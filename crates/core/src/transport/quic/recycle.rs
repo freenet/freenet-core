@@ -68,12 +68,15 @@
 //!    with no UDP session (a native one); on a path with one it only counts
 //!    (`quic_stall_would_close_<label>`) and the path stays open
 //!    ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
-//! 7. **Late ends** ([`Stall::LateEnds`]), observe-only on every path
-//!    ([`LATE_ENDS_CLOSE`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had their end
-//!    acknowledged late, or not at all, though the connection had
-//!    acknowledged enough bytes since the end to have carried it
-//!    (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]; counted
-//!    (`quic_stall_would_close_late_ends`), and the path stays open.
+//! 7. **Late ends** ([`Stall::LateEnds`]): sends had their end acknowledged
+//!    late, or not at all, though the connection had acknowledged enough
+//!    bytes since the end to have carried it (`path::LateEndCheck`), in
+//!    [`ACK_WAIT_EXPIRY_LIMIT`] separate episodes
+//!    ([`LATE_END_EPISODE_GAP`]) within [`ACK_WAIT_EXPIRY_WINDOW`]. It
+//!    closes a path with no UDP session (a native one) once
+//!    [`LATE_ENDS_CLOSE_NATIVE`] is set, which it is not yet; until then, and
+//!    on a path with a UDP session ([`LATE_ENDS_CLOSES_WITH_UDP`]), it only
+//!    counts (`quic_stall_would_close_late_ends`) and the path stays open.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -1237,14 +1240,23 @@ pub(crate) struct AckWatch {
     /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`Stall::LateEnds`]).
     late_seen: u64,
     late_at: VecDeque<u64>,
+    /// When the last late-end episode was counted. Kept apart from `late_at`,
+    /// which an observe-only would-close empties: the episode boundary must
+    /// survive that reset, or the next sample of the same episode counts again.
+    late_last_counted: Option<u64>,
     /// Times the ack-wait expiry rule would have closed the path, which has
     /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     would_close: u64,
-    /// Times the late-end rule would have closed the path ([`LATE_ENDS_CLOSE`]).
+    /// Times the late-end rule would have closed the path: counted on a path
+    /// with a UDP session ([`LATE_ENDS_CLOSES_WITH_UDP`]) and, while
+    /// [`LATE_ENDS_CLOSE_NATIVE`] is false, on a native one.
     late_would_close: u64,
     /// The path has a UDP session to fall back to, so the dark rule only
     /// counts ([`DARK_CLOSES_WITH_UDP`]).
     udp_fallback: bool,
+    /// The late-end rule closes a path with no UDP session
+    /// ([`LATE_ENDS_CLOSE_NATIVE`] unless a test says otherwise).
+    late_close_native: bool,
     /// The dark episode in progress was already counted as a would-close.
     dark_would_closed: bool,
     /// Where it is published whether the dark rule would have closed the path
@@ -1350,9 +1362,11 @@ impl AckWatch {
             expiries_at: VecDeque::new(),
             late_seen,
             late_at: VecDeque::new(),
+            late_last_counted: None,
             would_close: 0,
             late_would_close: 0,
             udp_fallback,
+            late_close_native: LATE_ENDS_CLOSE_NATIVE,
             dark_would_closed: false,
             dark_flag: None,
             long_dark_at: None,
@@ -1429,9 +1443,42 @@ impl AckWatch {
         )
     }
 
-    /// The same for late ends ([`Stall::LateEnds`]), in a window of their own.
+    /// The same for late ends ([`Stall::LateEnds`]), in a window of their
+    /// own and counting EPISODES, not ends: late ends seen within
+    /// [`LATE_END_EPISODE_GAP`] of the last counted one are the same
+    /// episode and add nothing. One loss burst or outage onset that lasts
+    /// less than that can leave many sends' ends late at once (up to 48
+    /// permits and 64 Shorts wait), and that is one piece of evidence, not
+    /// three; a spell of lateness that lasts two minutes or more counts
+    /// three.
     fn late_ends_reached(&mut self, now_nanos: u64, late: u64) -> bool {
-        strikes_in_window(&mut self.late_seen, &mut self.late_at, now_nanos, late)
+        let new = late.saturating_sub(self.late_seen);
+        self.late_seen = late;
+        let gap = u64::try_from(LATE_END_EPISODE_GAP.as_nanos()).unwrap_or(u64::MAX);
+        if new > 0
+            && self
+                .late_last_counted
+                .is_none_or(|last| now_nanos.saturating_sub(last) >= gap)
+        {
+            self.late_last_counted = Some(now_nanos);
+            self.late_at.push_back(now_nanos);
+        }
+        let window = u64::try_from(ACK_WAIT_EXPIRY_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        while self
+            .late_at
+            .front()
+            .is_some_and(|&first| now_nanos.saturating_sub(first) > window)
+        {
+            self.late_at.pop_front();
+        }
+        self.late_at.len() >= ACK_WAIT_EXPIRY_LIMIT as usize
+    }
+
+    /// Let the late-end rule close a path with no UDP session (see
+    /// [`LATE_ENDS_CLOSE_NATIVE`]).
+    pub(crate) fn closing_late_ends(mut self, closes: bool) -> Self {
+        self.late_close_native = closes;
+        self
     }
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
@@ -1585,11 +1632,16 @@ impl AckWatch {
             self.would_close += 1;
             self.expiries_at.clear();
         }
-        // Observe only on every path until calibrated ([`LATE_ENDS_CLOSE`]).
+        // Not judged against the peer's timing either, so a cap hold does
+        // not suspend it (the check itself restarts its proof under one,
+        // `path::LateEndCheck`).
         if late {
-            if LATE_ENDS_CLOSE {
+            if LATE_ENDS_CLOSES_WITH_UDP || (!self.udp_fallback && self.late_close_native) {
                 return Some(Stall::LateEnds);
             }
+            // Observe only (a path with a UDP session, or a native one while
+            // [`LATE_ENDS_CLOSE_NATIVE`] is false): count it, and start the
+            // window afresh.
             if let Some(node) = self.dark_counts {
                 node.record_stall_would_close(Stall::LateEnds.index());
             }
@@ -1728,8 +1780,11 @@ pub(crate) enum Stall {
     /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their end
     /// acknowledged late, or not at all, though the connection had
     /// acknowledged enough bytes since the end to have carried it
-    /// (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Observe-only
-    /// on every path ([`LATE_ENDS_CLOSE`]): counted as a would-close.
+    /// (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a
+    /// path with no UDP session once [`LATE_ENDS_CLOSE_NATIVE`] is set (it is
+    /// not yet); otherwise, and on a path with a UDP session
+    /// ([`LATE_ENDS_CLOSES_WITH_UDP`]), it is counted as a would-close and the
+    /// path is not closed.
     LateEnds,
 }
 
@@ -1929,12 +1984,49 @@ pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u6
 /// ([`DARK_CLOSES_WITH_UDP`]).
 pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 
-/// Whether the late-end rule ([`Stall::LateEnds`]) closes a path. It does
-/// not, on any path: each time [`ACK_WAIT_EXPIRY_LIMIT`] late ends come
-/// within [`ACK_WAIT_EXPIRY_WINDOW`] a would-close is counted
-/// (`quic_stall_would_close_late_ends`), until the field counts calibrate it
+/// Whether the late-end rule ([`Stall::LateEnds`]) closes a path that has a
+/// UDP session to fall back to. It does not: on such a path each time
+/// [`ACK_WAIT_EXPIRY_LIMIT`] late ends come within
+/// [`ACK_WAIT_EXPIRY_WINDOW`] a would-close is counted
+/// (`quic_stall_would_close_late_ends`) and the path stays open, as for the
+/// ack-wait rule ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]). A path with no UDP
+/// session (a native connection's) is closed once
+/// [`LATE_ENDS_CLOSE_NATIVE`] is set, with
+/// `close_code::PEER_NOT_ACKNOWLEDGING`: a peer that acknowledges each
+/// stream's end just before its wait runs out would otherwise hold the
+/// path's stream permits and send epochs with nothing to fall back to
 /// (#6205).
-pub(crate) const LATE_ENDS_CLOSE: bool = false;
+///
+/// What this covers is traffic-conditional. An end is judged only once the
+/// connection has wholly acknowledged more later data streams than the bytes
+/// ahead of it (every send in flight times what it had left, at most the send
+/// window each, plus the congestion window). With all 48 stream permits held
+/// by ends the peer withholds, no new permit stream starts, so only
+/// one-packet Shorts can advance that, and with large streams in flight
+/// the proof point is out of reach. A peer that acknowledges Shorts
+/// promptly and holds large-stream ends until just before their ack wait
+/// (at least 5 min) runs out is caught by neither this rule nor the
+/// ack-wait rule. It holds each permit for that wait, so the path streams at
+/// most 48 sends per wait, about one per 6 s at the 5 min minimum wait, and
+/// while all 48 are held a further streamed send on a native path is sent
+/// again on the same path (`route::NOT_OPENED_RETRIES` times) and then
+/// dropped: the residual of #6205, not closed here.
+pub(crate) const LATE_ENDS_CLOSES_WITH_UDP: bool = false;
+
+/// Whether the late-end rule ([`Stall::LateEnds`]) closes a path with no UDP
+/// session (a native one). It does not yet: detection, episode counting and
+/// liveness run on every path and count `quic_late_end_<label>`,
+/// `quic_late_end_judged_<label>` and `quic_stall_would_close_late_ends`, so
+/// the field shows the exact rule, but nothing is closed. Flipped by the
+/// phase D-3 flag day, after: the judged and would-close rates from the
+/// floor release; the sparse-ack gap (a path whose later streams are
+/// acknowledged at gaps over the recency window is judged late only after a
+/// restart of the liveness baseline); the withholding-peer residual (Shorts
+/// acknowledged promptly, large-stream ends held until just before their
+/// wait); honest-path evidence for the grace derivation, which has none; the
+/// 60 s episode gap ([`LATE_END_EPISODE_GAP`]), which is unvetted; and a
+/// Full re-review at flip time (#6205).
+pub(crate) const LATE_ENDS_CLOSE_NATIVE: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with
 /// no UDP session ([`Stall::AckWaitsExpired`]; on one with a UDP session
@@ -1946,6 +2038,17 @@ pub(crate) const LATE_ENDS_CLOSE: bool = false;
 /// reset by acknowledgements, so a peer that acknowledges everything else,
 /// or one end in three, is still counted.
 pub(crate) const ACK_WAIT_EXPIRY_LIMIT: u32 = 3;
+
+/// Late ends within this long of the last counted one are one episode for the
+/// late-end rule ([`Stall::LateEnds`]): a loss burst or an outage onset can
+/// leave many ends late together, and a path that closes needs
+/// [`ACK_WAIT_EXPIRY_LIMIT`] separate episodes, so at least twice this long
+/// in all. A design choice, not a measurement: long enough that one event
+/// under that long (an outage the dark rule has not yet excused, a loss
+/// burst) is one episode, short enough that a peer withholding every end is
+/// closed within minutes. An event of two minutes or more counts as
+/// separate episodes.
+pub(crate) const LATE_END_EPISODE_GAP: Duration = Duration::from_secs(60);
 
 /// The window [`ACK_WAIT_EXPIRY_LIMIT`] expiries must fall in.
 pub(crate) const ACK_WAIT_EXPIRY_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -2095,6 +2198,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         heard,
         carries_data,
         udp_fallback,
+        late_ends_close_native,
         dark,
         long_dark_at,
     } = shared;
@@ -2108,6 +2212,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     };
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first, udp_fallback)
+        .closing_late_ends(late_ends_close_native)
         .observing(carries_data, report.node)
         .publishing_dark(dark)
         .publishing_long_dark(long_dark_at);
@@ -2150,7 +2255,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
                     remote = %connection.remote_address(),
                     stall = watch.stall().map_or("", Stall::label),
                     "QUIC path: the peer stopped delivering on this path (see the stall \
-                     reason); closing the path so the connection falls back to UDP"
+                     reason); closing the path (a connection with a UDP session \
+                     falls back to UDP)"
                 );
             }
             return;
@@ -2201,6 +2307,9 @@ pub(crate) struct WatchShared {
     /// (`QuicPathLimits::udp_fallback`), so the dark rule only counts
     /// ([`DARK_CLOSES_WITH_UDP`]).
     pub(crate) udp_fallback: bool,
+    /// Whether the late-end rule closes a path with no UDP session
+    /// (`QuicPathLimits::late_ends_close_native`, [`LATE_ENDS_CLOSE_NATIVE`]).
+    pub(crate) late_ends_close_native: bool,
     /// Set while the dark rule would have closed the path in the episode in
     /// progress ([`AckWatch::publishing_dark`]), so the path's stall close
     /// leaves such a path with a UDP session alone (`route`).

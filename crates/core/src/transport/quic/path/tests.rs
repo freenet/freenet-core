@@ -149,15 +149,70 @@ struct Windows {
     b: Option<Arc<super::super::budget::QuicBudget>>,
 }
 
+/// A native connection's limits with the late-end rule closing
+/// (`recycle::LATE_ENDS_CLOSE_NATIVE` is false in production, so a test of the
+/// close, or of an honest peer staying open under it, asks for it).
+const NATIVE_ENFORCING: QuicPathLimits = QuicPathLimits {
+    late_ends_close_native: true,
+    ..QuicPathLimits::NATIVE
+};
+
 /// [`paths`] with `a`'s path a native connection's ([`QuicPathLimits::NATIVE`]):
 /// no UDP session, so its dark rule closes (`recycle::DARK_CLOSES_WITH_UDP`).
 async fn paths_native(network: &str) -> Paths {
     paths_built(
         network,
         QuicPathLimits::DEFAULT,
-        QuicPathLimits::NATIVE,
+        NATIVE_ENFORCING,
         None,
         None,
+        Windows::default(),
+        true,
+    )
+    .await
+}
+
+/// `network` for a native variant of a test: a name of its own, since the
+/// simulated network is keyed by name.
+fn net(network: &'static str, native: bool) -> &'static str {
+    if native {
+        Box::leak(format!("{network}-native").into_boxed_str())
+    } else {
+        network
+    }
+}
+
+/// The base limits of `a`'s path: a native connection's (no UDP session) or not.
+fn native_base(native: bool) -> QuicPathLimits {
+    if native {
+        NATIVE_ENFORCING
+    } else {
+        QuicPathLimits::DEFAULT
+    }
+}
+
+/// [`paths`] with `a`'s path a native connection's if `native`.
+async fn paths_for(network: &str, b_limits: QuicPathLimits, native: bool) -> Paths {
+    paths_built(
+        network,
+        b_limits,
+        native_base(native),
+        None,
+        None,
+        Windows::default(),
+        true,
+    )
+    .await
+}
+
+/// [`paths_capped`] with `a`'s path a native connection's if `native`.
+async fn paths_capped_for(network: &str, a_cap: u64, native: bool) -> Paths {
+    paths_built(
+        network,
+        QuicPathLimits::DEFAULT,
+        native_base(native),
+        None,
+        Some(a_cap),
         Windows::default(),
         true,
     )
@@ -1396,6 +1451,122 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
     })
 }
 
+/// The late-end rule's verdict reaches the real path's acknowledgement watch
+/// (#6205): three late ends (`Writers::late_end`, which `late_end_watch`
+/// calls when `LateEndCheck` finds one) 70 s apart (separate episodes,
+/// `recycle::LATE_END_EPISODE_GAP`) on a connected pair, with
+/// the peer acknowledging everything else, are
+/// - on a path with a UDP session, one would-close under `late_ends`, the
+///   path open;
+/// - on a native path, a close under `late_ends`, with no would-close; the
+///   peer is sent `PEER_NOT_ACKNOWLEDGING`.
+///
+/// Three at once are one episode and close neither, and a third more than 30
+/// min after the first does not either.
+///
+/// The detection itself (`LateEndCheck` on a stream whose end the peer
+/// withholds) is tested with a scripted acknowledgement record
+/// (`the_late_end_check_polls_until_the_end_is_late`,
+/// `a_late_end_is_counted_once_across_its_waits`), not on a real pair: this
+/// harness's peer acknowledges every packet it gets, and a packet that
+/// carries a stream's tail cannot be told on the wire, since quinn bundles
+/// its retransmissions with other frames. The field has had no late end
+/// since the counters shipped (0.2.160), so this pipeline is where the rule
+/// is shown to close.
+#[test]
+fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
+    use crate::transport::metrics::AckWaitKind;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (network, native, enforcing, gap) in [
+            ("quic-path-late-ends-udp", false, true, 70),
+            ("quic-path-late-ends-native", true, true, 70),
+            // As shipped (`LATE_ENDS_CLOSE_NATIVE` false): counted, not closed.
+            ("quic-path-late-ends-native-dark", true, false, 70),
+            // All three at once: one episode, so no close.
+            ("quic-path-late-ends-native-burst", true, true, 0),
+            ("quic-path-late-ends-native-spread", true, true, 16 * 60),
+        ] {
+            let counters = leaked_counters();
+            let limits = QuicPathLimits {
+                counters: Some(counters),
+                ..QuicPathLimits::DEFAULT
+            };
+            let a_base = if native {
+                QuicPathLimits {
+                    late_ends_close_native: enforcing,
+                    ..QuicPathLimits::NATIVE
+                }
+            } else {
+                QuicPathLimits::DEFAULT
+            };
+            let p = paths_built(
+                network,
+                limits,
+                a_base,
+                None,
+                None,
+                Windows::default(),
+                true,
+            )
+            .await;
+            let b_addr = p.pair.b_addr;
+            let (a, time) = (p.a.clone(), p.time());
+            // Three late ends 16 min apart span 32 min, past the 30 min
+            // window, so virtual time runs longer than `LIMIT` there.
+            let closed_after = drive(&p.pair.time, Duration::from_secs(2 * 3600), async move {
+                let mut closed = None;
+                for i in 1..=3u32 {
+                    a.writers().late_end(counters, AckWaitKind::Stream);
+                    time.sleep(Duration::from_secs(gap)).await;
+                    if a.connection().inner().close_reason().is_some() {
+                        closed = Some(i);
+                        break;
+                    }
+                }
+                // Past the watch's next samples, for the case with no gap.
+                time.sleep(Duration::from_secs(10)).await;
+                if closed.is_none() && a.connection().inner().close_reason().is_some() {
+                    closed = Some(4);
+                }
+                closed
+            })
+            .await;
+            let snapshot = counters.snapshot(false);
+            assert_eq!(snapshot.late_end, vec![3, 0, 0], "{network}");
+            assert_eq!(snapshot.ack_wait_expired, vec![0, 0, 0], "{network}");
+            if native && enforcing && gap == 70 {
+                assert_eq!(closed_after, Some(3), "{network}: closed at the third");
+                assert_eq!(
+                    recycle::stalls_to(b_addr),
+                    vec![recycle::Stall::LateEnds],
+                    "{network}"
+                );
+                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 0, 1], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
+                assert_eq!(
+                    recycle_closes_to(b_addr),
+                    vec![QuicCloseCode::PeerNotAcknowledging],
+                    "{network}"
+                );
+            } else if native && enforcing {
+                assert_eq!(closed_after, None, "{network}: spread past the window");
+                assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
+            } else {
+                assert_eq!(closed_after, None, "{network}: not closed");
+                assert_eq!(recycle::stalls_to(b_addr), vec![], "{network}");
+                assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
+                assert_eq!(
+                    snapshot.stall_would_close,
+                    vec![0, 0, 0, 0, 0, 1],
+                    "{network}: one would-close, under late_ends"
+                );
+            }
+        }
+    })
+}
+
 /// The ack-wait expiry rule does not count this node's own throttling: with
 /// the egress cap holding the connection's transmits (a 100 kB/s
 /// `total-bandwidth-limit` under a bulk transfer, so the connection still
@@ -1404,9 +1575,19 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
 /// not closed.
 #[test]
 fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
-    bounded(|| async move {
+    ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end. It pins that a cap hold makes no late end; it does not reach the grace (no end can be unacknowledged with its bytes ahead acknowledged here), so the hold's effect on the proof is pinned by `a_cap_hold_between_polls_restarts_the_late_end_proof`.
+#[test]
+fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on_a_native_path() {
+    ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on(true)
+}
+
+fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on(native: bool) {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths_capped("quic-path-expiries-capped", 100_000).await;
+        let p = paths_capped_for(net("quic-path-expiries-capped", native), 100_000, native).await;
         let (a, time) = (p.a.clone(), p.time());
         // The cap queues the bulk's bytes ahead of each end past the wait.
         let never = SendDeadlines {
@@ -1567,21 +1748,31 @@ fn a_one_packet_shorts_background_ack_wait_is_bounded() {
 /// (`[MaybeDelivered(TimedOut), Sent, Sent, ...]`).
 #[test]
 fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
+    concurrent_large_streams_on_a_slow_path_see_no_expiry_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn concurrent_large_streams_on_a_slow_path_see_no_expiry_on_a_native_path() {
+    concurrent_large_streams_on_a_slow_path_see_no_expiry_on(true)
+}
+
+fn concurrent_large_streams_on_a_slow_path_see_no_expiry_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
     const RATE: u64 = 40 * 1024;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-slow-many";
+        let network = net("quic-path-slow-many", native);
         set_packet_delivery_callback(
             network,
             Some(Arc::new(|_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200))
             })),
         );
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths_for(network, QuicPathLimits::DEFAULT, native).await;
         let (a_addr, time) = (p.pair.a_addr, p.time());
         let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
         set_packet_delivery_callback(
@@ -1655,8 +1846,8 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
 
 /// The late-end verdict (`late_end_verdict`), with literal values: the proof
 /// point is the first time the bytes acknowledged since the end reach the
-/// bytes ahead (with the window at the end added by the caller); late once `late_end_grace` (9 round
-/// trips and 75 ms, at least 2 s) has passed since then; never before the
+/// bytes ahead (with the window at the end added by the caller); late once `late_end_grace` (seven probe
+/// timeouts of at most 5 round trips and 25 ms, at least 2 s) has passed since then; never before the
 /// proof point, however long the end has waited.
 #[test]
 fn a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace() {
@@ -1669,7 +1860,12 @@ fn a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace() {
     );
     assert_eq!(
         late_end_grace(Duration::from_millis(800)),
-        Duration::from_millis(7_275)
+        Duration::from_millis(28_175)
+    );
+    assert_eq!(
+        late_end_grace(Duration::from_millis(200)),
+        Duration::from_millis(7_175),
+        "a 200 ms path: 7 x (5 x 200 + 25) ms"
     );
     let rtt = || Duration::from_millis(50);
     let mut crossed = None;
@@ -1734,6 +1930,8 @@ fn the_late_end_check_polls_until_the_end_is_late() {
                 dark_at,
                 end_at: time.now_nanos().max(1),
                 counted: Arc::default(),
+                judged: Arc::default(),
+                on_judged: None,
             }
         };
         let sleeper: Sleeper = {
@@ -1751,35 +1949,491 @@ fn the_late_end_check_polls_until_the_end_is_late() {
                 tokio::spawn(async move {
                     clock.sleep(Duration::from_secs(10)).await;
                     acked.store(proof, Relaxed);
+                    // A peer that is alive acknowledges more streams.
+                    loop {
+                        clock.sleep(Duration::from_secs(1)).await;
+                        acked.fetch_add(1024, Relaxed);
+                    }
                 })
             };
             check.late(s2.clone()).await;
-            feeder.await.unwrap();
+            feeder.abort();
             let plain = clock.now() - start;
 
             // A long dark episode since the end: never late.
             let dark_at = Arc::new(AtomicU64::new(0));
+            // The peer keeps acknowledging (the acknowledged bytes grow), so
+            // only the dark mark can excuse the end.
+            let alive = Arc::new(AtomicU64::new(proof));
             let check = make(
-                Arc::new(AtomicU64::new(proof)),
+                alive.clone(),
                 Arc::new(CapHolds::new(None)),
                 dark_at.clone(),
             );
+            let feeder = {
+                let clock = clock.clone();
+                tokio::spawn(async move {
+                    loop {
+                        clock.sleep(Duration::from_secs(1)).await;
+                        alive.fetch_add(1024, Relaxed);
+                    }
+                })
+            };
             dark_at.store(clock.now_nanos() + 1, Relaxed);
             let excused = tokio::select! {
                 () = check.late(s2.clone()) => false,
                 () = clock.sleep(Duration::from_secs(120)) => true,
             };
+            feeder.abort();
             (plain, excused)
         })
         .await;
         let (plain, excused) = took;
         assert_eq!(
             plain,
-            Duration::from_secs(12),
-            "proof at 10 s, late at the 12 s tick"
+            Duration::from_secs(16),
+            "proof at 10 s, past the grace at the 12 s tick (a candidate), the peer shown alive at the 14 s tick, late a grace later at the 16 s tick"
         );
         assert!(excused, "dark since the end: not judged");
         let _ = sleeper;
+    })
+}
+
+/// An outage that begins after an end has crossed its proof point is not a
+/// late end, though the watch has not yet published it as a dark spell (it
+/// does so after 10 s): nothing is acknowledged, so the check stays a
+/// candidate and never counts. When the connection acknowledges again the end
+/// is given another grace (the probes' acknowledgement of a path coming out of
+/// an outage), and counts only if it is still unacknowledged then, as it is
+/// for a peer that acknowledges every packet but this end.
+#[test]
+fn an_outage_after_the_proof_point_is_not_a_late_end() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let acked = Arc::new(AtomicU64::new(0));
+        let judged = Arc::new(AtomicU64::new(0));
+        let check = {
+            let (acked, clock, judged) = (acked.clone(), clock.clone(), judged.clone());
+            LateEndCheck {
+                reading: Arc::new({
+                    let acked = acked.clone();
+                    move || LaterReading {
+                        in_flight: 1,
+                        rest: 64 * 1024,
+                        started: 0,
+                        started_bytes: 0,
+                        acked_since_end: acked.load(Relaxed),
+                        window_at_end: 64 * 1024,
+                    }
+                }),
+                rtt: Arc::new(|| Duration::from_millis(50)),
+                now: Arc::new(move || clock.now_nanos()),
+                cap: Arc::new(CapHolds::new(None)),
+                dark_at: Arc::default(),
+                end_at: time.now_nanos().max(1),
+                counted: Arc::default(),
+                judged: Arc::default(),
+                on_judged: Some(Arc::new(move || {
+                    judged.fetch_add(1, Relaxed);
+                })),
+            }
+        };
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let (clock, time2) = (clock.clone(), time.clone());
+        let (outage, resumed_at) = drive(&time, LIMIT, async move {
+            // The proof point at 10 s; the outage begins right after, so
+            // nothing is acknowledged from then.
+            clock.sleep(Duration::from_secs(10)).await;
+            acked.store(128 * 1024, Relaxed);
+            let watch = tokio::spawn(check.late(sleeper));
+            clock.sleep(Duration::from_secs(60)).await;
+            let outage = watch.is_finished();
+            // The connection acknowledges again at 70 s.
+            let resumed_at = clock.now();
+            let feeder = {
+                let (acked, clock) = (acked.clone(), clock.clone());
+                tokio::spawn(async move {
+                    loop {
+                        clock.sleep(Duration::from_secs(1)).await;
+                        acked.fetch_add(1024, Relaxed);
+                    }
+                })
+            };
+            watch.await.unwrap();
+            let done = clock.now() - resumed_at;
+            feeder.abort();
+            let _ = &time2;
+            (outage, done)
+        })
+        .await;
+        assert!(!outage, "60 s of outage after the proof point: not late");
+        assert_eq!(judged.load(Relaxed), 1, "judged once, at the proof point");
+        assert_eq!(
+            resumed_at,
+            Duration::from_secs(4),
+            "late a first tick (candidate baseline), the growth (alive) and a grace after the acknowledgements resume"
+        );
+    })
+}
+
+/// A no-false-positive smoke test, not evidence for the grace: a lossy,
+/// jittery native path (where the late-end rule closes), 12% loss and a
+/// one-way delay of 60 to 140 ms drawn per datagram (a 120 to 280 ms round
+/// trip), with a small Short then three 64 KiB streams, 20 times, over 8
+/// loss patterns (the seeds vary only the loss sequence; the protocol's own
+/// randomness is one fixed seed). Every stream is `Sent`, the path stays
+/// open and no end is late. It does NOT show that the check was exercised:
+/// in this traffic no end reached the proof point (0 ends judged, printed),
+/// because loss recovery (fast retransmit after the later packets are
+/// acknowledged) completes a lost Short's acknowledgement before 64 KiB of
+/// later streams do. No test here reaches the proof point on an honest path,
+/// so the grace formula is pinned only by its derivation and by
+/// `a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace`;
+/// `quic_late_end_judged_*` will say how often honest ends are judged in the
+/// field.
+#[test]
+fn a_jittery_lossy_native_path_is_not_closed_smoke_test() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut judged = 0;
+        for seed in 1..=8u64 {
+            let network: &'static str =
+                Box::leak(format!("quic-late-jitter-native-{seed}").into_boxed_str());
+            set_packet_delivery_callback(
+                network,
+                Some(Arc::new(|_, _, _, _| {
+                    PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(100))
+                })),
+            );
+            let counters = leaked_counters();
+            let limits = QuicPathLimits {
+                counters: Some(counters),
+                ..QuicPathLimits::DEFAULT
+            };
+            // A budget each, so a Short holds a send epoch and its wait goes
+            // on in the background (`Outgoing`'s drop).
+            let windows = Windows {
+                a: Some(test_budget(64 << 20, leaked_counters())),
+                b: Some(test_budget(64 << 20, leaked_counters())),
+            };
+            let mut p =
+                paths_built(network, limits, NATIVE_ENFORCING, None, None, windows, true).await;
+            // One draw per datagram from a fixed sequence: loss, then jitter.
+            let state = Arc::new(std::sync::atomic::AtomicU64::new(seed));
+            set_packet_delivery_callback(
+                network,
+                Some(Arc::new(move |_, _, _, _| {
+                    let next = state
+                        .fetch_update(Relaxed, Relaxed, |x| {
+                            Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1))
+                        })
+                        .unwrap_or_default();
+                    if (next >> 33) % 100 < 12 {
+                        PacketDeliveryDecision::Drop
+                    } else {
+                        PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(
+                            60 + (next >> 40) % 81,
+                        ))
+                    }
+                })),
+            );
+            let mut streams =
+                std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
+            let drain = tokio::spawn(async move {
+                let mut kept = Vec::new();
+                loop {
+                    tokio::select! {
+                        Some(stream) = streams.recv() => kept.push(stream),
+                        Some(short) = shorts.recv() => drop(short),
+                        else => break,
+                    }
+                }
+            });
+            let (a, time) = (p.a.clone(), p.time());
+            let outcomes = p
+                .drive(async move {
+                    // 20 rounds of one small Short, then three 64 KiB streams
+                    // one after the other. A lost Short waits on a probe timeout
+                    // while the streams behind it complete, so its end can reach
+                    // the proof point on an honest path.
+                    let mut outcomes = Vec::new();
+                    for _ in 0..20 {
+                        let short = payload(100);
+                        a.send_short_bounded(
+                            &time,
+                            SendDeadlines {
+                                open: Duration::from_secs(30),
+                                gap: Some(Duration::from_secs(30)),
+                                ..SendDeadlines::short(100)
+                            },
+                            &short[..],
+                        )
+                        .await;
+                        for _ in 0..3 {
+                            let len = 64 * 1024;
+                            outcomes.push(
+                                a.send_stream_bounded(
+                                    &time,
+                                    a.stream_deadlines(len as u64),
+                                    StreamId::next(),
+                                    None,
+                                    Bytes::from(payload(len)),
+                                    None,
+                                )
+                                .await,
+                            );
+                        }
+                    }
+                    time.sleep(Duration::from_secs(60)).await;
+                    outcomes
+                })
+                .await;
+            drain.abort();
+            set_packet_delivery_callback(network, None);
+            assert!(
+                outcomes.iter().all(|o| matches!(o, BoundedSend::Sent)),
+                "seed {seed}: {outcomes:?}"
+            );
+            assert!(
+                p.a.connection().inner().close_reason().is_none(),
+                "seed {seed}: closed"
+            );
+            assert_eq!(p.a.writers().late_ends(), 0, "seed {seed}: a late end");
+            assert!(recycle::stalls_to(p.pair.b_addr).is_empty(), "seed {seed}");
+            judged += counters.snapshot(false).late_end_judged.iter().sum::<u64>();
+        }
+        eprintln!("jittery lossy native path: {judged} ends reached the proof point");
+    })
+}
+
+/// End to end on a native pair: three real late-end checks (`LateEndCheck`
+/// with a scripted acknowledgement record of a live peer, driven through
+/// `late_end_watch` into the path's `Writers` and the node counters), whose
+/// ends are never acknowledged, spawned 70 s apart, are three episodes: each
+/// is judged (`quic_late_end_judged_stream`), counted late
+/// (`quic_late_end_stream`), and the third closes the path under `late_ends`.
+/// The peer here is a script, not a real peer withholding ends (the harness
+/// cannot make one), so this is the wiring from the check to the close.
+#[test]
+fn late_end_checks_three_episodes_apart_close_a_native_path() {
+    use super::super::socket::CapHolds;
+    use crate::transport::metrics::AckWaitKind;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters = leaked_counters();
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths_built(
+            "quic-path-late-check-native",
+            limits,
+            NATIVE_ENFORCING,
+            None,
+            None,
+            Windows::default(),
+            true,
+        )
+        .await;
+        let b_addr = p.pair.b_addr;
+        let (a, time) = (p.a.clone(), p.time());
+        let writers = a.writers.clone();
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let closed_at = p
+            .drive(async move {
+                let mut watches = Vec::new();
+                let mut closed = None;
+                for i in 1..=3u32 {
+                    let acked = Arc::new(AtomicU64::new(128 * 1024));
+                    let check = {
+                        let (acked, clock, judged) = (acked.clone(), time.clone(), counters);
+                        LateEndCheck {
+                            reading: Arc::new(move || LaterReading {
+                                in_flight: 1,
+                                rest: 64 * 1024,
+                                started: 0,
+                                started_bytes: 0,
+                                acked_since_end: acked.load(Relaxed),
+                                window_at_end: 64 * 1024,
+                            }),
+                            rtt: Arc::new(|| Duration::from_millis(50)),
+                            now: {
+                                let clock = clock.clone();
+                                Arc::new(move || clock.now_nanos())
+                            },
+                            cap: Arc::new(CapHolds::new(None)),
+                            dark_at: Arc::default(),
+                            end_at: clock.now_nanos().max(1),
+                            counted: Arc::default(),
+                            judged: Arc::default(),
+                            on_judged: Some(Arc::new(move || {
+                                judged.record_late_end_judged(AckWaitKind::Stream);
+                            })),
+                        }
+                    };
+                    // A live peer: it acknowledges more every second.
+                    let feeder = {
+                        let clock = time.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                clock.sleep(Duration::from_secs(1)).await;
+                                acked.fetch_add(1024, Relaxed);
+                            }
+                        })
+                    };
+                    watches.push(feeder);
+                    watches.push(tokio::spawn(late_end_watch(
+                        Some(check),
+                        Some(sleeper.clone()),
+                        Some(writers.clone()),
+                        Some(counters),
+                        AckWaitKind::Stream,
+                    )));
+                    time.sleep(Duration::from_secs(70)).await;
+                    if i < 3 {
+                        assert!(
+                            a.connection().inner().close_reason().is_none(),
+                            "{i} episodes do not close"
+                        );
+                    } else if a.connection().inner().close_reason().is_some() {
+                        closed = Some(i);
+                    }
+                }
+                for task in watches {
+                    task.abort();
+                }
+                closed
+            })
+            .await;
+        assert_eq!(closed_at, Some(3));
+        let snapshot = counters.snapshot(false);
+        assert_eq!(snapshot.late_end_judged, vec![3, 0, 0]);
+        assert_eq!(snapshot.late_end, vec![3, 0, 0]);
+        assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 0, 1]);
+        assert_eq!(recycle::stalls_to(b_addr), vec![recycle::Stall::LateEnds]);
+    })
+}
+
+/// Liveness is rechecked through the second grace (`LateEndCheck::late`):
+/// - an outage that begins after the first growth, 50 ms round trip (grace
+///   2 s, so growth within the last 4 s is needed): the growth stops at 5 s
+///   and the check never returns;
+/// - a live peer: returns;
+/// - growth, then a stall longer than the recency window (an outage under the
+///   10 s dark window, so nothing excuses it), then growth again at 14 s: the
+///   second grace restarts there, so it returns at 16 s, not at 14 s, giving
+///   the end's probes a whole grace after the outage;
+/// - a 250 ms round trip (grace 8.9 s, recency window 4.5 s): growth goes on
+///   until 17 s and then stops, so the grace since the baseline (14 s) passes
+///   with the last growth 6 s old: never returns. Without the recency
+///   condition it would at 24 s.
+#[test]
+fn a_late_end_needs_the_peer_still_acknowledging_through_the_second_grace() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        // (round trip ms, growth stops after second, growth resumes at second,
+        // growth only every this many seconds). Growth lands half a second
+        // after a poll, so the order of the feeder and the poll is not a tie.
+        let cases: [(u64, Option<u64>, Option<u64>, u64); 5] = [
+            (50, Some(5), None, 1),
+            (50, None, None, 1),
+            (50, Some(5), Some(12), 1),
+            (250, Some(17), None, 1),
+            (50, None, None, 8),
+        ];
+        let results = drive(&time, LIMIT, async move {
+            let mut results = Vec::new();
+            for (rtt_ms, until, resume, every) in cases {
+                let acked = Arc::new(AtomicU64::new(128 * 1024));
+                let now_clock = clock.clone();
+                let check = {
+                    let acked = acked.clone();
+                    LateEndCheck {
+                        reading: Arc::new(move || LaterReading {
+                            in_flight: 1,
+                            rest: 64 * 1024,
+                            started: 0,
+                            started_bytes: 0,
+                            acked_since_end: acked.load(Relaxed),
+                            window_at_end: 64 * 1024,
+                        }),
+                        rtt: Arc::new(move || Duration::from_millis(rtt_ms)),
+                        now: Arc::new(move || now_clock.now_nanos()),
+                        cap: Arc::new(CapHolds::new(None)),
+                        dark_at: Arc::default(),
+                        end_at: clock.now_nanos().max(1),
+                        counted: Arc::default(),
+                        judged: Arc::default(),
+                        on_judged: None,
+                    }
+                };
+                let start = clock.now();
+                let feeder = {
+                    let (acked, clock) = (acked.clone(), clock.clone());
+                    tokio::spawn(async move {
+                        clock.sleep(Duration::from_millis(500)).await;
+                        for second in 1..u64::MAX {
+                            clock.sleep(Duration::from_secs(1)).await;
+                            let grows = (until.is_none_or(|u| second <= u)
+                                || resume.is_some_and(|r| second >= r))
+                                && second % every == 0;
+                            if grows {
+                                acked.fetch_add(1024, Relaxed);
+                            }
+                        }
+                    })
+                };
+                let finished = tokio::select! {
+                    () = check.late(sleeper.clone()) => Some(clock.now() - start),
+                    () = clock.sleep(Duration::from_secs(100)) => None,
+                };
+                feeder.abort();
+                results.push(finished);
+            }
+            results
+        })
+        .await;
+        assert_eq!(
+            results[0], None,
+            "an outage after the first growth: not late"
+        );
+        assert!(results[1].is_some(), "a live peer: late");
+        assert!(
+            results[2].is_some_and(|d| d >= Duration::from_secs(16)),
+            "growth back after a stall restarts the second grace: {:?}",
+            results[2]
+        );
+        assert_eq!(
+            results[3], None,
+            "a grace on, the last growth is older than the recency window: not late"
+        );
+        assert!(
+            results[4] == Some(Duration::from_secs(26)),
+            "later streams acknowledged every 8 s (past the recency window) are still judged: {:?}",
+            results[4]
+        );
     })
 }
 
@@ -1851,13 +2505,15 @@ fn a_late_end_is_counted_once_across_its_waits() {
         let clock = time.clone();
         let writers = Arc::new(recycle::Writers::default());
         let node = leaked_counters();
+        // A live peer: every read finds more data streams acknowledged.
+        let acked = Arc::new(AtomicU64::new(1 << 20));
         let check = LateEndCheck {
-            reading: Arc::new(|| LaterReading {
+            reading: Arc::new(move || LaterReading {
                 in_flight: 1,
                 rest: 1000,
                 started: 0,
                 started_bytes: 0,
-                acked_since_end: 1 << 20,
+                acked_since_end: acked.fetch_add(4096, std::sync::atomic::Ordering::Relaxed),
                 window_at_end: 64 * 1024,
             }),
             rtt: Arc::new(|| Duration::from_millis(50)),
@@ -1866,6 +2522,10 @@ fn a_late_end_is_counted_once_across_its_waits() {
             dark_at: Arc::default(),
             end_at: time.now_nanos().max(1),
             counted: Arc::default(),
+            judged: Arc::default(),
+            on_judged: Some(Arc::new(move || {
+                node.record_late_end_judged(crate::transport::metrics::AckWaitKind::Stream);
+            })),
         };
         let sleeper: Sleeper = {
             let time = time.clone();
@@ -1890,6 +2550,11 @@ fn a_late_end_is_counted_once_across_its_waits() {
         .await;
         assert_eq!(writers.late_ends(), 1);
         assert_eq!(node.snapshot(false).late_end, vec![1, 0, 0]);
+        assert_eq!(
+            node.snapshot(false).late_end_judged,
+            vec![1, 0, 0],
+            "judged once, though two waits polled it"
+        );
     })
 }
 
@@ -1974,7 +2639,7 @@ fn a_stream_open_at_the_end_is_not_progress_past_it() {
 /// An egress-cap hold that begins and ends between two polls of the
 /// late-end check restarts the proof, as a hold seen at a poll does: the
 /// bytes ahead are acknowledged at 10 s, a hold comes and goes at 11 s, so
-/// the proof point is the 14 s poll and the end is late at 16 s, not 12 s.
+/// the proof point is the 14 s poll, the grace passes at 16 s, the peer is shown alive at 18 s and the end is late at 20 s, not 16 s.
 #[test]
 fn a_cap_hold_between_polls_restarts_the_late_end_proof() {
     use super::super::socket::CapHolds;
@@ -2001,6 +2666,8 @@ fn a_cap_hold_between_polls_restarts_the_late_end_proof() {
                 dark_at: Arc::default(),
                 end_at: time.now_nanos().max(1),
                 counted: Arc::default(),
+                judged: Arc::default(),
+                on_judged: None,
             }
         };
         let sleeper: Sleeper = {
@@ -2017,14 +2684,18 @@ fn a_cap_hold_between_polls_restarts_the_late_end_proof() {
                     clock.sleep(Duration::from_secs(1)).await;
                     cap.hold_one();
                     cap.release_one();
+                    loop {
+                        clock.sleep(Duration::from_secs(1)).await;
+                        acked.fetch_add(1024, Relaxed);
+                    }
                 })
             };
             check.late(sleeper).await;
-            feeder.await.unwrap();
+            feeder.abort();
             clock.now() - start
         })
         .await;
-        assert_eq!(took, Duration::from_secs(16));
+        assert_eq!(took, Duration::from_secs(20));
     })
 }
 
@@ -2057,6 +2728,79 @@ fn the_completion_log_wraps_by_under_counting() {
     let read = opens.acked_after(0, &mut early);
     assert_eq!(read, 2000 + 4096);
     assert!(read <= 7000);
+}
+
+/// The path watch reads the late ends the checks count
+/// (`late_ends: writers.late_ends()` in the sample), and the close rule's
+/// constant is the one the documents name: a pin on the documents the rule
+/// has drifted from before (#6205). Source pins, comments stripped.
+#[test]
+fn the_late_end_rule_is_read_by_the_watch_and_documented() {
+    // Scoped to the function bodies (comments stripped, a moved anchor fails
+    // loudly), so a mention elsewhere in the file does not satisfy it.
+    let source = include_str!("../recycle.rs");
+    let pin = crate::transport::peer_connection::inbound_budget::pin::fn_body;
+    let sample = pin(source, "writers: &Writers,\n    ) -> Option<Self> {");
+    assert!(
+        sample.contains("late_ends: writers.late_ends(),"),
+        "the watch's sample reads the late ends the checks count"
+    );
+    let decide = pin(
+        source,
+        "fn decide(&mut self, now_nanos: u64, sample: AckSample) -> Option<Stall> {",
+    );
+    let flat: String = decide.split_whitespace().collect();
+    assert!(
+        flat.contains("LATE_ENDS_CLOSES_WITH_UDP||(!self.udp_fallback&&self.late_close_native)"),
+        "the close is gated by both constants' fields"
+    );
+    assert!(source.contains("pub(crate) const LATE_ENDS_CLOSE_NATIVE: bool = false;"));
+    const _: () = assert!(
+        !recycle::LATE_ENDS_CLOSE_NATIVE && !QuicPathLimits::DEFAULT.late_ends_close_native
+    );
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    for doc in [
+        "docs/architecture/transport/rules-reference.md",
+        ".claude/rules/transport.md",
+        "crates/core/src/transport/metrics/quic_data.rs",
+    ] {
+        let text = std::fs::read_to_string(format!("{root}/{doc}")).expect("a document");
+        assert!(
+            text.contains("LATE_ENDS_CLOSES_WITH_UDP") && text.contains("LATE_ENDS_CLOSE_NATIVE"),
+            "{doc} names the constants"
+        );
+        assert!(
+            !text.contains("LATE_ENDS_CLOSE`") && !text.contains("LATE_ENDS_CLOSE "),
+            "{doc} names the retired constant"
+        );
+    }
+    // The episode gap and the grace, as the documents state them
+    // (`LATE_END_EPISODE_GAP` is 60 s, the grace seven probe timeouts).
+    for (doc, needles) in [
+        (
+            "docs/architecture/transport/rules-reference.md",
+            &[
+                "LATE_END_EPISODE_GAP",
+                "60 s",
+                "seven probe timeouts",
+                "quic_late_end_judged_",
+            ][..],
+        ),
+        (
+            ".claude/rules/transport.md",
+            &["60 s", "quic_late_end_judged_"][..],
+        ),
+        (
+            "crates/core/src/transport/metrics/quic_data.rs",
+            &["LATE_END_EPISODE_GAP"][..],
+        ),
+    ] {
+        let text = std::fs::read_to_string(format!("{root}/{doc}")).expect("a document");
+        for needle in needles {
+            assert!(text.contains(needle), "{doc} states {needle}");
+        }
+    }
+    assert_eq!(recycle::LATE_END_EPISODE_GAP, Duration::from_secs(60));
 }
 
 /// The late-end check is polled wherever a sent end waits for its
@@ -2510,21 +3254,31 @@ fn an_expiry_whose_timer_woke_late_is_not_a_strike() {
 /// evidence holds, so they are not strikes and the path is not closed.
 #[test]
 fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
+    ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end. It pins that a quiet congestion-limited path makes no late end; it does not reach the grace, which the floor, slow-many-streams and outage variants do.
+#[test]
+fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on_a_native_path() {
+    ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on(true)
+}
+
+fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
     const RATE: u64 = 8 * 1024;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-expiries-slow";
+        let network = net("quic-path-expiries-slow", native);
         set_packet_delivery_callback(
             network,
             Some(Arc::new(|_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
             })),
         );
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths_for(network, QuicPathLimits::DEFAULT, native).await;
         let (a_addr, time) = (p.pair.a_addr, p.time());
         let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
         set_packet_delivery_callback(
@@ -2614,16 +3368,27 @@ fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
 /// (`SHORT_ACK_WAIT`). None is reset and the path is not closed.
 #[test]
 fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
+    one_packet_shorts_through_a_tolerated_outage_do_not_expire_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn one_packet_shorts_through_a_tolerated_outage_do_not_expire_on_a_native_path() {
+    one_packet_shorts_through_a_tolerated_outage_do_not_expire_on(true)
+}
+
+fn one_packet_shorts_through_a_tolerated_outage_do_not_expire_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         for (network, one_way_ms, outage_s) in [
             ("quic-path-shorts-outage-fast", 0u64, 11u64),
             ("quic-path-shorts-outage-800", 400, 30),
         ] {
+            let network = net(network, native);
             let one_way = Duration::from_millis(one_way_ms);
             let dark = Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
@@ -2645,7 +3410,16 @@ fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
                 a: Some(test_budget(64 << 20, leaked_counters())),
                 b: Some(test_budget(64 << 20, leaked_counters())),
             };
-            let p = paths_metered(network, windows).await;
+            let p = paths_built(
+                network,
+                QuicPathLimits::DEFAULT,
+                native_base(native),
+                None,
+                None,
+                windows,
+                true,
+            )
+            .await;
             let b_addr = p.pair.b_addr;
             dark.store(true, Relaxed);
             let (a, time) = (p.a.clone(), p.time());
@@ -2701,21 +3475,31 @@ fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
 /// is evicted by the receiver before any ack wait could run out, as on UDP.
 #[test]
 fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry() {
+    a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on_a_native_path() {
+    a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on(true)
+}
+
+fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
     const RATE: u64 = 16 * 1024;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-floor-4s";
+        let network = net("quic-path-floor-4s", native);
         set_packet_delivery_callback(
             network,
             Some(Arc::new(|_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
             })),
         );
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths_for(network, QuicPathLimits::DEFAULT, native).await;
         let (a_addr, time) = (p.pair.a_addr, p.time());
         let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
         set_packet_delivery_callback(

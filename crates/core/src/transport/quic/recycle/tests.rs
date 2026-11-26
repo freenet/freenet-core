@@ -1938,54 +1938,201 @@ fn ack_wait_expiries_within_the_window_close_only_a_path_without_udp() {
     }
 }
 
-/// The late-end rule only observes, on every path (`LATE_ENDS_CLOSE`): three
-/// late ends within 30 min count a would-close under `late_ends`, the window
-/// starting afresh, and the path is never closed, with a UDP session or
-/// without; two, or a third past the window, count none.
+/// Three late ends within 30 min are a would-close under `late_ends` on a path
+/// with a UDP session (`LATE_ENDS_CLOSES_WITH_UDP` is false), the window
+/// starting afresh, and that path is never closed; on a path without one the
+/// third closes it, under `late_ends`. Two, or a third past the window, count
+/// none and close nothing.
 #[test]
-fn late_ends_within_the_window_would_close_and_never_close() {
-    const _: () = assert!(!LATE_ENDS_CLOSE, "the late-end rule only observes");
+fn late_ends_within_the_window_would_close_with_udp_and_close_without() {
+    const _: () = assert!(!LATE_ENDS_CLOSES_WITH_UDP);
+    const _: () = assert!(!LATE_ENDS_CLOSE_NATIVE, "the rule ships dark");
     let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
     let at = |minutes: u64| (minutes * 60 / 2) as usize;
     let counted =
         |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
-    let run = |late: &dyn Fn(usize) -> u64, udp_fallback: bool| {
+    // (would-close samples, the sample the watch closed at and why).
+    let run = |late: &dyn Fn(usize) -> u64, udp_fallback: bool, enforcing: bool| {
         let record = Arc::default();
         let sample = |i: usize| {
             let t = i as u64;
             AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
                 .with_late_ends(late(i))
         };
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), udp_fallback);
+        let mut watch =
+            AckWatch::new(ACK_WATCH_WINDOW, sample(0), udp_fallback).closing_late_ends(enforcing);
         let mut would = Vec::new();
         for (i, time) in times.iter().enumerate().skip(1) {
             let before = watch.late_would_close();
-            assert!(!watch.observe(time * SEC, sample(i)), "never closed");
+            if watch.observe(time * SEC, sample(i)) {
+                assert_eq!(watch.would_close(), 0, "not counted as ack-wait expiries");
+                return (would, Some((i, watch.stall())));
+            }
             if watch.late_would_close() > before {
                 would.push(i);
             }
         }
         assert_eq!(watch.would_close(), 0, "not counted as ack-wait expiries");
-        would
+        (would, None)
     };
-    for udp_fallback in [true, false] {
+    type Late = Box<dyn Fn(usize) -> u64>;
+    let cases: Vec<(Late, Vec<usize>)> = vec![
+        (Box::new(counted(vec![at(2), at(10), at(20)])), vec![at(20)]),
+        (
+            Box::new(counted((1..=6).map(|m| at(2 * m)).collect())),
+            vec![at(6), at(12)],
+        ),
+        (Box::new(counted(vec![at(2), at(10), at(33)])), vec![]),
+        (Box::new(counted(vec![at(2), at(10)])), vec![]),
+    ];
+    for (late, would) in &cases {
         assert_eq!(
-            run(&counted(vec![at(2), at(10), at(20)]), udp_fallback),
-            vec![at(20)]
+            run(late, true, true),
+            (would.clone(), None),
+            "with UDP: {would:?}"
         );
+        // As shipped (`LATE_ENDS_CLOSE_NATIVE` false): a native path counts
+        // the same would-closes and is never closed.
         assert_eq!(
-            run(&counted((1..=6).map(|m| at(2 * m)).collect()), udp_fallback),
-            vec![at(6), at(12)]
+            run(late, false, false),
+            (would.clone(), None),
+            "native, rule dark: {would:?}"
         );
+        let (_, closed) = run(late, false, true);
         assert_eq!(
-            run(&counted(vec![at(2), at(10), at(33)]), udp_fallback),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            run(&counted(vec![at(2), at(10)]), udp_fallback),
-            Vec::<usize>::new()
+            closed,
+            would.first().map(|&i| (i, Some(Stall::LateEnds))),
+            "without UDP: {would:?}"
         );
     }
+}
+
+/// The late-end rule counts episodes, not ends (`LATE_END_EPISODE_GAP`): any
+/// number of late ends seen within a minute of the last counted one are the
+/// same episode, so one event that leaves many sends' ends late together (a
+/// loss burst, an outage onset: up to 48 permits and 64 Shorts wait) is one
+/// strike and cannot close a path. Three episodes more than a minute apart,
+/// within 30 min, do.
+#[test]
+fn a_burst_of_late_ends_is_one_episode() {
+    let times: Vec<u64> = (0..=900).map(|i| 2 * i).collect();
+    let at = |seconds: u64| (seconds / 2) as usize;
+    let counted =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    let run = |late: &dyn Fn(usize) -> u64| {
+        let record = Arc::default();
+        let sample = |i: usize| {
+            let t = i as u64;
+            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+                .with_late_ends(late(i))
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false).closing_late_ends(true);
+        for (i, time) in times.iter().enumerate().skip(1) {
+            if watch.observe(time * SEC, sample(i)) {
+                return Some((i, watch.stall()));
+            }
+        }
+        None
+    };
+    // 112 late ends (every permit and Short) in one sample: no close.
+    assert_eq!(run(&|i| if i >= at(100) { 112 } else { 0 }), None);
+    // Three ends in successive samples, then three more within a minute: still
+    // one episode.
+    assert_eq!(
+        run(&counted(vec![
+            at(100),
+            at(102),
+            at(104),
+            at(120),
+            at(130),
+            at(158)
+        ])),
+        None
+    );
+    // The gap is pinned at 60 s, `>=`: late ends at 100, 160 and 220 s are three
+    // episodes (close at 220); at 100, 158 and 216 s the second is 58 s after
+    // the first, so it is the same episode and only two count.
+    assert_eq!(
+        run(&counted(vec![at(100), at(160), at(220)])),
+        Some((at(220), Some(Stall::LateEnds)))
+    );
+    assert_eq!(run(&counted(vec![at(100), at(158), at(216)])), None);
+    // A late end at every sample for minutes is one strike a minute: closes
+    // at the third, two minutes after the first.
+    assert_eq!(
+        run(&|i| if i >= at(100) {
+            (i - at(100)) as u64 + 1
+        } else {
+            0
+        }),
+        Some((at(220), Some(Stall::LateEnds)))
+    );
+    assert_eq!(LATE_END_EPISODE_GAP, Duration::from_secs(60));
+    // Three episodes a minute and a bit apart, each with a burst: the third
+    // closes.
+    let burst = |from: usize| move |i: usize| if i >= from { 50 } else { 0 };
+    let (b1, b2, b3) = (burst(at(100)), burst(at(170)), burst(at(240)));
+    assert_eq!(
+        run(&|i| b1(i) + b2(i) + b3(i)),
+        Some((at(240), Some(Stall::LateEnds)))
+    );
+    // Two episodes do not.
+    assert_eq!(run(&|i| b1(i) + b2(i)), None);
+}
+
+/// An observe-only would-close empties the strike window, but not the episode
+/// boundary: late ends at 100, 160, 220, 222, 282 and 342 s are five episodes
+/// (220 and 222 are one), so there is ONE would-close (at 220), not two, which
+/// the field's would-close rate would otherwise overstate. A burst of samples
+/// straight after a would-close is part of the same episode.
+#[test]
+fn a_would_close_reset_does_not_split_an_episode() {
+    let times: Vec<u64> = (0..=300).map(|i| 2 * i).collect();
+    let at = |seconds: u64| (seconds / 2) as usize;
+    let run = |late: &dyn Fn(usize) -> u64| {
+        let record = Arc::default();
+        let sample = |i: usize| {
+            let t = i as u64;
+            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+                .with_late_ends(late(i))
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), true);
+        let mut would = Vec::new();
+        for (i, time) in times.iter().enumerate().skip(1) {
+            let before = watch.late_would_close();
+            assert!(
+                !watch.observe(time * SEC, sample(i)),
+                "a UDP path is not closed"
+            );
+            if watch.late_would_close() > before {
+                would.push(i);
+            }
+        }
+        would
+    };
+    let marks =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    assert_eq!(
+        run(&marks(vec![
+            at(100),
+            at(160),
+            at(220),
+            at(222),
+            at(282),
+            at(342)
+        ])),
+        vec![at(220)]
+    );
+    // A late end at every sample from 100 s: one episode a minute, so a
+    // would-close every three minutes (220, 400, 580 s).
+    assert_eq!(
+        run(&|i| if i >= at(100) {
+            (i - at(100)) as u64 + 1
+        } else {
+            0
+        }),
+        vec![at(220), at(400), at(580)]
+    );
 }
 
 /// The labels `quic_stall_close_<label>` counts under are the stalls'
