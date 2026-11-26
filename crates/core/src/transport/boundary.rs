@@ -784,6 +784,11 @@ pub(crate) trait PeerConnectionApi: Send {
         None
     }
 
+    /// EXPERIMENT: transport kind label for the listener probe.
+    fn probe_kind(&self) -> &'static str {
+        "other"
+    }
+
     /// Why `recv` ended this connection, when the transport knows. Read
     /// after `recv` returns an error, to label the disconnect in telemetry.
     /// `None` means an ordinary transport closure. Defaults to `None` for

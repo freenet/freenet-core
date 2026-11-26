@@ -3949,6 +3949,251 @@ async fn handle_peer_channel_message(
     Ok(())
 }
 
+// ===== EXPERIMENT (never merged): listener scheduling probe =====
+mod lprobe {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
+    pub(super) const ST_SELECT: u8 = 0;
+    pub(super) const ST_OUT: u8 = 1;
+    pub(super) const ST_FWD: u8 = 2;
+    pub(super) const ST_DRAIN: u8 = 3;
+    pub(super) struct Shared {
+        pub state: AtomicU8,
+        pub since_ms: AtomicU64, // ms since probe epoch when state entered
+        pub label: std::sync::Mutex<&'static str>,
+        pub done: AtomicBool,
+    }
+    pub(super) struct Probe {
+        pub sh: Arc<Shared>,
+        pub epoch: Instant,
+        pub peer: SocketAddr,
+        pub kind: &'static str,
+        pub stamp: Option<crate::transport::ReceiptStamp>,
+        pub last_exit: Instant,
+        pub seg_start: Instant,
+        pub seg_state: u8,
+        pub seg_label: String,
+        pub max_gap: Duration,
+        pub gaps: [u64; 4], // >1s >5s >10s >30s
+        pub iters: u64,
+        pub max_out: Duration,
+        pub max_fwd: Duration,
+        pub out_label: String,
+        pub fwd_label: String,
+    }
+    pub(super) fn name(st: u8) -> &'static str {
+        match st {
+            ST_SELECT => "select",
+            ST_OUT => "outbound",
+            ST_FWD => "forward",
+            _ => "drain",
+        }
+    }
+    impl Probe {
+        pub fn new(
+            peer: SocketAddr,
+            kind: &'static str,
+            stamp: Option<crate::transport::ReceiptStamp>,
+        ) -> Self {
+            let epoch = Instant::now();
+            let sh = Arc::new(Shared {
+                state: AtomicU8::new(ST_SELECT),
+                since_ms: AtomicU64::new(0),
+                label: std::sync::Mutex::new("init"),
+                done: AtomicBool::new(false),
+            });
+            let p = Probe {
+                sh: sh.clone(),
+                epoch,
+                peer,
+                kind,
+                stamp: stamp.clone(),
+                last_exit: epoch,
+                seg_start: epoch,
+                seg_state: ST_SELECT,
+                seg_label: String::new(),
+                max_gap: Duration::ZERO,
+                gaps: [0; 4],
+                iters: 0,
+                max_out: Duration::ZERO,
+                max_fwd: Duration::ZERO,
+                out_label: String::new(),
+                fwd_label: String::new(),
+            };
+            // Sampler: watches stamp age and the listener's state from outside.
+            let (shs, st) = (sh, stamp);
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                let mut silent_since: Option<Instant> = None;
+                let mut max_age_sel = Duration::ZERO;
+                let mut max_age_blk = Duration::ZERO;
+                let mut n_age = [0u64; 3]; // samples >10s >30s >60s
+                let mut n_samples = 0u64;
+                let mut n_blocked_samples = 0u64;
+                let mut max_blocked = Duration::ZERO;
+                let mut blocked_logged = false;
+                let mut last_sum = Instant::now();
+                loop {
+                    tick.tick().await;
+                    if shs.done.load(Relaxed) {
+                        break;
+                    }
+                    let state = shs.state.load(Relaxed);
+                    let since = Duration::from_millis(
+                        epoch.elapsed().as_millis() as u64
+                            - shs
+                                .since_ms
+                                .load(Relaxed)
+                                .min(epoch.elapsed().as_millis() as u64),
+                    );
+                    let label = *shs.label.lock().unwrap();
+                    let (qlat_max, qlat_n_over1, qlat_n) =
+                        crate::transport::peer_connection::probe_qlat_take(peer);
+                    n_samples += 1;
+                    let blocked = state != ST_SELECT;
+                    if blocked {
+                        n_blocked_samples += 1;
+                        if since > max_blocked {
+                            max_blocked = since;
+                        }
+                    }
+                    if blocked && since >= Duration::from_secs(5) && !blocked_logged {
+                        blocked_logged = true;
+                        tracing::info!(target:"lprobe", "LPROBE_BLOCKED_NOW peer={peer} kind={kind} state={} label={label} blocked_for_ms={}", name(state), since.as_millis());
+                    }
+                    if !blocked {
+                        blocked_logged = false;
+                    }
+                    if let Some(st) = &st {
+                        let age = st.since_last_receipt();
+                        if age > Duration::from_secs(10) {
+                            n_age[0] += 1;
+                        }
+                        if age > Duration::from_secs(30) {
+                            n_age[1] += 1;
+                        }
+                        if age > Duration::from_secs(60) {
+                            n_age[2] += 1;
+                        }
+                        if blocked {
+                            if age > max_age_blk {
+                                max_age_blk = age;
+                            }
+                        } else if age > max_age_sel {
+                            max_age_sel = age;
+                        }
+                        if age >= Duration::from_secs(20) {
+                            if silent_since.is_none() {
+                                silent_since = Some(Instant::now());
+                            }
+                            if silent_since
+                                .map(|t| t.elapsed() < Duration::from_millis(1500))
+                                .unwrap_or(false)
+                                || age.as_secs() % 30 == 0
+                            {
+                                tracing::info!(target:"lprobe", "LPROBE_SILENT peer={peer} kind={kind} age_ms={} listener_state={} state_for_ms={} label={label} qlat_max_ms={} qlat_over1s={}", age.as_millis(), name(state), since.as_millis(), qlat_max/1_000_000, qlat_n_over1);
+                            }
+                        } else if silent_since.take().is_some() {
+                            tracing::info!(target:"lprobe", "LPROBE_SILENT_END peer={peer} kind={kind} age_ms={} listener_state={}", age.as_millis(), name(state));
+                        }
+                    }
+                    let _ = qlat_n;
+                    if qlat_max >= 1_000_000_000 {
+                        tracing::info!(target:"lprobe", "LPROBE_QLAT peer={peer} kind={kind} max_ms={} n_over1s={} listener_state={} state_for_ms={}", qlat_max/1_000_000, qlat_n_over1, name(state), since.as_millis());
+                    }
+                    if last_sum.elapsed() >= Duration::from_secs(300) {
+                        last_sum = Instant::now();
+                        tracing::info!(target:"lprobe", "LPROBE_SAMPLER peer={peer} kind={kind} age_s={} samples={n_samples} blocked_samples={n_blocked_samples} max_blocked_ms={} age_gt10={} age_gt30={} age_gt60={} max_age_ms_listener_in_select={} max_age_ms_listener_blocked={}", epoch.elapsed().as_secs(), max_blocked.as_millis(), n_age[0], n_age[1], n_age[2], max_age_sel.as_millis(), max_age_blk.as_millis());
+                    }
+                }
+                tracing::info!(target:"lprobe", "LPROBE_SAMPLER_END peer={peer} kind={kind} age_s={} samples={n_samples} blocked_samples={n_blocked_samples} max_blocked_ms={} age_gt10={} age_gt30={} age_gt60={} max_age_ms_listener_in_select={} max_age_ms_listener_blocked={}", epoch.elapsed().as_secs(), max_blocked.as_millis(), n_age[0], n_age[1], n_age[2], max_age_sel.as_millis(), max_age_blk.as_millis());
+            });
+            p
+        }
+        fn set(&self, st: u8, label: &'static str) {
+            *self.sh.label.lock().unwrap() = label;
+            self.sh
+                .since_ms
+                .store(self.epoch.elapsed().as_millis() as u64, Relaxed);
+            self.sh.state.store(st, Relaxed);
+        }
+        /// Listener about to (re-)enter the select (recv polled from here on).
+        pub fn enter_select(&mut self) {
+            self.iters += 1;
+            let gap = self.last_exit.elapsed();
+            if gap > self.max_gap {
+                self.max_gap = gap;
+            }
+            for (i, t) in [1u64, 5, 10, 30].iter().enumerate() {
+                if gap >= Duration::from_secs(*t) {
+                    self.gaps[i] += 1;
+                }
+            }
+            if gap >= Duration::from_secs(1) {
+                let age = self
+                    .stamp
+                    .as_ref()
+                    .map(|s| s.since_last_receipt().as_millis() as i64)
+                    .unwrap_or(-1);
+                tracing::info!(target:"lprobe", "LPROBE_GAP peer={} kind={} recv_unpolled_ms={} stamp_age_now_ms={age}", self.peer, self.kind, gap.as_millis());
+            }
+            self.set(ST_SELECT, "select");
+        }
+        /// recv no longer polled from here until enter_select.
+        pub fn exit_select(&mut self) {
+            self.last_exit = Instant::now();
+        }
+        pub fn begin(&mut self, st: u8, label: String, label_static: &'static str) {
+            self.seg_start = Instant::now();
+            self.seg_state = st;
+            self.seg_label = label;
+            self.set(st, label_static);
+        }
+        pub fn end(&mut self) {
+            let d = self.seg_start.elapsed();
+            if self.seg_state == ST_FWD {
+                if d > self.max_fwd {
+                    self.max_fwd = d;
+                    self.fwd_label = self.seg_label.clone();
+                }
+            } else if d > self.max_out {
+                self.max_out = d;
+                self.out_label = self.seg_label.clone();
+            }
+            if d >= Duration::from_secs(1) {
+                let age = self
+                    .stamp
+                    .as_ref()
+                    .map(|s| s.since_last_receipt().as_millis() as i64)
+                    .unwrap_or(-1);
+                tracing::info!(target:"lprobe", "LPROBE_SEG peer={} kind={} branch={} what={} dur_ms={} stamp_age_at_end_ms={age}", self.peer, self.kind, name(self.seg_state), self.seg_label, d.as_millis());
+            }
+        }
+        pub fn finish(&mut self) {
+            self.sh.done.store(true, Relaxed);
+            tracing::info!(target:"lprobe", "LPROBE_LISTENER_END peer={} kind={} age_s={} iters={} max_unpolled_ms={} unpolled_gt1s={} gt5s={} gt10s={} gt30s={} max_out_ms={} out_what={} max_fwd_ms={} fwd_what={}", self.peer, self.kind, self.epoch.elapsed().as_secs(), self.iters, self.max_gap.as_millis(), self.gaps[0], self.gaps[1], self.gaps[2], self.gaps[3], self.max_out.as_millis(), self.out_label, self.max_fwd.as_millis(), self.fwd_label);
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+}
+fn lprobe_msg_label(m: &Either<NetMessage, ConnEvent>) -> (String, &'static str) {
+    match m {
+        Left(n) => (
+            format!("send_bytes:{:?}", n.id().transaction_type()),
+            "send_bytes",
+        ),
+        Right(ConnEvent::StreamSend { .. }) => ("StreamSend".into(), "StreamSend"),
+        Right(ConnEvent::PipeStream { .. }) => ("PipeStream".into(), "PipeStream"),
+        Right(_) => ("other_action".into(), "other_action"),
+    }
+}
+// ===== end experiment =====
+
 async fn notify_transport_closed(
     sender: &Sender<ConnEvent>,
     remote_addr: SocketAddr,
@@ -4039,6 +4284,7 @@ async fn peer_connection_listener(
     report_first_frame: bool,
 ) {
     let remote_addr = conn.remote_addr();
+    let mut probe = lprobe::Probe::new(remote_addr, conn.probe_kind(), conn.receipt_stamp());
     // A native connection tells the event loop once when it first hears from
     // the peer, for the survivor rule's hold (`HeldNative`).
     let mut first_frame_pending = report_first_frame;
@@ -4071,15 +4317,18 @@ async fn peer_connection_listener(
             match rx.try_recv() {
                 Ok(msg) => {
                     drained += 1;
-                    if let Err(error) = handle_peer_channel_message(
+                    let (lbl, ls) = lprobe_msg_label(&msg);
+                    probe.begin(lprobe::ST_DRAIN, lbl, ls);
+                    let lres = handle_peer_channel_message(
                         &mut conn,
                         msg,
                         &outbound_mix,
                         &propagation,
                         native_wire,
                     )
-                    .await
-                    {
+                    .await;
+                    probe.end();
+                    if let Err(error) = lres {
                         if !error.closes_connection() {
                             warn_transient_send_failure(
                                 remote_addr,
@@ -4144,11 +4393,17 @@ async fn peer_connection_listener(
 
         // Now wait for either new outbound or inbound messages fairly
         // Uses deterministic_select! for consistent test behavior under DST
+        probe.enter_select();
         crate::deterministic_select! {
             msg = rx.recv() => {
+                probe.exit_select();
                 match msg {
                     Some(msg) => {
-                        if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation, native_wire).await {
+                        let (lbl, ls) = lprobe_msg_label(&msg);
+                        probe.begin(lprobe::ST_OUT, lbl, ls);
+                        let lres = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation, native_wire).await;
+                        probe.end();
+                        if let Err(error) = lres {
                             if !error.closes_connection() {
                                 warn_transient_send_failure(
                                     remote_addr,
@@ -4196,6 +4451,7 @@ async fn peer_connection_listener(
                 }
             },
             msg = conn.recv() => {
+                probe.exit_select();
                 match msg {
                     Ok(msg) => match native_wire.decode(|| decode_msg(&msg)) {
                         Ok(net_message) => {
@@ -4211,6 +4467,7 @@ async fn peer_connection_listener(
                             // may not dequeue it for a while, and the zombie sweep
                             // must already see this transport as in use (#5654).
                             zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
+                            probe.begin(lprobe::ST_FWD, format!("fwd_inbound:{:?}", tx.transaction_type()), "fwd_inbound");
                             if first_frame_pending {
                                 first_frame_pending = false;
                                 if conn_events
@@ -4224,14 +4481,15 @@ async fn peer_connection_listener(
                                     return;
                                 }
                             }
-                            if conn_events
+                            let lfwd_failed = conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
                                     remote_addr,
                                 )))
                                 .await
-                                .is_err()
-                            {
+                                .is_err();
+                            probe.end();
+                            if lfwd_failed {
                                 tracing::debug!(
                                     from = %remote_addr,
                                     "[CONN_LIFECYCLE] conn_events receiver dropped; stopping listener"

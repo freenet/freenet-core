@@ -134,6 +134,30 @@ pub(in crate::transport) const RESEND_YIELD_DELAY: Duration = Duration::from_mil
 /// time, the forwarded packets first); `inbound_concurrency` keeps its
 /// arrival times sorted on that basis and counts its window by binary
 /// search.
+static PROBE_QLAT: std::sync::Mutex<
+    Option<std::collections::HashMap<SocketAddr, (u64, u64, u64)>>,
+> = std::sync::Mutex::new(None);
+pub(crate) fn probe_qlat_record(peer: SocketAddr, lat_nanos: u64) {
+    let mut g = PROBE_QLAT.lock().unwrap();
+    let e = g
+        .get_or_insert_with(Default::default)
+        .entry(peer)
+        .or_insert((0, 0, 0));
+    e.0 = e.0.max(lat_nanos);
+    if lat_nanos >= 1_000_000_000 {
+        e.1 += 1;
+    }
+    e.2 += 1;
+}
+/// (max latency ns, count over 1 s, count) since the last take.
+pub(crate) fn probe_qlat_take(peer: SocketAddr) -> (u64, u64, u64) {
+    let mut g = PROBE_QLAT.lock().unwrap();
+    g.get_or_insert_with(Default::default)
+        .get_mut(&peer)
+        .map(|e| std::mem::take(e))
+        .unwrap_or((0, 0, 0))
+}
+
 pub(crate) struct InboundPacket {
     pub(crate) packet: PacketData<UnknownEncryption>,
     pub(crate) queued_nanos: u64,
@@ -1705,6 +1729,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     let InboundPacket { packet: packet_data, queued_nanos } =
                         inbound.ok_or_else(|| TransportError::ConnectionClosed(self.remote_addr()))?;
                     self.last_received_nanos = self.time_source.now_nanos();
+                    probe_qlat_record(self.remote_conn.remote_addr, self.last_received_nanos.saturating_sub(queued_nanos));
 
                     // Debug logging for intro packets
                     if packet_data.is_intro_packet() {
@@ -4203,6 +4228,10 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
     // (`node::network_bridge::p2p_protoc::identity::HOLD_WINDOW`).
     fn receipt_stamp(&self) -> Option<super::ReceiptStamp> {
         Some(self.receipt_stamp_handle())
+    }
+
+    fn probe_kind(&self) -> &'static str {
+        "udp"
     }
 
     fn send_bytes(

@@ -397,6 +397,10 @@ impl PeerConnectionApi for NativePeerConnection {
         Some(self.remote_version)
     }
 
+    fn probe_kind(&self) -> &'static str {
+        "quic-native"
+    }
+
     fn receipt_stamp(&self) -> Option<ReceiptStamp> {
         let clock = self.clock.clone();
         // No UDP side: its time is 0, so the stamp reads the path's alone.
