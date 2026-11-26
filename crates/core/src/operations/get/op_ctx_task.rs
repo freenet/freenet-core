@@ -4255,59 +4255,6 @@ where
     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
     let htl = htl.min(ring_max_htl);
 
-    // ── Short-circuit 1: HTL = 0 ────────────────────────────────────────
-    if htl == 0 {
-        tracing::warn!(
-            tx = %incoming_tx,
-            %instance_id,
-            %upstream_addr,
-            htl = 0,
-            phase = "not_found",
-            "GET relay: HTL exhausted — sending NotFound upstream"
-        );
-        if let Some(event) = crate::tracing::NetEventLog::get_not_found(
-            &incoming_tx,
-            &op_manager.ring,
-            instance_id,
-            Some(op_manager.ring.max_hops_to_live),
-            None,
-        ) {
-            op_manager
-                .ring
-                .register_events(either::Either::Left(event))
-                .await;
-        }
-        // HTL=0 path: the original Request reached us with htl already at 0,
-        // meaning the request traversed the full max_htl forward hops to get
-        // here. hop_count = max_htl - 0 = max_htl.
-        let hop_count = op_manager.ring.max_hops_to_live;
-        // EXPERIMENT-ONLY (findability_probe): record the HTL-exhaustion GET
-        // terminus. NOT for ship.
-        #[cfg(any(test, feature = "testing"))]
-        {
-            let visited = visited.clone();
-            crate::operations::findability_probe::record_terminus(
-                &op_manager.ring,
-                crate::operations::findability_probe::ProbeOpKind::Get,
-                &incoming_tx,
-                crate::ring::Location::from(&instance_id),
-                htl,
-                hop_count,
-                crate::operations::findability_probe::ProbeStopReason::HtlZero,
-                move |addr| visited.probably_visited(addr),
-            );
-        }
-        relay_send_not_found(
-            op_manager,
-            incoming_tx,
-            instance_id,
-            upstream_addr,
-            hop_count,
-        )
-        .await;
-        return Ok(());
-    }
-
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
 
     // Hosting attribution for EVERY local store this driver makes. Computed once
@@ -4325,7 +4272,7 @@ where
     }
     new_visited.mark_visited(upstream_addr);
 
-    // ── Short-circuit 2: Local cache hit with interest ───────────────────
+    // ── Short-circuit 1: Local cache hit with interest ───────────────────
     let (local_value, local_fallback) = match check_local_with_interest_gate(
         op_manager,
         &instance_id,
@@ -4509,6 +4456,120 @@ where
         )
         .await;
         send_result?;
+        return Ok(());
+    }
+
+    // ── Short-circuit 2: HTL = 0, nothing fresh to serve ─────────────────
+    // Runs AFTER the local-hit arm above on purpose: a peer that holds a
+    // fresh copy answers Found whatever the HTL. HTL only bounds FORWARDING,
+    // so HTL = 0 never forwards but must not hide a copy this node serves at
+    // any other HTL (the sim trace in ~/code/scratch/placement-gap/TRACE.md:
+    // a GET reached the holder exactly at HTL 0 and got NotFound). Reaching
+    // here means the local arm found no FRESH copy. A stale-but-hosted copy
+    // (`local_fallback`: no local interest, still in the update mesh) is served
+    // as well, exactly as the exhaustion arm below serves it: at HTL 0 routing
+    // is exhausted by definition (this node cannot forward), so the same rule
+    // applies. Fresh copy first, fallback second, NotFound only with neither.
+    if htl == 0 {
+        if let Some((key, state, contract)) = local_fallback {
+            tracing::info!(
+                tx = %incoming_tx,
+                %instance_id,
+                contract = %key,
+                htl = 0,
+                "GET relay: HTL exhausted — serving local fallback"
+            );
+            // Forward upstream first, cache after (#4155), as at R4 and R10.
+            let hop_count = op_manager.ring.max_hops_to_live;
+            // EXPERIMENT-ONLY (findability_probe), as at R4: record that a GET
+            // reached a live local copy. NOT for ship.
+            #[cfg(any(test, feature = "testing"))]
+            {
+                let visited = new_visited.clone();
+                crate::operations::findability_probe::record_terminus(
+                    &op_manager.ring,
+                    crate::operations::findability_probe::ProbeOpKind::Get,
+                    &incoming_tx,
+                    crate::ring::Location::from(&instance_id),
+                    htl,
+                    hop_count,
+                    crate::operations::findability_probe::ProbeStopReason::Found,
+                    move |addr| visited.probably_visited(addr),
+                );
+            }
+            let send_result = relay_send_found(
+                op_manager,
+                conn_manager,
+                incoming_tx,
+                instance_id,
+                upstream_addr,
+                key,
+                state.clone(),
+                contract.clone(),
+                hop_count,
+            )
+            .await;
+            cache_contract_locally(
+                op_manager,
+                &instance_id,
+                key,
+                state,
+                contract,
+                false,
+                hosting_cause,
+            )
+            .await;
+            send_result?;
+            return Ok(());
+        }
+        tracing::warn!(
+            tx = %incoming_tx,
+            %instance_id,
+            %upstream_addr,
+            htl = 0,
+            phase = "not_found",
+            "GET relay: HTL exhausted — sending NotFound upstream"
+        );
+        if let Some(event) = crate::tracing::NetEventLog::get_not_found(
+            &incoming_tx,
+            &op_manager.ring,
+            instance_id,
+            Some(op_manager.ring.max_hops_to_live),
+            None,
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+        // HTL=0 path: the original Request reached us with htl already at 0,
+        // meaning the request traversed the full max_htl forward hops to get
+        // here. hop_count = max_htl - 0 = max_htl.
+        let hop_count = op_manager.ring.max_hops_to_live;
+        // EXPERIMENT-ONLY (findability_probe): record the HTL-exhaustion GET
+        // terminus. NOT for ship.
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let visited = new_visited.clone();
+            crate::operations::findability_probe::record_terminus(
+                &op_manager.ring,
+                crate::operations::findability_probe::ProbeOpKind::Get,
+                &incoming_tx,
+                crate::ring::Location::from(&instance_id),
+                htl,
+                hop_count,
+                crate::operations::findability_probe::ProbeStopReason::HtlZero,
+                move |addr| visited.probably_visited(addr),
+            );
+        }
+        relay_send_not_found(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            upstream_addr,
+            hop_count,
+        )
+        .await;
         return Ok(());
     }
 
@@ -7672,9 +7733,9 @@ mod tests {
     // without requiring a full simulation harness.  They mirror the pattern
     // established by the client driver tests above.
 
-    /// T1: HTL=0 short-circuit must send NotFound upstream without entering
-    /// the retry loop.  The source must contain the htl==0 guard BEFORE the
-    /// first `relay_advance_to_next_peer` call.
+    /// T1: the HTL=0 short-circuit (serve a held copy, else NotFound) must
+    /// return without entering the retry loop.  The source must contain the
+    /// htl==0 guard BEFORE the first `relay_advance_to_next_peer` call.
     #[test]
     fn relay_driver_htl_zero_guard_precedes_retry_loop() {
         let src = production_source();
@@ -7694,7 +7755,9 @@ mod tests {
 
     /// T2: Local cache short-circuit must send Found upstream without entering
     /// the retry loop.  The source must contain the local-cache check BEFORE
-    /// `relay_advance_to_next_peer` and AFTER the HTL guard.
+    /// `relay_advance_to_next_peer` and BEFORE the HTL guard (HTL only bounds
+    /// forwarding, so a held copy is served at HTL 0 too; see
+    /// `htl_zero_relay_serves_a_held_copy_before_answering_not_found`).
     #[test]
     fn relay_driver_local_cache_check_precedes_retry_loop() {
         let src = production_source();
@@ -7878,12 +7941,12 @@ mod tests {
         );
     }
 
-    /// T4b: All three relay-driver callsites must forward upstream
+    /// T4b: All four relay-driver callsites must forward upstream
     /// BEFORE caching locally (issue #4155). Mirrors T4 for the other
-    /// two relay paths that the source-scrape
+    /// three relay paths that the source-scrape
     /// `all_relay_callsites_pass_is_client_requester_false` test already
-    /// recognizes (R4 immediate-serve, R10 exhaustion fallback, R12a
-    /// bubble-up).
+    /// recognizes (R4 immediate-serve, the HTL-0 stale fallback, R10
+    /// exhaustion fallback, R12a bubble-up).
     #[test]
     fn all_relay_callsites_forward_before_caching() {
         let src = production_source();
@@ -7902,29 +7965,33 @@ mod tests {
             .collect();
         assert_eq!(
             send_positions.len(),
-            3,
-            "drive_relay_get_inner should have exactly three \
-             `relay_send_found(` callsites (R4 immediate, R10 fallback, \
-             R12a bubble-up). Found {} — a refactor has changed the shape.",
+            4,
+            "drive_relay_get_inner should have exactly four \
+             `relay_send_found(` callsites (R4 immediate, the HTL-0 stale \
+             fallback, R10 exhaustion fallback, R12a bubble-up). The HTL-0 \
+             site exists because at HTL 0 routing is exhausted by definition \
+             (the node cannot forward), so a stale-but-hosted copy is served \
+             exactly as R10 serves it. Found {} — a refactor has changed the \
+             shape.",
             send_positions.len(),
         );
         assert_eq!(
             cache_positions.len(),
-            5,
-            "drive_relay_get_inner should have exactly five \
-             `cache_contract_locally(` callsites (R4, R10, R12a, plus the \
-             two #4307 streaming-arm caches). Found {} — a refactor has \
-             changed the shape.",
+            6,
+            "drive_relay_get_inner should have exactly six \
+             `cache_contract_locally(` callsites (R4, HTL-0 fallback, R10, \
+             R12a, plus the two #4307 streaming-arm caches). Found {} — a \
+             refactor has changed the shape.",
             cache_positions.len(),
         );
-        // Pair the three `relay_send_found` callsites (R4, R10, R12a) with
+        // Pair the four `relay_send_found` callsites (R4, HTL-0, R10, R12a) with
         // their corresponding inline-Found caches and verify each `send`
         // comes before its `cache`. The streaming-arm caches (positions
-        // 4 and 5) forward via `pipe_stream` rather than `relay_send_found`
+        // 5 and 6) forward via `pipe_stream` rather than `relay_send_found`
         // and are covered by `relay_streaming_arm_forwards_before_caching`,
         // so they are intentionally excluded from this positional pairing.
-        // The three sends all precede the streaming arm in source order, so
-        // zipping against the first three caches is correct.
+        // The four sends all precede the streaming arm in source order, so
+        // zipping against the first four caches is correct.
         for (idx, (send_pos, cache_pos)) in send_positions
             .iter()
             .zip(cache_positions.iter())
@@ -8199,10 +8266,78 @@ mod tests {
             "HTL=0 NotFound must be sent to `upstream_addr`, not any other \
              peer. Guard body was: {guard_block}"
         );
+        // The fallback arm also returns, so look for the return only after the
+        // NotFound send.
+        let not_found_at = guard_block
+            .find("relay_send_not_found")
+            .expect("checked above");
         assert!(
-            guard_block.contains("return Ok(())"),
+            guard_block[not_found_at..].contains("return Ok(())"),
             "HTL=0 guard must return early after sending NotFound; otherwise \
              execution would fall into the retry loop with htl=0."
+        );
+    }
+
+    /// A relay that holds a servable copy answers Found whatever the request's
+    /// HTL: HTL only bounds forwarding. A GET that reached the holder with
+    /// HTL = 0 used to get NotFound because the `htl == 0` guard ran before the
+    /// local lookup (sim trace, placement-gap TRACE.md). The guard must come
+    /// after the local-hit arm, so a held copy is served by the same
+    /// `check_local_with_interest_gate` path (and its interest/freshness rule)
+    /// as at any other HTL, and only a node with nothing to serve answers
+    /// NotFound. HTL = 0 still never forwards.
+    ///
+    /// Source-scrape pin: the relay driver needs a full `OpManager`, which no
+    /// unit harness builds. Mutation check: moving the guard back above the
+    /// local lookup turns this red (run when written; see the commit message).
+    #[test]
+    fn htl_zero_relay_serves_a_held_copy_before_answering_not_found() {
+        let body = code_only(extract_fn_body(
+            production_source(),
+            "async fn drive_relay_get_inner<CB>(",
+        ));
+        let guard = body
+            .find("ifhtl==0{")
+            .expect("htl==0 guard must exist at statement position");
+        let lookup = body
+            .find("check_local_with_interest_gate(")
+            .expect("local lookup must exist");
+        let serve = body
+            .find("ifletSome((key,state,contract))=local_value{")
+            .expect("local-hit arm must exist");
+        assert!(
+            lookup < guard && serve < guard,
+            "the `htl == 0` guard must come AFTER the local lookup and the \
+             local-hit arm, or a peer holding the contract answers NotFound \
+             when the request arrives with HTL 0"
+        );
+        // Fresh copy first, then the stale-but-hosted fallback (routing is
+        // exhausted at HTL 0), then NotFound; and HTL 0 never forwards.
+        let tail = &body[guard..];
+        let fallback = tail
+            .find("ifletSome((key,state,contract))=local_fallback{")
+            .expect("HTL 0 must serve a stale-but-hosted local_fallback");
+        let not_found = tail
+            .find("relay_send_not_found(")
+            .expect("the not-held branch must send NotFound upstream");
+        assert!(
+            fallback < not_found,
+            "the HTL-0 fallback must be tried before NotFound is sent"
+        );
+        let fallback_arm = &tail[fallback..not_found];
+        assert!(
+            fallback_arm.contains("relay_send_found("),
+            "the HTL-0 fallback arm must send Found upstream, not just log"
+        );
+        let guard_end = not_found
+            + tail[not_found..]
+                .find("returnOk(());")
+                .expect("guard returns early");
+        let guard_block = &tail[..guard_end];
+        assert!(
+            !guard_block.contains("relay_advance_to_next_peer")
+                && !guard_block.contains("send_to_and_await"),
+            "HTL=0 must never forward"
         );
     }
 
@@ -8961,13 +9096,14 @@ mod tests {
 
     /// All relay-driver cache callsites must pass `false`.
     /// Relay caches forwarded Found payloads but MUST NOT flag them as
-    /// client-accessed on the relay's own hosting cache. There are five
+    /// client-accessed on the relay's own hosting cache. There are six
     /// relay cache callsites in `drive_relay_get_inner`:
     ///   1. Active-interest local Found (R4, immediate serve)
-    ///   2. Exhaustion fallback (R10, stale local state)
-    ///   3. Downstream Found bubble-up (R12a, forwarded payload)
-    ///   4. Streaming loopback safety-net (#4307, upstream == own_addr)
-    ///   5. Streaming forward best-effort cache (#4307, after pipe_stream)
+    ///   2. HTL-0 fallback (stale local state, routing exhausted at HTL 0)
+    ///   3. Exhaustion fallback (R10, stale local state)
+    ///   4. Downstream Found bubble-up (R12a, forwarded payload)
+    ///   5. Streaming loopback safety-net (#4307, upstream == own_addr)
+    ///   6. Streaming forward best-effort cache (#4307, after pipe_stream)
     #[test]
     fn all_relay_callsites_pass_is_client_requester_false() {
         let src = production_source();
@@ -8978,10 +9114,11 @@ mod tests {
             .collect();
         assert_eq!(
             callsites.len(),
-            5,
-            "drive_relay_get_inner should have exactly five \
-             cache_contract_locally callsites (R4 immediate, R10 fallback, \
-             R12a bubble-up, plus the two #4307 streaming-arm caches). \
+            6,
+            "drive_relay_get_inner should have exactly six \
+             cache_contract_locally callsites (R4 immediate, HTL-0 fallback, \
+             R10 fallback, R12a bubble-up, plus the two #4307 streaming-arm \
+             caches). \
              Found {} — a refactor has changed the shape.",
             callsites.len(),
         );

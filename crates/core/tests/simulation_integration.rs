@@ -26008,3 +26008,201 @@ fn simulation_data_dirs_are_private_to_this_process() {
         "the gateway's data dir is not under this process's root {own_root}"
     );
 }
+
+/// A GET that reaches the node holding the contract with no hops left (HTL 0)
+/// must be answered Found, not NotFound. HTL only bounds forwarding; the relay
+/// GET driver used to test `htl == 0` before it looked at its own store, so a
+/// holder reached at exactly HTL 0 answered NotFound.
+///
+/// One copy is seeded at the node closest to the key with scatter off (so it
+/// stays the only copy), and every other node GETs it. `ring_max_htl` is swept
+/// low so some request is spent exactly when it arrives at the holder. The GET
+/// terminus probe records `HtlZero` for an HTL-exhausted NotFound and `Found`
+/// for a local serve, so an `HtlZero` terminus AT the holder is the bug.
+///
+/// The probe record is written before the Found frame is sent, so it cannot
+/// show that the requester received the answer. The client-visible check does:
+/// a requester that was answered Found stores the state, and a GET attempt
+/// logs `GetSuccess` at the requester. With `ring_max_htl = 1` the only way a
+/// request reaches the holder is at HTL 0, so dropping the send leaves no
+/// requester with state and no successful attempt.
+///
+/// Two seedings are run: `SeedHostedContract` (the holder has no local interest,
+/// so HTL 0 serves it through the stale-but-hosted fallback) and
+/// `SeedDemandlessCopy` (the holder has local interest, which is what every
+/// hosted copy registers in production, so HTL 0 serves it through the fresh
+/// path).
+#[test_log::test]
+fn test_get_reaching_holder_at_htl_zero_is_answered_found() {
+    let mut served_at_htl_zero_total = 0usize;
+    for demandless in [false, true] {
+        for ring_max_htl in 1..=4usize {
+            let run = run_get_at_htl_zero_sim(ring_max_htl, demandless);
+            eprintln!(
+                "demandless={demandless} ring_max_htl={ring_max_htl}: holder \
+                 NotFound-at-HTL0={} Found-at-HTL0={} requesters_with_state={} \
+                 successful_attempts={}",
+                run.not_found_at_htl_zero,
+                run.found_at_htl_zero,
+                run.requesters_with_state,
+                run.successful_attempts,
+            );
+            assert_eq!(
+                run.not_found_at_htl_zero, 0,
+                "demandless={demandless} ring_max_htl={ring_max_htl}: a GET reached the \
+                 holder with HTL 0 and was answered NotFound although the holder hosts \
+                 the contract"
+            );
+            if run.found_at_htl_zero > 0 {
+                assert!(
+                    run.requesters_with_state >= 1 && run.successful_attempts >= 1,
+                    "demandless={demandless} ring_max_htl={ring_max_htl}: the holder served \
+                     {} GETs at HTL 0 but no requester received the contract \
+                     (requesters_with_state={}, successful_attempts={}): the Found frame \
+                     was not sent",
+                    run.found_at_htl_zero,
+                    run.requesters_with_state,
+                    run.successful_attempts,
+                );
+            }
+            if ring_max_htl == 1 {
+                // Every request that reaches the holder does so at HTL 0, so a
+                // holder with a servable copy next to any requester must have
+                // answered at least one.
+                assert!(
+                    run.found_at_htl_zero > 0 && run.requesters_with_state >= 1,
+                    "demandless={demandless}: with ring_max_htl=1 no GET was served by the \
+                     holder at HTL 0; the scenario no longer exercises the HTL-0 boundary"
+                );
+            }
+            served_at_htl_zero_total += run.found_at_htl_zero;
+        }
+    }
+    assert!(served_at_htl_zero_total > 0);
+}
+
+struct GetAtHtlZeroRun {
+    not_found_at_htl_zero: usize,
+    found_at_htl_zero: usize,
+    requesters_with_state: usize,
+    successful_attempts: usize,
+}
+
+/// One sweep point of `test_get_reaching_holder_at_htl_zero_is_answered_found`.
+fn run_get_at_htl_zero_sim(ring_max_htl: usize, demandless: bool) -> GetAtHtlZeroRun {
+    use freenet::dev_tool::{
+        Location, NodeLabel, ProbeOpKind, ProbeStopReason, ScheduledOperation, SimNetwork,
+        SimOperation,
+    };
+
+    const NUM_NODES: usize = 12;
+    let seed = 0x4854_4C30_0000_u64 + ring_max_htl as u64 + if demandless { 0x100 } else { 0 };
+    setup_deterministic_state(seed);
+    freenet::dev_tool::set_scatter_disabled(true);
+    freenet::dev_tool::clear_op_traces();
+    let _guard = NnLatticeTestGuard;
+
+    let network = format!("get-htl0-holder-{ring_max_htl}-{demandless}");
+    let contract = SimOperation::create_test_contract(0xA5);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let node_locations = nn_node_locations(key_loc, NUM_NODES);
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            ring_max_htl,
+            ring_max_htl,
+            4,
+            2,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let holder_no = ranked[0];
+    let holder_loc = locs[holder_no];
+    let holder = NodeLabel::node(&network, holder_no);
+
+    let state = SimOperation::create_test_state(1);
+    let seed_op = if demandless {
+        SimOperation::SeedDemandlessCopy {
+            contract: contract.clone(),
+            state,
+        }
+    } else {
+        SimOperation::SeedHostedContract {
+            contract: contract.clone(),
+            state,
+        }
+    };
+    let mut operations = vec![ScheduledOperation::new(holder.clone(), seed_op)];
+    let mut requesters = Vec::new();
+    for n in 1..=NUM_NODES {
+        if n != holder_no {
+            let label = NodeLabel::node(&network, n);
+            requesters.push(label.clone());
+            operations.push(ScheduledOperation::new(
+                label,
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    }
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(240),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "ring_max_htl={ring_max_htl}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        result.is_node_hosting(&holder, &contract_key),
+        "ring_max_htl={ring_max_htl}: the seeded holder must still host"
+    );
+
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let traces = freenet::dev_tool::take_op_traces();
+    let at_holder = |t: &&freenet::dev_tool::OpTraceRecord| {
+        matches!(t.kind, ProbeOpKind::Get) && (t.own_loc - holder_loc).abs() < 1e-9
+    };
+    GetAtHtlZeroRun {
+        not_found_at_htl_zero: traces
+            .iter()
+            .filter(at_holder)
+            .filter(|t| matches!(t.stop_reason, ProbeStopReason::HtlZero))
+            .count(),
+        found_at_htl_zero: traces
+            .iter()
+            .filter(at_holder)
+            .filter(|t| matches!(t.stop_reason, ProbeStopReason::Found) && t.htl_remaining == 0)
+            .count(),
+        // Client-visible: a requester answered Found stores the contract.
+        requesters_with_state: requesters
+            .iter()
+            .filter(|r| {
+                result
+                    .node_storages
+                    .get(*r)
+                    .and_then(|s| s.get_stored_state(&contract_key))
+                    .is_some()
+            })
+            .count(),
+        successful_attempts: freenet::tracing::summarize_get_outcomes_per_tx(&logs).successes
+            as usize,
+    }
+}
