@@ -2247,8 +2247,10 @@ impl SimNetwork {
 
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
     /// `"shadow"`, `"prefer"`), on every node. Without this call the harness
-    /// writes `off`, whatever the node default is. Call before the simulation
-    /// starts.
+    /// writes `prefer` at a 100% data share (see
+    /// [`Self::with_release_quic_data_share`] to read the release's own share
+    /// instead); `"off"` opts a test back to the legacy UDP transport. Call
+    /// before the simulation starts.
     ///
     /// # Panics
     /// On a value this binary does not know. A node would read it as off
@@ -2525,6 +2527,33 @@ impl SimNetwork {
     pub fn with_gateway_max_connections(&mut self, max: usize) -> &mut Self {
         for (builder, _) in &mut self.gateways {
             builder.config.max_number_of_connections(max);
+        }
+        self
+    }
+
+    /// Clears `quic-data-percent` on every node, so each reads the release's own
+    /// share (the ramp), instead of the simulation default of 100.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_release_quic_data_share(&mut self) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            Arc::make_mut(&mut config.config)
+                .network_api
+                .quic_data_percent = None;
+        }
+        self
+    }
+
+    /// Clears the native connect and native gateway join shares on every
+    /// node, so each runs this release's own (`QUIC_NATIVE_PERCENT`,
+    /// `GATEWAY_NATIVE_JOIN_PERCENT`) instead of the simulation default of 0%.
+    /// For a test of the shipped defaults. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_release_native_share(&mut self) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            config.native_connect_override = None;
+            config.native_gateway_join_override = None;
         }
         self
     }
@@ -3973,10 +4002,12 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
-                    // QUIC is off in a simulation unless the test turns it on
-                    // (`with_transport_quic`), whatever the node default is, so a
-                    // change of that default leaves every other run's trace as it was.
-                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
+                    // A simulation negotiates QUIC data with every pair unless the
+                    // test opts back into the legacy UDP transport with
+                    // `with_transport_quic("off")`. The values are pinned here so a
+                    // change of the node default does not move simulations.
+                    transport_quic: Some(crate::transport::quic::QuicMode::PREFER.to_string()),
+                    quic_data_percent: Some("100".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4002,6 +4033,12 @@ impl SimNetwork {
                 config.transient_budget = budget;
             }
             config.connect_backoff_base = self.connect_backoff_base_override;
+            // Pinned, like the QUIC mode and data share above: a default
+            // simulation decides no connect native, whatever this release's
+            // `QUIC_NATIVE_PERCENT` and `GATEWAY_NATIVE_JOIN_PERCENT` are. A test
+            // turns native on with `with_native_connect` / `with_native_gateway_join`.
+            config.native_connect_override = Some(0);
+            config.native_gateway_join_override = Some(0);
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -4085,10 +4122,12 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
-                    // QUIC is off in a simulation unless the test turns it on
-                    // (`with_transport_quic`), whatever the node default is, so a
-                    // change of that default leaves every other run's trace as it was.
-                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
+                    // A simulation negotiates QUIC data with every pair unless the
+                    // test opts back into the legacy UDP transport with
+                    // `with_transport_quic("off")`. The values are pinned here so a
+                    // change of the node default does not move simulations.
+                    transport_quic: Some(crate::transport::quic::QuicMode::PREFER.to_string()),
+                    quic_data_percent: Some("100".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4113,6 +4152,9 @@ impl SimNetwork {
                 config.transient_budget = budget;
             }
             config.connect_backoff_base = self.connect_backoff_base_override;
+            // Pinned like the gateway site above: no native connect by default.
+            config.native_connect_override = Some(0);
+            config.native_gateway_join_override = Some(0);
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -8788,8 +8830,12 @@ mod tests {
         for label in &labels {
             let config = sim.node_config_mut(label);
             assert!(
-                config.config.network_api.quic_settings().is_none(),
-                "QUIC is off in a simulation unless the test turns it on"
+                config.config.network_api.quic_settings().is_some(),
+                "QUIC is on (prefer, 100% data) in a simulation unless the test turns it off"
+            );
+            assert_eq!(
+                config.config.network_api.quic_data_percent.as_deref(),
+                Some("100")
             );
             assert_eq!(config.advertised_version_override, None);
             assert_eq!(config.quic_idle_timeout_override, None);
@@ -8987,6 +9033,9 @@ mod tests {
         let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
         let labels = labels_in_order(&sim);
         sim.with_node_transport_quic(&labels[0], "shadow");
+        // The second node must have no QUIC endpoint, which is no longer the
+        // simulation default.
+        sim.with_node_transport_quic(&labels[1], "off");
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;

@@ -70,6 +70,9 @@ struct TestConfig {
     /// Send states larger than this many bytes as streams (`run_direct` only).
     /// `None` keeps the simulation default (streaming off).
     streaming_threshold: Option<usize>,
+    /// Run on the legacy UDP transport (`transport-quic = off`) instead of the
+    /// simulation default of QUIC data (`run_direct` only).
+    legacy_udp: bool,
 }
 
 impl TestConfig {
@@ -94,6 +97,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -118,6 +122,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -142,6 +147,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -186,6 +192,7 @@ impl TestConfig {
             message_loss_rate: 0.0,
             use_mock_wasm: false,
             streaming_threshold: None,
+            legacy_udp: false,
         }
     }
 
@@ -279,6 +286,14 @@ impl TestConfig {
     /// Stream states larger than `bytes` (`run_direct` only).
     fn with_streaming_threshold(mut self, bytes: usize) -> Self {
         self.streaming_threshold = Some(bytes);
+        self
+    }
+
+    /// Keep this test on the legacy UDP transport (`run_direct` only), for a
+    /// test whose subject is not the transport and whose QUIC run exceeds its
+    /// CI time cap.
+    fn with_legacy_udp(mut self) -> Self {
+        self.legacy_udp = true;
         self
     }
 
@@ -403,6 +418,9 @@ impl TestConfig {
             sim.skip_convergence_wait = skip_convergence_wait;
             if let Some(bytes) = self.streaming_threshold {
                 sim.with_streaming_threshold(bytes);
+            }
+            if self.legacy_udp {
+                sim.with_transport_quic("off");
             }
 
             // Apply fault injection if configured (latency and/or message loss)
@@ -6596,6 +6614,7 @@ fn test_subscription_renewal_at_scale() {
         message_loss_rate: 0.0,
         use_mock_wasm: false,
         streaming_threshold: None,
+        legacy_udp: false,
     };
 
     let max_contracts = config.max_contracts; // Save before config.run() moves it
@@ -16005,6 +16024,11 @@ fn run_subscription_mesh(
     let sim = rt.block_on(async {
         let mut sim = SimNetwork::new(network, 1, 15, 10, 3, 5, 3, seed).await;
         sim.enable_hosting_time_control();
+        // Kept on the legacy UDP transport: the subscription tree does not
+        // depend on the transport, and the callers (six meshes per test) take
+        // about 1.6x as long under QUIC data (measured alone: 288 s off, 452 s
+        // on, loaded host), past the 240 s CI cap with a 95 s QUIC-off baseline.
+        sim.with_transport_quic("off");
         sim
     });
 
@@ -21081,9 +21105,7 @@ fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTra
     let rt = create_runtime();
     let (sim, logs_handle, probe) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
-        if let Some(value) = quic {
-            sim.with_transport_quic(value);
-        }
+        sim.with_transport_quic(quic.unwrap_or("off"));
         let probe = sim.probe_quic_endpoints_at(Duration::from_secs(2));
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle, probe)
@@ -21472,6 +21494,11 @@ fn run_quic_shadow_sim_waiting(
         // native wire fields but decides none, isolating the upgrade path;
         // native connects are covered by the `test_quic_native_*` sims.
         sim.with_native_connect(0);
+        // These runs exercise the negotiation itself, so every node starts with
+        // QUIC off and `set_up` turns it on where the test wants it. The harness
+        // default is `prefer` at 100%.
+        sim.with_transport_quic("off")
+            .with_release_quic_data_share();
         let trace = sim.quic_upgrade_trace();
         let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
         labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
@@ -21775,7 +21802,8 @@ fn run_quic_data_ramp(
         let mut sim = SimNetwork::new(network, 1, 3, 7, 3, 10, 2, seed).await;
         sim.enable_gateway_ack_version();
         let trace = sim.quic_upgrade_trace();
-        sim.with_transport_quic("prefer");
+        sim.with_transport_quic("prefer")
+            .with_release_quic_data_share();
         trace.ramp_data_started_before(started_before);
         run_as_first_negotiating_release(&trace);
         let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
@@ -23560,10 +23588,14 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_above_binary());
+        // The test's subject is 0%: with QUIC on (the simulation default) the
+        // production 25% share would decide native connects in the "on" run.
+        sim.with_native_connect(0);
     });
     let on = run_native_wire_sim("native-wire-on", SEED, |sim| {
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
+        sim.with_native_connect(0);
     });
     assert_eq!(off.trace.requests_native(), 0, "premise: off sends none");
     assert!(on.trace.requests_native() > 0, "premise: on sends them");
@@ -23625,6 +23657,9 @@ fn run_native_connect_sim_with(
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
         sim.with_transport_quic("prefer");
+        // These sims start from this release's own native shares; a test sets
+        // its own with `with_native_connect` / `with_native_gateway_join`.
+        sim.with_release_native_share();
         configure(&mut sim);
         let trace = sim.native_wire_trace();
         let upgrades = sim.quic_upgrade_trace();
@@ -25024,7 +25059,12 @@ fn assert_non_settling_contract_is_bounded(streaming_threshold: Option<usize>, e
         .with_connections(4, 10)
         .with_event_wait(Duration::from_millis(200))
         .with_mock_wasm()
-        .no_convergence_wait();
+        .no_convergence_wait()
+        // Kept on the legacy UDP transport: this test counts merges against a
+        // budget and does not depend on the transport, and under QUIC data it
+        // takes about twice as long (measured alone: 409 s off, 815 s on), past
+        // its 600 s CI cap, which has no retries.
+        .with_legacy_udp();
     if let Some(bytes) = streaming_threshold {
         config = config.with_streaming_threshold(bytes);
     }

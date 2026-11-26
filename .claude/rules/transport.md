@@ -466,7 +466,7 @@ QUIC memory (`quic/config.rs`, `quic::memory_tests`)
 - quinn assumptions (PANICS-class) to re-check before bumping the quinn pin: `QUIC_ACK_TAIL_BYTES` assumes quinn-proto's cap of 1000 ack-only packets (M2); loss telemetry assumes quinn-proto 0.11.19 `PathStats` semantics (sent includes ack-only, lost never taken back, lost PLPMTUD probes left out of `lost` while sent ones are in `sent`, MTU discovery off).
 
 Simulation (`SimNetwork`)
-- Harness writes `off` unless `with_transport_quic` / `with_node_transport_quic` set it. The endpoint runs on VirtualTime only in simulation (`the_transport_endpoint_runs_on_virtual_time_only_in_simulation`); the bind-time draw uses `GlobalRng::with_side_stream`; every runner must move VirtualTime (`run_turmoil_on_virtual_time`) or no QUIC timer fires.
+- Harness writes `prefer` at a 100% data share and pins native connect / native gateway join at 0%, unless `with_transport_quic` / `with_node_transport_quic` (`"off"` is the legacy-UDP opt-out), `with_release_quic_data_share` (the release's own share) or `with_native_connect` set otherwise. The endpoint runs on VirtualTime only in simulation (`the_transport_endpoint_runs_on_virtual_time_only_in_simulation`); the bind-time draw uses `GlobalRng::with_side_stream`; every runner must move VirtualTime (`run_turmoil_on_virtual_time`) or no QUIC timer fires.
 
 Mechanism detail: docs/architecture/transport/rules-reference.md § QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
