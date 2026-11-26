@@ -2430,7 +2430,7 @@ fn a_late_end_needs_the_peer_still_acknowledging_through_the_second_grace() {
             "a grace on, the last growth is older than the recency window: not late"
         );
         assert!(
-            results[4].is_some_and(|d| d < Duration::from_secs(40)),
+            results[4] == Some(Duration::from_secs(26)),
             "later streams acknowledged every 8 s (past the recency window) are still judged: {:?}",
             results[4]
         );
@@ -2736,21 +2736,25 @@ fn the_completion_log_wraps_by_under_counting() {
 /// has drifted from before (#6205). Source pins, comments stripped.
 #[test]
 fn the_late_end_rule_is_read_by_the_watch_and_documented() {
-    let code = |source: &str| {
-        source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let recycle = code(include_str!("../recycle.rs"));
-    assert!(recycle.contains("late_ends: writers.late_ends(),"));
+    // Scoped to the function bodies (comments stripped, a moved anchor fails
+    // loudly), so a mention elsewhere in the file does not satisfy it.
+    let source = include_str!("../recycle.rs");
+    let pin = crate::transport::peer_connection::inbound_budget::pin::fn_body;
+    let sample = pin(source, "writers: &Writers,\n    ) -> Option<Self> {");
     assert!(
-        recycle.contains(
-            "LATE_ENDS_CLOSES_WITH_UDP || (!self.udp_fallback && self.late_close_native)"
-        )
+        sample.contains("late_ends: writers.late_ends(),"),
+        "the watch's sample reads the late ends the checks count"
     );
-    assert!(recycle.contains("pub(crate) const LATE_ENDS_CLOSE_NATIVE: bool = false;"));
+    let decide = pin(
+        source,
+        "fn decide(&mut self, now_nanos: u64, sample: AckSample) -> Option<Stall> {",
+    );
+    let flat: String = decide.split_whitespace().collect();
+    assert!(
+        flat.contains("LATE_ENDS_CLOSES_WITH_UDP||(!self.udp_fallback&&self.late_close_native)"),
+        "the close is gated by both constants' fields"
+    );
+    assert!(source.contains("pub(crate) const LATE_ENDS_CLOSE_NATIVE: bool = false;"));
     const _: () = assert!(
         !recycle::LATE_ENDS_CLOSE_NATIVE && !QuicPathLimits::DEFAULT.late_ends_close_native
     );
@@ -2775,9 +2779,17 @@ fn the_late_end_rule_is_read_by_the_watch_and_documented() {
     for (doc, needles) in [
         (
             "docs/architecture/transport/rules-reference.md",
-            &["LATE_END_EPISODE_GAP", "60 s", "seven probe timeouts"][..],
+            &[
+                "LATE_END_EPISODE_GAP",
+                "60 s",
+                "seven probe timeouts",
+                "quic_late_end_judged_",
+            ][..],
         ),
-        (".claude/rules/transport.md", &["60 s"][..]),
+        (
+            ".claude/rules/transport.md",
+            &["60 s", "quic_late_end_judged_"][..],
+        ),
         (
             "crates/core/src/transport/metrics/quic_data.rs",
             &["LATE_END_EPISODE_GAP"][..],

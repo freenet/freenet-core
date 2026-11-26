@@ -2636,6 +2636,17 @@ pub(crate) fn late_end_grace(rtt: Duration) -> Duration {
 /// The least [`late_end_grace`].
 pub(crate) const LATE_END_GRACE_MIN: Duration = Duration::from_secs(2);
 
+/// How recent the connection's latest growth must be for a candidate to count
+/// ([`LateEndCheck::late`]): half the grace, at least this many
+/// [`recycle::ACK_WATCH_TICK`]s (4 s), so at the grace's 2 s floor the current
+/// or the previous poll.
+pub(crate) const LATE_END_RECENT_MIN_TICKS: u64 = 2;
+
+/// Ticks past the recency window that a stall must last before the liveness
+/// baseline restarts ([`LateEndCheck::late`]), so a poll that slept a little
+/// long is not read as a stall.
+pub(crate) const LATE_END_RESTART_SLACK_TICKS: u64 = 1;
+
 /// The least margin past [`bytes_ahead`] the connection must have
 /// acknowledged since a stream's end before the end can be late
 /// ([`LaterReading::window_at_end`]): what was already in flight when the end
@@ -2769,7 +2780,8 @@ impl LateEndCheck {
                 grew_at: now,
                 restarted: false,
             });
-            let recent = (grace / 2).max(nanos(recycle::ACK_WATCH_TICK) * 2);
+            let recent =
+                (grace / 2).max(nanos(recycle::ACK_WATCH_TICK) * LATE_END_RECENT_MIN_TICKS);
             if reading.acked_since_end > c.acked {
                 c.acked = reading.acked_since_end;
                 // The first growth, or growth coming back after a stall
@@ -2783,7 +2795,9 @@ impl LateEndCheck {
                 // long gaps must still be judged.
                 if c.alive_at.is_none()
                     || (!c.restarted
-                        && now.saturating_sub(c.grew_at) > recent + nanos(recycle::ACK_WATCH_TICK))
+                        && now.saturating_sub(c.grew_at)
+                            > recent
+                                + nanos(recycle::ACK_WATCH_TICK) * LATE_END_RESTART_SLACK_TICKS)
                 {
                     c.restarted = c.alive_at.is_some();
                     c.alive_at = Some(now);

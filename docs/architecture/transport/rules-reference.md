@@ -1464,6 +1464,11 @@ a test passes its own; tests read their own, never the global).
   late, or not at all, though the peer had wholly acknowledged enough
   data-stream bytes since the end to have carried it (path::LateEndCheck),
   by kind; expected 0 on honest paths.
+  quic_late_end_judged_<stream|short|control>: sends whose end reached the
+  proof point of that check (the later data streams the peer wholly
+  acknowledged outnumber the bytes ahead of the end), by kind; counted once
+  per end, and the denominator for quic_late_end_<kind>: a late-end count of
+  0 says little where this is also near 0.
   quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
   unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
   packets outstanding, nothing acknowledged, nothing heard) by how they ended;
