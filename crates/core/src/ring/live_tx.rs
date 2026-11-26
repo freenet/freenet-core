@@ -151,6 +151,13 @@ impl LiveTransactionTracker {
         self.tx_per_peer.len()
     }
 
+    /// Transactions currently in flight, one per transaction. Unlike
+    /// [`Self::len`] (a count of peers, which includes the stale lists a rebind
+    /// leaves behind) this is zero on an idle node.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.peer_for_tx.len()
+    }
+
     /// Returns the total number of active transactions across all peers.
     #[cfg(test)]
     pub(crate) fn active_transaction_count(&self) -> usize {

@@ -34,13 +34,18 @@
 //!
 //! # Windows against the transport keepalives
 //!
-//! `W` is longer than two missed keepalives. The UDP ping is every 5 s and
-//! backs off towards 15 s (`MAX_KEEPALIVE_INTERVAL`) only after more than 5
-//! pings in a row went unanswered, i.e. about 25 s into a silence; a live peer
-//! answers every ping, so a live link is never in that state, and a dead one is
-//! dropped at `W` (14 s), before the backoff begins. A UDP connection that has
-//! carried a QUIC path gets the QUIC window, because its stamp includes QUIC
-//! receipts and those arrive at the QUIC keepalive (15 s).
+//! A UDP peer pings every 5 s, but backs off when ITS pings go unanswered
+//! (counted since ITS last inbound packet): after more than 5 in a row the
+//! interval doubles to 10 s and then to `MAX_KEEPALIVE_INTERVAL` (15 s). That
+//! happens to a live peer whose own listener is blocked (the mirror of the
+//! frozen-stamp case above: its inbound stamp freezes, so it counts our
+//! answers as missing) and on a link that loses our pongs one way. So a live
+//! UDP peer can be quiet for up to 15 s, and the UDP window is sized from that
+//! constant: `MAX_KEEPALIVE_INTERVAL + UDP_WINDOW_MARGIN` (19 s), not from the
+//! 5 s base interval. A dead peer is dropped at that window, after its pings
+//! have already begun to back off. A UDP connection that has carried a QUIC
+//! path gets the QUIC window (34 s), because its stamp includes QUIC receipts
+//! and those arrive at the QUIC keepalive (15 s).
 //!
 //! A peer with nothing waiting on it is never examined, so a peer that simply
 //! had nothing to say is not silent.
@@ -62,14 +67,18 @@ use super::*;
 use std::collections::HashMap;
 
 /// How often the sweep runs. Much shorter than the 30 s stats tick, which
-/// would make a window of about 14 s meaningless. Cheap: one pass over
+/// would make a window of about 19 s coarse. Cheap: one pass over
 /// `connections` and the live-transaction index.
 pub(super) const STALE_LINK_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Keepalive ping interval of the legacy UDP transport. Mirrors
-/// `peer_connection::KEEP_ALIVE_INTERVAL`, which is private to that module;
-/// `udp_keepalive_matches_the_transport` pins the two together.
-pub(super) const UDP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+/// The longest a live UDP peer stays quiet: its keepalive interval after
+/// backing off (`peer_connection::MAX_KEEPALIVE_INTERVAL`, 15 s).
+pub(super) const UDP_MAX_QUIET: Duration =
+    crate::transport::peer_connection::MAX_KEEPALIVE_INTERVAL;
+
+/// Added to [`UDP_MAX_QUIET`] for the UDP window: one round trip and a lost
+/// packet's worth of slack.
+pub(super) const UDP_WINDOW_MARGIN: Duration = Duration::from_secs(4);
 
 /// Keepalive interval of a QUIC-native connection.
 pub(super) const QUIC_KEEPALIVE_INTERVAL: Duration =
@@ -103,21 +112,21 @@ thread_local! {
 /// sweep runs when the transport has a keepalive ([`transport_has_keepalive`]).
 #[cfg(any(test, feature = "testing"))]
 #[must_use = "the override ends when the guard is dropped"]
-pub struct StaleLinkSweepGuard(());
+pub struct StaleLinkSweepGuard(Option<bool>);
 
 #[cfg(any(test, feature = "testing"))]
 impl StaleLinkSweepGuard {
     /// Force the sweep on (`true`) or off (`false`) for this thread.
     pub fn force(on: bool) -> Self {
-        OVERRIDE_FOR_THREAD.with(|o| o.set(Some(on)));
-        Self(())
+        Self(OVERRIDE_FOR_THREAD.with(|o| o.replace(Some(on))))
     }
 }
 
 #[cfg(any(test, feature = "testing"))]
 impl Drop for StaleLinkSweepGuard {
     fn drop(&mut self) {
-        OVERRIDE_FOR_THREAD.with(|o| o.set(None));
+        // Restore what was there, so nested guards unwind in order.
+        OVERRIDE_FOR_THREAD.with(|o| o.set(self.0));
     }
 }
 
@@ -158,6 +167,38 @@ pub(super) fn activation(listen: SocketAddr) -> (bool, &'static str) {
     }
 }
 
+static UNRESPONSIVE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many links this process has dropped as unresponsive since it started.
+/// Counted where the decision is acted on, and logged with each drop as
+/// `total`, so the field rate of misfires and real dead links alike is
+/// readable. Each drop also reaches telemetry as a `Disconnected` event with
+/// reason `Unresponsive` (the reason is produced nowhere else). The getter is
+/// for tests; production reads the log field and the telemetry event.
+#[cfg(test)]
+pub(crate) fn unresponsive_drops_total() -> u64 {
+    UNRESPONSIVE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Act on a decision to drop `addr`: count it and start the re-dial cooldown.
+/// Returns the running total.
+///
+/// The cooldown is the existing recently-failed-address backoff
+/// (`ConnectionManager::record_failed_addr`): CONNECT requests this node starts
+/// treat the address as already visited for 5 minutes, doubling on each repeat
+/// up to an hour, and a connection that is established to the address (it
+/// dialled us, or a dial succeeds) clears it. It fits because a wrongly dropped
+/// peer then cannot be picked again by this node's acquisition for minutes,
+/// while one that comes back by itself is not held out. It does not stop a
+/// peer dialling us, nor a direct reconnect that bypasses CONNECT.
+pub(super) fn note_unresponsive_drop(
+    connection_manager: &crate::ring::ConnectionManager,
+    addr: SocketAddr,
+) -> u64 {
+    connection_manager.record_failed_addr(addr);
+    UNRESPONSIVE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// Which transport carries a link; sets its keepalive and so its window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LinkKind {
@@ -167,7 +208,7 @@ pub(super) enum LinkKind {
 
 /// The window class of a connection. A UDP connection that has carried a QUIC
 /// path counts as QUIC: its receipt stamp includes that path's receipts, which
-/// arrive at the QUIC keepalive (15 s), so the 14 s UDP window would drop a
+/// arrive at the QUIC keepalive (15 s), so a shorter UDP window would drop a
 /// healthy link between two of them.
 pub(super) fn link_kind(native: bool, quic_path_seen: bool) -> LinkKind {
     if native || quic_path_seen {
@@ -177,15 +218,16 @@ pub(super) fn link_kind(native: bool, quic_path_seen: bool) -> LinkKind {
     }
 }
 
-/// `W = max(2 x keepalive + 2 x srtt + 2 s, 12 s)`: longer than two missed
-/// keepalives, so one lost ping cannot trigger it. About 14 s for UDP, 34 s
-/// for QUIC.
+/// UDP: the longest quiet a live peer can show plus a margin, `15 s + 4 s =
+/// 19 s` (see the module doc). QUIC: `max(2 x keepalive + 2 x srtt + 2 s,
+/// 12 s) = 34 s`, longer than two missed fixed-interval keepalives.
 pub(super) fn silence_window(kind: LinkKind) -> Duration {
-    let keepalive = match kind {
-        LinkKind::Udp => UDP_KEEPALIVE_INTERVAL,
-        LinkKind::Quic => QUIC_KEEPALIVE_INTERVAL,
-    };
-    (keepalive * 2 + ASSUMED_SRTT * 2 + WINDOW_MARGIN).max(MIN_WINDOW)
+    match kind {
+        LinkKind::Udp => UDP_MAX_QUIET + UDP_WINDOW_MARGIN,
+        LinkKind::Quic => {
+            (QUIC_KEEPALIVE_INTERVAL * 2 + ASSUMED_SRTT * 2 + WINDOW_MARGIN).max(MIN_WINDOW)
+        }
+    }
 }
 
 /// What the sweep knows about one connected peer at a tick.
@@ -350,6 +392,9 @@ impl P2pConnManager {
                 requests_waiting = waiting,
                 "STALE_LINK_SWEEP dropping a link that went silent with requests waiting"
             );
+            let total =
+                note_unresponsive_drop(&self.bridge.op_manager.ring.connection_manager, addr);
+            tracing::info!(peer_addr = %addr, total, "STALE_LINK_SWEEP drop counted, re-dial cooldown started");
             // Integration point for fix B (recently-silent peer record,
             // branch fix/get-skip-recently-silent-peer, not merged): mark
             // `addr` silent here once it lands. Not marked in this change.
@@ -496,34 +541,60 @@ mod tests {
 
     #[test]
     fn windows_match_the_design() {
-        assert_eq!(udp_w(), Duration::from_secs(14));
+        assert_eq!(udp_w(), Duration::from_secs(19));
         assert_eq!(silence_window(LinkKind::Quic), Duration::from_secs(34));
         assert!(silence_window(LinkKind::Udp) >= MIN_WINDOW);
     }
 
-    /// `UDP_KEEPALIVE_INTERVAL` is a copy of a private constant in a file this
-    /// sweep does not edit; fail if they drift apart. Reads only the constant's
-    /// own definition, with comments stripped, so a mention elsewhere in that
-    /// large file cannot satisfy it.
+    /// The UDP window is derived from `MAX_KEEPALIVE_INTERVAL`, which the
+    /// ping backoff in `peer_connection.rs` caps at 15 s, and 15 s is what
+    /// this module's doc and the window's margin reason from. Reads only the
+    /// constant's own definition, comments stripped, so a mention elsewhere in
+    /// that large file cannot satisfy it; if the cap moves, re-derive the window.
     #[test]
-    fn udp_keepalive_matches_the_transport() {
+    fn the_keepalive_backoff_cap_is_what_the_udp_window_assumes() {
         let src = crate::contract::source_pin_util::strip_comments(include_str!(
             "../../../transport/peer_connection.rs"
         ));
-        let start = src
-            .find("const KEEP_ALIVE_INTERVAL")
-            .expect("peer_connection.rs defines KEEP_ALIVE_INTERVAL");
-        let definition: String = src[start..]
-            .split(';')
-            .next()
-            .expect("the definition ends")
-            .split_whitespace()
-            .collect();
-        assert_eq!(
-            definition, "constKEEP_ALIVE_INTERVAL:Duration=Duration::from_secs(5)",
-            "peer_connection.rs KEEP_ALIVE_INTERVAL changed: update UDP_KEEPALIVE_INTERVAL"
-        );
-        assert_eq!(UDP_KEEPALIVE_INTERVAL, Duration::from_secs(5));
+        for (name, expected) in [
+            (
+                "const MAX_KEEPALIVE_INTERVAL",
+                "constMAX_KEEPALIVE_INTERVAL:Duration=Duration::from_secs(15)",
+            ),
+            (
+                "const KEEP_ALIVE_INTERVAL",
+                "constKEEP_ALIVE_INTERVAL:Duration=Duration::from_secs(5)",
+            ),
+        ] {
+            let start = src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is defined"));
+            let definition: String = src[start..]
+                .split(';')
+                .next()
+                .expect("the definition ends")
+                .split_whitespace()
+                .collect();
+            assert!(
+                definition.ends_with(expected),
+                "{name} changed ({definition}): re-derive the UDP window"
+            );
+        }
+        assert_eq!(UDP_MAX_QUIET, Duration::from_secs(15));
+    }
+
+    /// A live UDP peer whose pings are backing off is quiet for up to
+    /// `MAX_KEEPALIVE_INTERVAL` between packets (its own listener blocked, or
+    /// our pongs lost one way). With a request waiting for minutes, such a
+    /// peer must never read as silent; a dead one still does.
+    #[test]
+    fn the_udp_window_covers_the_longest_keepalive_backoff() {
+        let c = clock();
+        let (now, last) = normal_tick(&c);
+        let worst_live_gap = UDP_MAX_QUIET + Duration::from_secs(1);
+        let live = peer(1, worst_live_gap, 1, Duration::from_secs(600));
+        assert_eq!(decide(now, last, &[live]), Decision::default());
+        assert!(udp_w() > UDP_MAX_QUIET);
     }
 
     #[test]
@@ -854,9 +925,30 @@ mod tests {
         );
     }
 
-    /// The guard must be bound to a name that lives across the sends, taken
-    /// before the first one: `let _ = ...` would drop it at once and the test
-    /// above would still pass.
+    /// Index of the `}` closing the `{` at `open` in `src`.
+    fn closing_brace(src: &str, open: usize) -> usize {
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces");
+    }
+
+    /// The listener's `msg = conn.recv()` arm takes the forward guard under a
+    /// name, before either send, and in a scope that is still open at the
+    /// second send. Bounded to that arm, so a mention elsewhere cannot satisfy
+    /// it, and by block depth, so a guard moved into an inner block that closes
+    /// before the sends (dropped, and the stamp not held) fails it. `let _ =`
+    /// would drop at once, so the binding name is part of the pin.
     #[test]
     fn the_listener_holds_the_forward_guard_across_its_sends() {
         let src = crate::contract::source_pin_util::strip_comments(
@@ -865,18 +957,39 @@ mod tests {
                 .next()
                 .expect("production source"),
         );
-        let guard = src
+        let arm_start = src
+            .find("msg = conn.recv() => {")
+            .expect("the listener's recv arm");
+        let open = arm_start + "msg = conn.recv() ".len() + "=> ".len();
+        let arm = &src[open..=closing_brace(&src, open)];
+        let guard = arm
             .find("let _forwarding = link_use.begin_forward();")
-            .expect("the listener takes the guard under a name");
-        let first = src[guard..]
+            .expect("the arm takes the guard under a name");
+        let first = arm
             .find("ConnEvent::NativeFirstFrame {")
-            .expect("first-frame send follows");
-        let second = src[guard..]
+            .expect("first-frame send");
+        let second = arm
             .find("ConnEvent::InboundMessage(IncomingMessage::with_remote(")
-            .expect("inbound send follows");
-        assert!(first > 0 && second > 0);
-        // And the guard is in the listener, after its `conn.recv()` arm.
-        assert!(src[..guard].rfind("msg = conn.recv()").is_some());
+            .expect("inbound send");
+        assert!(
+            guard < first && first < second,
+            "guard, then both sends, in order"
+        );
+        // The scope the guard lives in must still be open at the last send.
+        let mut depth = 0i64;
+        let mut min_depth = i64::MAX;
+        for c in arm[guard..second].chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            min_depth = min_depth.min(depth);
+        }
+        assert!(
+            min_depth >= 0,
+            "the guard's block closes before the second send: the stamp would not be held"
+        );
     }
 
     // ---- production default ----
@@ -930,6 +1043,59 @@ mod tests {
             let _on = StaleLinkSweepGuard::force(true);
             assert!(activation(listen).0);
         }
+        assert_eq!(override_for_thread(), None);
+    }
+
+    // ---- re-dial cooldown ----
+
+    /// A peer dropped as unresponsive is not re-dialled within the cooldown:
+    /// it is in the recently-failed set that the CONNECT acquisition excludes,
+    /// and the counter moves.
+    #[test]
+    fn a_peer_dropped_as_unresponsive_enters_the_redial_cooldown() {
+        let cm = crate::ring::ConnectionManager::test_default();
+        let peer: SocketAddr = "10.8.8.8:4001".parse().unwrap();
+        assert!(!cm.recently_failed_addrs().contains(&peer));
+        let before = unresponsive_drops_total();
+        let total = note_unresponsive_drop(&cm, peer);
+        assert!(cm.recently_failed_addrs().contains(&peer));
+        assert!(total > before && unresponsive_drops_total() >= total);
+        // A repeat doubles the cooldown rather than resetting it.
+        note_unresponsive_drop(&cm, peer);
+        assert!(cm.recently_failed_addrs().contains(&peer));
+    }
+
+    /// The cooldown is applied where the drop is carried out, not only in the
+    /// helper: the sweep's drop loop calls it before closing the link.
+    #[test]
+    fn the_drop_site_starts_the_cooldown_before_closing_the_link() {
+        // Whitespace removed, so a reformat of the call cannot defeat the pin.
+        let src: String = crate::contract::source_pin_util::strip_comments(
+            include_str!("stale_link_sweep.rs")
+                .split("\n#[cfg(test)]\nmod ")
+                .next()
+                .expect("production source"),
+        )
+        .split_whitespace()
+        .collect();
+        let note = src
+            .find("lettotal=note_unresponsive_drop(")
+            .expect("the drop site counts the drop and starts the cooldown");
+        let close = src
+            .find("self.drop_connection_by_addr(")
+            .expect("closes the link");
+        assert!(note < close);
+    }
+
+    #[test]
+    fn nested_guards_restore_the_previous_override() {
+        let outer = StaleLinkSweepGuard::force(true);
+        {
+            let _inner = StaleLinkSweepGuard::force(false);
+            assert_eq!(override_for_thread(), Some(false));
+        }
+        assert_eq!(override_for_thread(), Some(true));
+        drop(outer);
         assert_eq!(override_for_thread(), None);
     }
 }

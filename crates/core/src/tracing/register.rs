@@ -1680,10 +1680,11 @@ impl EventClockGuard {
         Self(())
     }
 
-    /// Whether `at` was stamped from the simulation clock (within 100 years of
-    /// the Unix epoch) and not from the wall clock.
+    /// Whether `at` was stamped from the simulation clock and not from the wall
+    /// clock: a simulation's elapsed time counted from the Unix epoch is under a
+    /// year, a present-day wall-clock reading is about 56 years.
     pub fn is_virtual(at: DateTime<Utc>) -> bool {
-        at.timestamp() < 100 * 365 * 24 * 3600
+        (0..366 * 24 * 3600).contains(&at.timestamp())
     }
 }
 
@@ -1694,9 +1695,15 @@ impl Drop for EventClockGuard {
     }
 }
 
-pub(crate) fn event_timestamp() -> DateTime<Utc> {
+/// The timestamp for an event of `kind`. Only Get and Put events carry the
+/// simulation clock when a test asks for it (`EventClockGuard`): the
+/// connection bookkeeping in `tracing.rs` compares event times across nodes,
+/// and other kinds would tie or reorder under it. Every constructor of
+/// `NetLogMessage` goes through here, so the rule is one rule.
+pub(crate) fn event_timestamp(kind: &EventKind) -> DateTime<Utc> {
+    let _ = kind; // read only when a test can ask for the simulation clock
     #[cfg(any(test, feature = "testing"))]
-    if EVENT_CLOCK_ON.with(|c| c.get()) {
+    if matches!(kind, EventKind::Get(_) | EventKind::Put(_)) && EVENT_CLOCK_ON.with(|c| c.get()) {
         if let Some(elapsed) = turmoil::sim_elapsed() {
             return DateTime::<Utc>::from_timestamp_nanos(elapsed.as_nanos() as i64);
         }
@@ -1707,7 +1714,7 @@ pub(crate) fn event_timestamp() -> DateTime<Utc> {
 impl<'a> From<NetEventLog<'a>> for NetLogMessage {
     fn from(log: NetEventLog<'a>) -> NetLogMessage {
         NetLogMessage {
-            datetime: event_timestamp(),
+            datetime: event_timestamp(&log.kind),
             tx: *log.tx,
             kind: log.kind,
             peer_id: log.peer_id,
@@ -2139,7 +2146,7 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'_, ()> {
         let log_msg = NetLogMessage {
             tx,
-            datetime: event_timestamp(),
+            datetime: Utc::now(),      // a Timeout event is never Get or Put
             peer_id: PeerId::random(), // Timeout events don't have a specific peer context
             kind: EventKind::Timeout {
                 id: tx,
@@ -2445,7 +2452,7 @@ mod span_completed_tests {
 
     fn msg(kind: EventKind) -> NetLogMessage {
         NetLogMessage {
-            datetime: event_timestamp(),
+            datetime: event_timestamp(&kind),
             tx: *Transaction::NULL,
             peer_id: PeerId::random(),
             kind,
@@ -2653,5 +2660,38 @@ mod get_hop_telemetry_pins {
             "inbound get_request must resolve the sender into `upstream`"
         );
         assert!(arm.contains("upstream,") && arm.contains("key_location: Some("));
+    }
+}
+
+#[cfg(test)]
+mod event_clock_tests {
+    use super::*;
+
+    /// The latency tests read `is_virtual` to detect an event that fell back to
+    /// the wall clock, so a present-day reading must not pass it.
+    #[test]
+    fn a_wall_clock_timestamp_is_not_virtual() {
+        assert!(!EventClockGuard::is_virtual(Utc::now()));
+        assert!(!EventClockGuard::is_virtual(
+            Utc::now() - chrono::Duration::days(365 * 30)
+        ));
+        assert!(EventClockGuard::is_virtual(
+            DateTime::<Utc>::from_timestamp_nanos(39_000_000_000)
+        ));
+        assert!(EventClockGuard::is_virtual(
+            DateTime::<Utc>::from_timestamp_nanos(0)
+        ));
+    }
+
+    /// Outside a running simulation the guard falls back to the wall clock,
+    /// and other kinds never use the simulation clock.
+    #[test]
+    fn event_timestamp_is_the_wall_clock_without_a_simulation() {
+        let _guard = EventClockGuard::simulation();
+        let wall = event_timestamp(&EventKind::Ignored);
+        assert!(!EventClockGuard::is_virtual(wall));
+        assert!(!EventClockGuard::is_virtual(event_timestamp(
+            &EventKind::Ignored
+        )));
     }
 }

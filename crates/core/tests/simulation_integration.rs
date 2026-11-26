@@ -13099,17 +13099,18 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     const NETWORK_NAME: &str = "get-dead-first-hop";
     // VirtualTime has no keepalive, so the sweep is off by default in sims;
     // this one makes a link truly dead and needs it. DEAD_SWEEP=0 measures
-    // the same run without it (it then fails the limit, at 121 s).
+    // the same run without it (it then fails the 60 s limit, at 121 s).
     let _sweep_on = freenet::dev_tool::StaleLinkSweepGuard::force(
         std::env::var("DEAD_SWEEP").map_or(true, |v| v != "0"),
     );
     // The retry goes through a relay that is also connected to the dead host
     // (it is closest to the key), so the GET pays the silence window twice:
-    // once at the requester and once at that relay, each 14 s plus up to one
-    // 5 s sweep tick, so at most 38 s plus the time the replies take (measured
-    // 39 s, in simulated time, identical on every run). Without the sweep each
-    // of the two waits is the 60 s attempt deadline (121 s measured).
-    const MAX_LATENCY_S: f64 = 50.0;
+    // once at the requester and once at that relay, each 19 s plus up to one
+    // 5 s sweep tick, so at most 48 s plus the time the replies take. Measured
+    // 54 s in simulated time, identical on every run; the limit is that plus a
+    // small margin. Without the sweep each of the two waits is the 60 s attempt
+    // deadline (121 s measured), so the limit still separates the two.
+    const MAX_LATENCY_S: f64 = 60.0;
     setup_deterministic_state(SEED);
 
     let contract = SimOperation::create_test_contract(0x59);

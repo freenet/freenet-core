@@ -1839,7 +1839,7 @@ impl P2pConnManager {
                                 .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
                             zombie_sweep::earliest(
                                 ctx.held_native_deadline(),
-                                stale_link_sweep.deadline(op_manager.ring.live_tx_tracker.len() > 0),
+                                stale_link_sweep.deadline(op_manager.ring.live_tx_tracker.in_flight() > 0),
                             ),
                         ),
                     ),
