@@ -26609,6 +26609,25 @@ enum PgOrigin {
 }
 
 #[cfg(feature = "nightly_tests")]
+fn subject_succ(sorted: &[f64], l: f64) -> f64 {
+    sorted
+        .iter()
+        .copied()
+        .find(|&x| x > l + 1e-9)
+        .unwrap_or(sorted[0])
+}
+
+#[cfg(feature = "nightly_tests")]
+fn subject_pred(sorted: &[f64], l: f64) -> f64 {
+    sorted
+        .iter()
+        .rev()
+        .copied()
+        .find(|&x| x < l - 1e-9)
+        .unwrap_or(sorted[sorted.len() - 1])
+}
+
+#[cfg(feature = "nightly_tests")]
 fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool) {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
     const OP_INTERVAL_MS: u64 = 250;
@@ -26767,6 +26786,30 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
         slot += 1;
     }
 
+    // Optional extra warm-up (virtual time = pads * OP_INTERVAL_MS): cheap GETs
+    // for a contract that does not exist, so the lattice probe gets time to run
+    // before the first PUT.
+    let pads: usize = std::env::var("PG_WARMUP_PADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if pads > 0 {
+        let dummy = *pg_contract(60000).key().id();
+        let mut padded: Vec<ScheduledOperation> = (0..pads)
+            .map(|i| {
+                ScheduledOperation::new(
+                    NodeLabel::node(network, 1 + i % NODES),
+                    SimOperation::Get {
+                        contract_id: dummy,
+                        return_contract_code: false,
+                        subscribe: false,
+                    },
+                )
+            })
+            .collect();
+        padded.extend(ops);
+        ops = padded;
+    }
     let result = sim.run_controlled_simulation(
         seed,
         ops,
@@ -26975,6 +27018,148 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
                 .map(|v| format!("{:.3}", v as f64 / 1000.0))
                 .collect();
             eprintln!("PG EDGES {:.3}: {}", nloc, nb.join(" "));
+        }
+    }
+    // ---- Lattice analysis from Connect events (log order) ----
+    {
+        let q = |x: f64| (x * 1000.0).round() as i64;
+        let ploc = |d: &str| -> Option<f64> {
+            d.split("(@ ")
+                .nth(1)
+                .and_then(|r| r.split(')').next())
+                .and_then(|v| v.parse().ok())
+        };
+        let mut links: std::collections::BTreeSet<(i64, i64)> = Default::default();
+        let mut sorted: Vec<f64> = locs.clone();
+        sorted.sort_by(f64::total_cmp);
+        let band_lo = pg_wrap(c - 0.075);
+        let subject = sorted
+            .iter()
+            .copied()
+            .filter(|&l| l < band_lo && l > 0.2)
+            .fold(f64::MIN, f64::max);
+        let succ_of = subject_succ(&sorted, subject);
+        let (mut sent, mut resp_recv, mut rejected, mut disc) = (0, 0, 0, 0);
+        let mut desired: Vec<String> = Vec::new();
+        let mut acceptors: std::collections::BTreeSet<i64> = Default::default();
+        let mut rej_reasons: HashMap<String, usize> = HashMap::new();
+        let (mut recv_at_succ, mut recv_at_succ_acc) = (0, 0);
+        let mut pair_events: Vec<String> = Vec::new();
+        let mut connected_events = 0usize;
+        let mut succ_conn_count = 0usize;
+        for (seq, l) in logs.iter().enumerate() {
+            let pd = format!("{:?}", l.peer_id);
+            let Some(a) = ploc(&pd) else { continue };
+            let d = format!("{:?}", l.kind);
+            if d.starts_with("Connect(Connected") {
+                connected_events += 1;
+                if (a - succ_of).abs() < 1e-6 {
+                    if let Some(n) = fa_field(&d, "this_peer_connection_count: ") {
+                        succ_conn_count = n.parse().unwrap_or(0);
+                    }
+                }
+                if let Some(b) = fa_peer_loc(&d, "connected: ") {
+                    let (x, y) = (q(a), q(b));
+                    if x != y {
+                        links.insert((x.min(y), x.max(y)));
+                    }
+                    if (a - subject).abs() < 1e-6 || (b - subject).abs() < 1e-6 {
+                        pair_events.push(format!("#{seq} Connected {:.3}<->{:.3}", a, b));
+                    }
+                }
+            } else if d.starts_with("Disconnected") {
+                if let Some(b) = fa_peer_loc(&d, "from: ") {
+                    let (x, y) = (q(a), q(b));
+                    links.remove(&(x.min(y), x.max(y)));
+                    if (a - subject).abs() < 1e-6 || (b - subject).abs() < 1e-6 {
+                        disc += 1;
+                        pair_events.push(format!(
+                            "#{seq} Disconnected {:.3}-{:.3} {}",
+                            a,
+                            b,
+                            d.split("reason: ")
+                                .nth(1)
+                                .unwrap_or("")
+                                .chars()
+                                .take(40)
+                                .collect::<String>()
+                        ));
+                    }
+                }
+            } else if d.starts_with("Connect(RequestSent") && (a - subject).abs() < 1e-6 {
+                sent += 1;
+                if let Some(r) = fa_field(&d, "desired_location: Location(") {
+                    desired.push(r.chars().take(5).collect());
+                }
+            } else if d.starts_with("Connect(ResponseReceived") && (a - subject).abs() < 1e-6 {
+                resp_recv += 1;
+                if let Some(b) = fa_peer_loc(&d, "acceptor: ") {
+                    acceptors.insert(q(b));
+                }
+            } else if d.starts_with("Connect(Rejected") && (a - subject).abs() < 1e-6 {
+                rejected += 1;
+                let r = d
+                    .split("reason: ")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                *rej_reasons.entry(r).or_default() += 1;
+            } else if d.starts_with("Connect(RequestReceived") {
+                if let (Some(j), true) = (fa_peer_loc(&d, "joiner: "), (a - succ_of).abs() < 1e-6) {
+                    if (j - subject).abs() < 1e-6 {
+                        if recv_at_succ < 4 {
+                            pair_events.push(format!(
+                                "#{seq} AT-SUCC {}",
+                                d.chars().take(520).collect::<String>()
+                            ));
+                        }
+                        recv_at_succ += 1;
+                        if d.contains("accepted: true") {
+                            recv_at_succ_acc += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Ring successor/predecessor link completeness over all peers.
+        let (mut succ_ok, mut pred_ok) = (0, 0);
+        let mut missing: Vec<String> = Vec::new();
+        for &l in sorted.iter() {
+            let su = subject_succ(&sorted, l);
+            let pr = subject_pred(&sorted, l);
+            let has = |b: f64| {
+                let (x, y) = (q(l), q(b));
+                links.contains(&(x.min(y), x.max(y)))
+            };
+            if has(su) {
+                succ_ok += 1;
+            } else {
+                missing.push(format!("{l:.3}->succ {su:.3}"));
+            }
+            if has(pr) {
+                pred_ok += 1;
+            }
+        }
+        eprintln!(
+            "PG LATTICE: succ_last_conn_count={succ_conn_count} peers={} links_to_true_succ={succ_ok} links_to_true_pred={pred_ok} (n={}) pads={pads} connected_events={connected_events}",
+            sorted.len(),
+            sorted.len()
+        );
+        eprintln!("PG LATTICE missing-succ: {}", missing.join(", "));
+        eprintln!(
+            "PG LATTICE subject={subject:.3} true_succ={succ_of:.3} linked={} requests_sent={sent} desired={:?} responses={resp_recv} acceptors={:?} rejected={rejected} {:?} disconnects={disc} recv_at_succ={recv_at_succ} accepted={recv_at_succ_acc}",
+            links.contains(&(q(subject).min(q(succ_of)), q(subject).max(q(succ_of)))),
+            desired.iter().take(12).collect::<Vec<_>>(),
+            acceptors
+                .iter()
+                .map(|v| *v as f64 / 1000.0)
+                .collect::<Vec<_>>(),
+            rej_reasons
+        );
+        for e in pair_events.iter().take(40) {
+            eprintln!("PG LATTICE ev {e}");
         }
     }
     let trace_keys: Vec<usize> = if never.is_empty() {
