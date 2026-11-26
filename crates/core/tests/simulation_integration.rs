@@ -26268,6 +26268,573 @@ fn run_get_at_htl_zero_sim(ring_max_htl: usize, demandless: bool) -> GetAtHtlZer
     }
 }
 
+// =============================================================================
+// Hop-policy sweep (EXPERIMENT, not for merge): where should a PUT's next hop go?
+// =============================================================================
+//
+// Pre-registered in ~/code/tmp/mcp/findability-put-placement-decision.md. One
+// cell per process: `HS_CELL=<policy>,<topo>,<cond>,<seed>[,<per_cohort>]`
+// (policy T|G|GG|K2|K3|P1|P1G|P1GG, GG/P1GG = the policy on GET as well;
+// topo dense|sparse; cond clean|churn|lossy). Output: one `HSCELL {json}`
+// line, appended to $HS_OUT when set.
+
+#[cfg(feature = "nightly_tests")]
+fn hs_contract(seed: u16) -> freenet_stdlib::prelude::ContractContainer {
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractWasmAPIVersion, Parameters, WrappedContract,
+    };
+    let s = seed.to_le_bytes();
+    let code: Vec<u8> = (0..32u8)
+        .map(|i| s[(i % 2) as usize].wrapping_add(i).wrapping_mul(7) ^ s[1])
+        .collect();
+    let params: Vec<u8> = (0..16u8)
+        .map(|i| s[(i % 2) as usize].wrapping_add(i.wrapping_mul(3)))
+        .collect();
+    ContractWasmAPIVersion::V1(WrappedContract::new(
+        Arc::new(ContractCode::from(code)),
+        Parameters::from(params),
+    ))
+    .into()
+}
+
+#[cfg(feature = "nightly_tests")]
+fn hs_inst(d: &str) -> Option<&str> {
+    let rest = d.split("ContractInstanceId(\"").nth(1)?;
+    rest.split('"').next()
+}
+
+#[cfg(feature = "nightly_tests")]
+fn hs_field<'a>(d: &'a str, pat: &str) -> Option<&'a str> {
+    let rest = d.split(pat).nth(1)?;
+    let end = rest.find([',', ' ', '}', ')']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+#[cfg(feature = "nightly_tests")]
+fn hs_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+#[cfg(feature = "nightly_tests")]
+fn hs_wrap(x: f64) -> f64 {
+    x.rem_euclid(1.0)
+}
+
+#[cfg(feature = "nightly_tests")]
+fn hs_pct(v: &mut Vec<f64>, q: f64) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.total_cmp(b));
+    v[((v.len() as f64 - 1.0) * q).round() as usize]
+}
+
+#[cfg(feature = "nightly_tests")]
+fn hs_run(
+    seed: u64,
+    network: &str,
+    sparse: bool,
+    cond: &str,
+    put_policy: freenet::dev_tool::HopPolicy,
+    get_policy: freenet::dev_tool::HopPolicy,
+    per_cohort: usize,
+    policy_name: &str,
+) -> String {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+    const SLOT_MS: u64 = 100;
+    const NODES: usize = 60;
+    const WARM_CONTRACTS: usize = 70;
+    const WARM_GETS_PER_NODE: usize = 56;
+    const STATE_BYTES: usize = 1_200_000;
+    // GET delay after the PUT, in slots: +10 s and +60 s.
+    const DELAYS: [usize; 2] = [100, 600];
+    let debug = std::env::var("HS_DEBUG").is_ok();
+
+    // Gateway location, as in the placement-gap sim.
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let g = rt.block_on(async {
+        let probe = SimNetwork::new(network, 1, 1, 10, 7, 12, 4, seed).await;
+        probe.get_peer_locations()[0]
+    });
+    drop(rt);
+    let c = hs_wrap(g - 0.31);
+    let mut targets: Vec<f64> = Vec::new();
+    if sparse {
+        for off in [-0.065, -0.02, 0.012, 0.05] {
+            targets.push(hs_wrap(c + off));
+        }
+    } else {
+        for i in 0..24 {
+            targets.push(hs_wrap(c - 0.075 + 0.15 * (i as f64 + 0.5) / 24.0));
+        }
+    }
+    let rest = NODES - targets.len();
+    for i in 0..rest {
+        targets.push(hs_wrap(c + 0.15 + 0.70 * (i as f64 + 0.5) / rest as f64));
+    }
+
+    setup_deterministic_state(seed);
+    let _event_clock = freenet::dev_tool::EventClockGuard::simulation();
+    let _policy = freenet::dev_tool::HopPolicyGuard::set(put_policy, get_policy);
+    let nn_guard = NnLatticeTestGuard;
+    freenet::dev_tool::set_nn_lattice_enabled(true);
+    let rt = create_runtime();
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let mut sim =
+            SimNetwork::new_with_node_locations(network, 1, NODES, 10, 7, 12, 4, seed, &targets)
+                .await;
+        sim.with_streaming_threshold(64 * 1024);
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
+        sim.with_controlled_op_interval(Duration::from_millis(SLOT_MS));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    let locs = sim.get_peer_locations(); // gateway first
+    assert_eq!(locs.len(), 1 + NODES);
+    assert!((locs[0] - g).abs() < 1e-9, "gateway location changed");
+
+    let mut rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = move || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as usize
+    };
+
+    // Nodes taken out of the requester pool: the churned set and the lossy peer.
+    let mut excluded: HashSet<usize> = HashSet::new();
+    let mut churned: Vec<usize> = Vec::new();
+    let mut lossy: Option<usize> = None;
+    if cond == "churn" {
+        while churned.len() < NODES / 10 {
+            let n = 1 + next_rand() % NODES;
+            if !churned.contains(&n) {
+                churned.push(n);
+            }
+        }
+        excluded.extend(churned.iter().copied());
+    }
+    if cond == "lossy" {
+        // The regular node geometrically closest to the middle of the key band.
+        let n = (1..=NODES)
+            .min_by(|&a, &b| hs_dist(locs[a], c).total_cmp(&hs_dist(locs[b], c)))
+            .unwrap();
+        lossy = Some(n);
+        excluded.insert(n);
+        sim.with_lossy_peer(&NodeLabel::node(network, n), 50);
+    }
+
+    // Measured contracts: keys inside c +/- 0.075, 2 cohorts (+10 s, +60 s).
+    let total = DELAYS.len() * per_cohort;
+    let mut containers = Vec::new();
+    let mut key_locs = Vec::new();
+    for s in 0..u16::MAX {
+        let ct = hs_contract(s);
+        let kl = Location::from(&ct.key()).as_f64();
+        if hs_dist(kl, c) <= 0.075 {
+            containers.push(ct);
+            key_locs.push(kl);
+            if containers.len() == total {
+                break;
+            }
+        }
+    }
+    assert_eq!(containers.len(), total, "not enough keys in the band");
+    // Warm-up contracts: small, anywhere, ids disjoint from the measured ones.
+    let warm: Vec<_> = (0..WARM_CONTRACTS)
+        .map(|i| hs_contract(40000 + i as u16))
+        .collect();
+
+    // Requester per measured contract: below the key, ring distance 0.18..0.40.
+    let mut requester = Vec::new();
+    for kl in &key_locs {
+        let cand: Vec<usize> = (1..=NODES)
+            .filter(|n| !excluded.contains(n))
+            .filter(|&n| (0.18..=0.40).contains(&hs_wrap(kl - locs[n])))
+            .collect();
+        assert!(!cand.is_empty(), "no requesters below key {kl}");
+        requester.push(cand[next_rand() % cand.len()]);
+    }
+
+    // Timeline, one op per slot.
+    let mut ops: Vec<ScheduledOperation> = Vec::new();
+    for (i, w) in warm.iter().enumerate() {
+        ops.push(ScheduledOperation::new(
+            NodeLabel::gateway(network, 0),
+            SimOperation::Put {
+                contract: w.clone(),
+                state: vec![i as u8; 64],
+                subscribe: false,
+            },
+        ));
+    }
+    // Idle slots so the warm PUTs settle before the warm GETs.
+    let settle_slots = 100usize;
+    // Each node GETs WARM_GETS_PER_NODE distinct warm contracts (round-robin
+    // over nodes so no node issues two ops back to back).
+    for k in 0..WARM_GETS_PER_NODE {
+        for n in 1..=NODES {
+            let w = &warm[(n + k * 7) % WARM_CONTRACTS];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, n),
+                SimOperation::Get {
+                    contract_id: *w.key().id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ));
+        }
+    }
+    let _ = settle_slots;
+    let measure_start_slot = ops.len();
+    // Measured phase: PUT one contract every slot... spaced 2 slots so streaming
+    // transfers overlap less; each GET becomes due `delay` slots after its PUT.
+    let mut pending: Vec<(usize, usize)> = Vec::new(); // (due slot, contract)
+    let churn_at = measure_start_slot + total / 2;
+    let mut crash_done = false;
+    let mut recover_at: Option<usize> = None;
+    let mut next_put = 0usize;
+    let mut slot = measure_start_slot;
+    while next_put < total || !pending.is_empty() {
+        if cond == "churn" && !crash_done && slot >= churn_at {
+            for &n in &churned {
+                ops.push(ScheduledOperation::new(
+                    NodeLabel::node(network, n),
+                    SimOperation::CrashNode,
+                ));
+                slot += 1;
+            }
+            crash_done = true;
+            recover_at = Some(slot + 600);
+            continue;
+        }
+        if let Some(at) = recover_at {
+            if slot >= at {
+                for &n in &churned {
+                    ops.push(ScheduledOperation::new(
+                        NodeLabel::node(network, n),
+                        SimOperation::RecoverNode,
+                    ));
+                    slot += 1;
+                }
+                recover_at = None;
+                continue;
+            }
+        }
+        let due = pending.iter().position(|(d, _)| *d <= slot);
+        let pick = due.or_else(|| {
+            if next_put >= total {
+                pending
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (d, _))| *d)
+                    .map(|(i, _)| i)
+            } else {
+                None
+            }
+        });
+        if let Some(pos) = pick {
+            let (_, ci) = pending.remove(pos);
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, requester[ci]),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else {
+            let ci = next_put;
+            next_put += 1;
+            // Interleave the cohorts: even index = +10 s, odd = +60 s.
+            let delay = DELAYS[ci % DELAYS.len()];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::gateway(network, 0),
+                SimOperation::Put {
+                    contract: containers[ci].clone(),
+                    state: {
+                        let mut s = vec![(ci % 251) as u8; STATE_BYTES];
+                        s[..8].copy_from_slice(&(ci as u64).to_le_bytes());
+                        s
+                    },
+                    subscribe: true,
+                },
+            ));
+            pending.push((slot + delay, ci));
+        }
+        slot += 1;
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(20000),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "hop sweep sim failed: {:?}",
+        result.turmoil_result.as_ref().err()
+    );
+    drop(nn_guard);
+
+    // ---- Analysis (virtual-time event stamps only) ----
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    struct Ev {
+        t: f64, // seconds, virtual
+        tx: String,
+        peer: String,
+        d: String,
+    }
+    let mut non_virtual = 0usize;
+    let mut by_inst: HashMap<String, Vec<Ev>> = HashMap::new();
+    for l in logs.iter() {
+        let d = format!("{:?}", l.kind);
+        if !d.starts_with("Get(") && !d.starts_with("Put(") {
+            continue;
+        }
+        let Some(inst) = hs_inst(&d).map(str::to_owned) else {
+            continue;
+        };
+        if !freenet::dev_tool::EventClockGuard::is_virtual(l.datetime) {
+            non_virtual += 1;
+            continue;
+        }
+        let t = l.datetime.timestamp() as f64 + l.datetime.timestamp_subsec_nanos() as f64 / 1e9;
+        let peer = l
+            .peer_id
+            .to_string()
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        by_inst.entry(inst).or_default().push(Ev {
+            t,
+            tx: l.tx.to_string(),
+            peer,
+            d,
+        });
+    }
+
+    // Warm-up check: min router events across all 61 nodes at the first measured PUT.
+    let first_put_t = containers
+        .iter()
+        .filter_map(|ct| by_inst.get(&ct.key().id().to_string()))
+        .flat_map(|v| v.iter().filter(|e| e.d.starts_with("Put(")).map(|e| e.t))
+        .fold(f64::INFINITY, f64::min);
+    let timeline = freenet::dev_tool::event_timeline();
+    let mut last_events: HashMap<u64, usize> = HashMap::new();
+    for (t_ns, own, n) in &timeline {
+        // The selection timeline is stamped with turmoil elapsed time counted
+        // from zero; event stamps count from the Unix epoch of the same clock.
+        if (*t_ns as f64) / 1e9 <= first_put_t {
+            last_events.insert(*own, *n);
+        }
+    }
+    let warm_counts: Vec<usize> = locs
+        .iter()
+        .map(|l| last_events.get(&l.to_bits()).copied().unwrap_or(0))
+        .collect();
+    let warm_min = warm_counts.iter().copied().min().unwrap_or(0);
+    let warm_below50 = warm_counts.iter().filter(|&&n| n < 50).count();
+
+    let mut put_lat = Vec::new();
+    let mut put_fail = 0usize;
+    let mut get_lat = Vec::new();
+    let mut found = [0usize; 2];
+    let mut n_get = [0usize; 2];
+    let mut replicas = Vec::new();
+    let mut per_peer: HashMap<String, usize> = HashMap::new();
+    let mut dump_left = if debug { 3 } else { 0 };
+    for (ci, ct) in containers.iter().enumerate() {
+        let coh = ci % DELAYS.len();
+        let evs = by_inst
+            .get(&ct.key().id().to_string())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let puts: Vec<&Ev> = evs.iter().filter(|e| e.d.starts_with("Put(")).collect();
+        let gets: Vec<&Ev> = evs.iter().filter(|e| e.d.starts_with("Get(")).collect();
+        let variant = |e: &Ev, pre: usize| -> String {
+            e.d[pre..]
+                .split([' ', '{'])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let put_start = puts.iter().map(|e| e.t).fold(f64::INFINITY, f64::min);
+        // GET client op.
+        let term = gets
+            .iter()
+            .filter(|e| variant(e, 4) == "ClientTerminal" && e.d.contains("is_sub_op: false"))
+            .min_by(|a, b| a.t.total_cmp(&b.t));
+        let get_start = term.and_then(|t| {
+            gets.iter()
+                .filter(|e| variant(e, 4) == "Request" && e.tx == t.tx)
+                .map(|e| e.t)
+                .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |y| y.min(x))))
+        });
+        n_get[coh] += 1;
+        let mut first_get = f64::INFINITY;
+        if let Some(t) = term {
+            let start = get_start.unwrap_or(t.t);
+            first_get = start;
+            if t.d.contains("outcome: Success") {
+                found[coh] += 1;
+            }
+            get_lat.push((t.t - start).max(0.0));
+        }
+        // PUT end: the originator's (the peer that logged the first Put event)
+        // first terminal event after its start.
+        let origin = puts
+            .iter()
+            .min_by(|a, b| a.t.total_cmp(&b.t))
+            .map(|e| e.peer.clone());
+        let mut ok = false;
+        if let Some(o) = &origin {
+            let end = puts
+                .iter()
+                .filter(|e| &e.peer == o && (variant(e, 4) == "PutSuccess"))
+                .map(|e| e.t)
+                .fold(f64::INFINITY, f64::min);
+            if end.is_finite() {
+                ok = true;
+                put_lat.push(end - put_start);
+            }
+        }
+        if !ok {
+            put_fail += 1;
+        }
+        // Replicas after the PUT, before the first GET: peers that stored.
+        let stored: HashSet<&str> = puts
+            .iter()
+            .filter(|e| variant(e, 4) == "PutSuccess" && e.t < first_get)
+            .map(|e| e.peer.as_str())
+            .collect();
+        replicas.push(stored.len() as f64);
+        for p in &stored {
+            *per_peer.entry((*p).to_owned()).or_default() += 1;
+        }
+        if dump_left > 0 {
+            dump_left -= 1;
+            eprintln!("HS dump contract {ci} key_loc={:.4}", key_locs[ci]);
+            for e in puts.iter().chain(gets.iter()).take(40) {
+                eprintln!(
+                    "HS   t={:.3} peer={:.8} tx=..{} {}",
+                    e.t - put_start,
+                    e.peer,
+                    &e.tx[e.tx.len().saturating_sub(5)..],
+                    &e.d[..e.d.len().min(160)]
+                );
+            }
+        }
+    }
+    let mut counts: Vec<usize> = per_peer.values().copied().collect();
+    counts.sort_unstable_by(|a, b| b.cmp(a));
+    let tot_place: usize = counts.iter().sum();
+    let top = |frac: f64| -> f64 {
+        let k = ((61.0 * frac).ceil() as usize).max(1);
+        if tot_place == 0 {
+            return f64::NAN;
+        }
+        counts.iter().take(k).sum::<usize>() as f64 / tot_place as f64
+    };
+    let (rank_put, n_put_sel, rank_get, n_get_sel) = freenet::dev_tool::rank_stats();
+    let (narrowed, _, fell_back) = freenet::dev_tool::choice_counts();
+    let pct = |f: usize, n: usize| 100.0 * f as f64 / n.max(1) as f64;
+    let mut rep = replicas.clone();
+    let out = format!(
+        concat!(
+            "{{\"policy\":\"{}\",\"topo\":\"{}\",\"cond\":\"{}\",\"seed\":{},\"n_per_cohort\":{},",
+            "\"find10\":{:.1},\"find60\":{:.1},\"found10\":{},\"found60\":{},\"n10\":{},\"n60\":{},",
+            "\"put_med_s\":{:.3},\"put_p90_s\":{:.3},\"put_fail_pct\":{:.1},",
+            "\"get_med_s\":{:.3},\"get_p90_s\":{:.3},",
+            "\"top1_share\":{:.3},\"top5_share\":{:.3},",
+            "\"replicas_med\":{:.1},\"replicas_mean\":{:.2},",
+            "\"warm_min_events\":{},\"nodes_below_50\":{},",
+            "\"put_hop_mean_rank\":{:.2},\"put_hop_n\":{},\"get_hop_mean_rank\":{:.2},\"get_hop_n\":{},",
+            "\"narrowed_decisions\":{},\"fell_back\":{},\"non_virtual_events\":{},\"lossy\":{:?},\"churned\":{}}}"
+        ),
+        policy_name,
+        if sparse { "sparse" } else { "dense" },
+        cond,
+        seed,
+        per_cohort,
+        pct(found[0], n_get[0]),
+        pct(found[1], n_get[1]),
+        found[0],
+        found[1],
+        n_get[0],
+        n_get[1],
+        hs_pct(&mut put_lat.clone(), 0.5),
+        hs_pct(&mut put_lat, 0.9),
+        pct(put_fail, total),
+        hs_pct(&mut get_lat.clone(), 0.5),
+        hs_pct(&mut get_lat, 0.9),
+        top(0.01),
+        top(0.05),
+        hs_pct(&mut rep, 0.5),
+        replicas.iter().sum::<f64>() / replicas.len().max(1) as f64,
+        warm_min,
+        warm_below50,
+        rank_put,
+        n_put_sel,
+        rank_get,
+        n_get_sel,
+        narrowed,
+        fell_back,
+        non_virtual,
+        lossy,
+        churned.len(),
+    );
+    println!("HSCELL {out}");
+    if let Ok(path) = std::env::var("HS_OUT") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{out}");
+        }
+    }
+    out
+}
+
+/// One sweep cell, selected by `HS_CELL`; a no-op when unset.
+#[cfg(feature = "nightly_tests")]
+#[test]
+fn test_hop_policy_sweep_cell() {
+    use freenet::dev_tool::HopPolicy as H;
+    let Ok(spec) = std::env::var("HS_CELL") else {
+        return;
+    };
+    let p: Vec<&str> = spec.split(',').collect();
+    let (put, get) = match p[0] {
+        "T" => (H::Today, H::Today),
+        "G" => (H::G, H::Today),
+        "GG" => (H::G, H::G),
+        "K2" => (H::K2, H::Today),
+        "K3" => (H::K3, H::Today),
+        "P1" => (H::P1, H::Today),
+        "P1G" => (H::P1G, H::Today),
+        "P1GG" => (H::P1G, H::P1G),
+        other => panic!("unknown policy {other}"),
+    };
+    let per: usize = p.get(4).and_then(|v| v.parse().ok()).unwrap_or(60);
+    hs_run(
+        p[3].parse().expect("seed"),
+        &format!("hs-{}-{}-{}-{}", p[0], p[1], p[2], p[3]),
+        p[1] == "sparse",
+        p[2],
+        put,
+        get,
+        per,
+        p[0],
+    );
+}
+
 /// A subscriber that misses a 1 MiB contract's update (crashed while it was
 /// broadcast) is healed by anti-entropy, and the heal never holds a node's event
 /// loop. Before the fix, the simulation build awaited the heal's send inside the
