@@ -12940,18 +12940,6 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
     const NETWORK_NAME: &str = "get-retry-single-host-timeout";
     setup_deterministic_state(SEED);
 
-    // This test needs the first attempt to hit the 60 s attempt deadline
-    // against a link that stays up. Under VirtualTime nothing keeps an idle
-    // link's receipt stamp fresh, so the stale-link sweep would drop the link
-    // after about 14 s instead. Turn it off for this thread's simulation.
-    struct SweepOff;
-    impl Drop for SweepOff {
-        fn drop(&mut self) {
-            freenet::dev_tool::set_stale_link_sweep_disabled(false);
-        }
-    }
-    freenet::dev_tool::set_stale_link_sweep_disabled(true);
-    let _sweep_off = SweepOff;
     let contract = SimOperation::create_test_contract(0x57);
     let contract_id = *contract.key().id();
     let contract_key = contract.key();
@@ -13109,6 +13097,16 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
 
     const SEED: u64 = 0x57A1_E11C_0001;
     const NETWORK_NAME: &str = "get-dead-first-hop";
+    // Off by default in sims: VirtualTime has no keepalive, so only a sim that
+    // makes a link truly dead can use it. This one does.
+    struct SweepOn;
+    impl Drop for SweepOn {
+        fn drop(&mut self) {
+            freenet::dev_tool::set_stale_link_sweep_enabled(false);
+        }
+    }
+    freenet::dev_tool::set_stale_link_sweep_enabled(true);
+    let _sweep_on = SweepOn;
     // The retry goes through a relay that is also connected to the dead host
     // (it is closest to the key), so the GET pays the silence window twice:
     // once at the requester (14 s window plus up to one 5 s tick) and once at
@@ -26624,6 +26622,13 @@ fn fa_run(
     setup_deterministic_state(seed);
     let nn_guard = NnLatticeTestGuard;
     freenet::dev_tool::set_nn_lattice_enabled(true);
+    // The stale-link sweep is what ships; FA_SWEEP=0 measures without it. Its
+    // switch is per thread and this test thread runs only this simulation.
+    // Caveat: VirtualTime has no keepalive, so in this sim "silent" means
+    // "idle", which is harsher than production.
+    freenet::dev_tool::set_stale_link_sweep_enabled(
+        std::env::var("FA_SWEEP").map_or(true, |v| v != "0"),
+    );
 
     let rt = create_runtime();
     let (sim, logs_handle) = rt.block_on(async {

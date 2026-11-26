@@ -69,7 +69,7 @@ pub(crate) use network_bridge::p2p_protoc::{
 // The visited-peers bloom gates its index check on the handshake floor (#5994).
 pub(crate) use network_bridge::p2p_protoc::parse_crate_version;
 #[cfg(any(test, feature = "testing"))]
-pub use network_bridge::p2p_protoc::set_stale_link_sweep_disabled;
+pub use network_bridge::p2p_protoc::set_stale_link_sweep_enabled;
 // Test-only: the release-timing marker has no runtime reader by design (see
 // its rustdoc), so re-exporting it unconditionally is an unused import in the
 // non-test build.

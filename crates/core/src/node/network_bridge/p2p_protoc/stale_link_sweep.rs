@@ -69,27 +69,30 @@ pub(super) const MAJORITY_GUARD_MIN_PEERS: usize = 3;
 
 #[cfg(any(test, feature = "testing"))]
 thread_local! {
-    static DISABLED_FOR_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ENABLED_FOR_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test-only, per thread: turn the sweep off for simulations run on this
-/// thread. Under `VirtualTime` nothing keeps an idle link's receipt stamp
-/// fresh, so a scenario that needs a request to outlive the silence window
-/// against a link that stays up (the 60 s attempt deadline path) cannot be
-/// built with the sweep on. Other sims on other threads are unaffected.
+/// Test-only, per thread: turn the sweep ON for simulations run on this
+/// thread. In builds with the `testing` feature it is off by default, because
+/// `VirtualTime` disables the transport keepalive: an idle simulated link's
+/// receipt stamp never advances, so "silent" there only means "idle", and the
+/// sweep would drop live links that have a slow request waiting on them (it
+/// broke the QUIC upgrade sims that way). A sim that needs the sweep, because
+/// it makes a link truly dead, opts in. Other sims on other threads are
+/// unaffected. Production builds have no switch and always sweep.
 #[cfg(any(test, feature = "testing"))]
-pub fn set_stale_link_sweep_disabled(disabled: bool) {
-    DISABLED_FOR_THREAD.with(|d| d.set(disabled));
+pub fn set_stale_link_sweep_enabled(enabled: bool) {
+    ENABLED_FOR_THREAD.with(|d| d.set(enabled));
 }
 
-fn disabled_for_thread() -> bool {
+fn enabled_for_thread() -> bool {
     #[cfg(any(test, feature = "testing"))]
     {
-        DISABLED_FOR_THREAD.with(|d| d.get())
+        ENABLED_FOR_THREAD.with(|d| d.get())
     }
     #[cfg(not(any(test, feature = "testing")))]
     {
-        false
+        true
     }
 }
 
@@ -219,7 +222,7 @@ impl P2pConnManager {
         if !sweep.due(now) {
             return;
         }
-        if disabled_for_thread() {
+        if !enabled_for_thread() {
             // Keep the timer moving so the loop does not spin on a due deadline.
             sweep.tick(now, &[]);
             return;

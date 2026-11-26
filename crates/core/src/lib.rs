@@ -245,7 +245,7 @@ pub mod dev_tool {
     // Test-only, per thread: turn the stale-link sweep off (see
     // `p2p_protoc::stale_link_sweep`).
     #[cfg(any(test, feature = "testing"))]
-    pub use crate::node::set_stale_link_sweep_disabled;
+    pub use crate::node::set_stale_link_sweep_enabled;
 
     // Test hook: connection identity decisions since process start, by kind
     // (labels as in the `conn_identity_*` telemetry). Never reset.
