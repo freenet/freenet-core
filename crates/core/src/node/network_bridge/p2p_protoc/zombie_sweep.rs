@@ -13,8 +13,10 @@
 //! - Only transports whose remote sent a request within `3 × transient_ttl`
 //!   (90s by default) are exempt. An unjoined peer that stays quiet longer than
 //!   that is collected by age as before, and its next request can still go
-//!   into a dead link until its own 120s idle timeout fires. #5654 is fixed for
-//!   unjoined peers that keep sending requests.
+//!   into a dead link until its own 120s idle timeout fires, or, if that
+//!   request is waiting for a reply, until the stale-link sweep
+//!   (`stale_link_sweep`) drops the silent link after its window (about 14 s on
+//!   UDP). #5654 is fixed for unjoined peers that keep sending requests.
 //! - A third or later exempt transport from one IP (or one IPv6 /64), or any
 //!   beyond the global cap, gets the age rule as before.
 //!
@@ -64,8 +66,9 @@ impl TransportActivity {
 /// ordinary use refreshes must be time-bounded (AGENTS.md). It is long because
 /// collecting a link the remote is still using is exactly the #5654 failure:
 /// the transport has no close message, so the remote keeps sending into the
-/// dead link until its 120s idle timeout fires. At one hour an unjoined peer
-/// pays that ~2-minute outage at most once an hour, instead of every ~3.5
+/// dead link until its 120s idle timeout fires (or, for a request waiting on
+/// it, until the stale-link sweep drops it after about 14 s). At one hour an
+/// unjoined peer pays that outage at most once an hour, instead of every ~3.5
 /// minutes as it did when the sweep judged by age alone.
 const ACTIVE_UNPROMOTED_MAX_AGE_TTL_MULTIPLE: u32 = 120;
 
@@ -275,6 +278,24 @@ pub(super) struct LinkUseStamp {
     base: Instant,
     micros_since_base: Arc<std::sync::atomic::AtomicU64>,
     connect_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the listener is now holding a received message for the event
+    /// loop (see [`Self::begin_forward`]).
+    forwarding: Arc<std::sync::atomic::AtomicBool>,
+    /// When the listener last finished forwarding one, as micros since
+    /// `base` plus one; 0 if it never has.
+    forwarded_at_micros_plus_one: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Held by a connection's listener while it waits to hand a received message to
+/// the event loop; see [`LinkUseStamp::begin_forward`].
+pub(super) struct ForwardGuard<'a> {
+    stamp: &'a LinkUseStamp,
+}
+
+impl Drop for ForwardGuard<'_> {
+    fn drop(&mut self) {
+        self.stamp.end_forward(Instant::now());
+    }
 }
 
 impl LinkUseStamp {
@@ -283,6 +304,44 @@ impl LinkUseStamp {
             base,
             micros_since_base: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             connect_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forwarding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            forwarded_at_micros_plus_one: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// The listener has a received message and is about to wait for room on the
+    /// event loop's channel. Until the guard drops the connection is not being
+    /// read, so its transport receipt stamp cannot advance although the peer is
+    /// alive: the stale-link sweep treats that as life, not silence.
+    pub(super) fn begin_forward(&self) -> ForwardGuard<'_> {
+        self.forwarding
+            .store(true, std::sync::atomic::Ordering::Release);
+        ForwardGuard { stamp: self }
+    }
+
+    fn end_forward(&self, now: Instant) {
+        let micros =
+            u64::try_from(now.saturating_duration_since(self.base).as_micros()).unwrap_or(u64::MAX);
+        self.forwarded_at_micros_plus_one.fetch_max(
+            micros.saturating_add(1),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        self.forwarding
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Time since the listener last held a message for the event loop: zero
+    /// while it holds one, `Duration::MAX` if it never has.
+    pub(super) fn since_forwarded(&self, now: Instant) -> Duration {
+        if self.forwarding.load(std::sync::atomic::Ordering::Acquire) {
+            return Duration::ZERO;
+        }
+        match self
+            .forwarded_at_micros_plus_one
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => Duration::MAX,
+            m => now.saturating_duration_since(self.base + Duration::from_micros(m - 1)),
         }
     }
 
@@ -400,8 +459,9 @@ pub(super) fn is_zombie(
         // timeout is the primary backstop, but this ensures no permanent leaks.
         /// Gateway connections get a generous exemption window (1 hour) because they
         /// are intentionally transient but needed for routing. The transport-level
-        /// idle timeout (120s keepalive) is the primary cleanup mechanism for dead
-        /// gateways; this threshold is the safety net.
+        /// idle timeout (120s) is the cleanup for a dead gateway nothing is waiting
+        /// on, and the stale-link sweep (`stale_link_sweep`, about 14 s on UDP)
+        /// for one that a request is waiting on; this threshold is the safety net.
         const GATEWAY_ZOMBIE_EXEMPTION: Duration = Duration::from_secs(3600);
         if age < GATEWAY_ZOMBIE_EXEMPTION {
             return false;

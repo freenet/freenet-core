@@ -13097,22 +13097,16 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
 
     const SEED: u64 = 0x57A1_E11C_0001;
     const NETWORK_NAME: &str = "get-dead-first-hop";
-    // Off by default in sims: VirtualTime has no keepalive, so only a sim that
-    // makes a link truly dead can use it. This one does.
-    struct SweepOn;
-    impl Drop for SweepOn {
-        fn drop(&mut self) {
-            freenet::dev_tool::set_stale_link_sweep_enabled(false);
-        }
-    }
-    freenet::dev_tool::set_stale_link_sweep_enabled(true);
-    let _sweep_on = SweepOn;
+    // VirtualTime has no keepalive, so the sweep is off by default in sims;
+    // this one makes a link truly dead and needs it.
+    let _sweep_on = freenet::dev_tool::StaleLinkSweepGuard::force(true);
     // The retry goes through a relay that is also connected to the dead host
     // (it is closest to the key), so the GET pays the silence window twice:
-    // once at the requester (14 s window plus up to one 5 s tick) and once at
-    // that relay, about 34 s in all. Without the sweep each of the two waits is
-    // the 60 s attempt deadline.
-    const MAX_LATENCY_S: f64 = 40.0;
+    // once at the requester and once at that relay, each 14 s plus up to one
+    // 5 s sweep tick, so at most 38 s plus the time the replies take (measured
+    // 39 s, in simulated time, identical on every run). Without the sweep each
+    // of the two waits is the 60 s attempt deadline (121 s measured).
+    const MAX_LATENCY_S: f64 = 50.0;
     setup_deterministic_state(SEED);
 
     let contract = SimOperation::create_test_contract(0x59);
@@ -13129,7 +13123,7 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     let num_nodes = node_locations.len();
 
     let rt = create_runtime();
-    let (mut sim, logs_handle) = rt.block_on(async {
+    let (sim, logs_handle) = rt.block_on(async {
         let mut sim = SimNetwork::new_with_node_locations(
             NETWORK_NAME,
             1,
@@ -13148,6 +13142,9 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
         let logs = sim.event_logs_handle();
         (sim, logs)
     });
+    // Stamp events with the simulation's clock, so the latency below is
+    // simulated time and cannot depend on how fast the host runs.
+    let _event_clock = freenet::dev_tool::EventClockGuard::simulation();
 
     let dead = NodeLabel::node(NETWORK_NAME, 1);
     let second_host = NodeLabel::node(NETWORK_NAME, 2);
@@ -13197,30 +13194,12 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
         operations.push(filler_get());
     }
 
-    // `NetLogMessage::datetime` is the wall clock, so sample (wall, virtual)
-    // pairs from another thread while the simulation runs and map each event
-    // onto virtual time afterwards.
-    let virtual_time = sim.virtual_time().clone();
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sampler = {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let mut samples: Vec<(chrono::DateTime<chrono::Utc>, u64)> = Vec::new();
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                samples.push((chrono::Utc::now(), virtual_time.now_nanos()));
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            samples
-        })
-    };
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
         Duration::from_secs(900),
         Duration::from_secs(120),
     );
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let samples = sampler.join().expect("sampler thread");
     assert!(
         result.turmoil_result.is_ok(),
         "simulation failed: {:?}",
@@ -13235,8 +13214,11 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
     let instance = contract_id.to_string();
     let virt_s = |dt: chrono::DateTime<chrono::Utc>| -> f64 {
-        let idx = samples.partition_point(|(w, _)| *w <= dt);
-        samples[idx.saturating_sub(1)].1 as f64 / 1e9
+        assert!(
+            freenet::dev_tool::EventClockGuard::is_virtual(dt),
+            "an event was stamped by the wall clock: {dt}"
+        );
+        dt.timestamp_nanos_opt().expect("in range") as f64 / 1e9
     };
     let get_events: Vec<(chrono::DateTime<chrono::Utc>, String, String, String)> = logs
         .iter()
@@ -26622,11 +26604,10 @@ fn fa_run(
     setup_deterministic_state(seed);
     let nn_guard = NnLatticeTestGuard;
     freenet::dev_tool::set_nn_lattice_enabled(true);
-    // The stale-link sweep is what ships; FA_SWEEP=0 measures without it. Its
-    // switch is per thread and this test thread runs only this simulation.
+    // The stale-link sweep is what ships; FA_SWEEP=0 measures without it.
     // Caveat: VirtualTime has no keepalive, so in this sim "silent" means
-    // "idle", which is harsher than production.
-    freenet::dev_tool::set_stale_link_sweep_enabled(
+    // "idle", which is harsher than production. Reverts when `fa_run` returns.
+    let _sweep_guard = freenet::dev_tool::StaleLinkSweepGuard::force(
         std::env::var("FA_SWEEP").map_or(true, |v| v != "0"),
     );
 
@@ -26639,6 +26620,14 @@ fn fa_run(
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle)
     });
+    // Latencies are read from event timestamps, so stamp them with the
+    // simulation's clock, not the host's: every latency below is simulated
+    // time (`NetLogMessage::datetime` is the wall clock by default). Taken
+    // after the join phase, whose convergence check compares event times across
+    // nodes: each node's clock starts at its own real start time, so only
+    // same-node differences are exact (the latencies), and cross-node ones
+    // (cohort ages) carry the start-time skew.
+    let _event_clock = freenet::dev_tool::EventClockGuard::simulation();
     let locs = sim.get_peer_locations();
     assert_eq!(locs.len(), num_gateways + num_nodes);
 
@@ -26763,6 +26752,11 @@ fn fa_run(
         if !d.starts_with("Get(") && !d.starts_with("Put(") {
             continue;
         }
+        assert!(
+            freenet::dev_tool::EventClockGuard::is_virtual(l.datetime),
+            "an event was stamped by the wall clock, not the simulation: {:?}",
+            l.datetime
+        );
         let Some(inst) = fa_instance(&d).map(str::to_owned) else {
             continue;
         };

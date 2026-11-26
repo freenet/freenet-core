@@ -737,6 +737,16 @@ impl ReceiptStamp {
         }
     }
 
+    /// Whether a QUIC path has ever been active on this connection. Its
+    /// receipts then feed [`Self::since_last_receipt`] (and keep their last
+    /// write after the path ends), so the stamp is bounded by the QUIC
+    /// keepalive and not only by the UDP one.
+    pub(crate) fn quic_path_seen(&self) -> bool {
+        self.quic_last_nanos
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
+
     /// Time since the connection last received an authenticated packet, on
     /// either side.
     pub(crate) fn since_last_receipt(&self) -> std::time::Duration {

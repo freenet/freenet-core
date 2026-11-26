@@ -13,7 +13,34 @@
 //! - at least one transaction is awaiting a reply from the peer, and
 //! - the connection has received no authenticated packet of any kind (pings,
 //!   pongs, acks and stream fragments included) for `W`, measured from the
-//!   later of the last receipt and the first sweep that saw a request waiting.
+//!   later of the last receipt and the first sweep that saw a request waiting,
+//!   and
+//! - the connection's listener is not holding a received message that the
+//!   event loop has yet to take (see below).
+//!
+//! # Why a held message counts as life
+//!
+//! A UDP connection's receipt stamp is written where the connection is read
+//! (`PeerConnection::recv`), and that is polled only by the connection's
+//! listener task, which forwards each message to the event loop over a bounded
+//! channel. While the loop is behind, the listener waits in that send and stops
+//! reading, so the stamp of a peer that is sending us traffic stops moving
+//! although the peer is alive; the peers awaited are exactly the ones that
+//! just sent something. The listener therefore marks itself
+//! (`LinkUseStamp::begin_forward`) before the send and records when it ended,
+//! and a peer whose listener is forwarding now, or finished forwarding within
+//! `W`, is not silent. QUIC stamps come from the ack-watch task and do not
+//! have this problem; the extra signal is harmless there.
+//!
+//! # Windows against the transport keepalives
+//!
+//! `W` is longer than two missed keepalives. The UDP ping is every 5 s and
+//! backs off towards 15 s (`MAX_KEEPALIVE_INTERVAL`) only after more than 5
+//! pings in a row went unanswered, i.e. about 25 s into a silence; a live peer
+//! answers every ping, so a live link is never in that state, and a dead one is
+//! dropped at `W` (14 s), before the backoff begins. A UDP connection that has
+//! carried a QUIC path gets the QUIC window, because its stamp includes QUIC
+//! receipts and those arrive at the QUIC keepalive (15 s).
 //!
 //! A peer with nothing waiting on it is never examined, so a peer that simply
 //! had nothing to say is not silent.
@@ -68,30 +95,66 @@ pub(super) const MAJORITY_GUARD_MIN_PEERS: usize = 3;
 
 #[cfg(any(test, feature = "testing"))]
 thread_local! {
-    static ENABLED_FOR_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OVERRIDE_FOR_THREAD: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Test-only, per thread: turn the sweep ON for simulations run on this
-/// thread. In builds with the `testing` feature it is off by default, because
-/// `VirtualTime` disables the transport keepalive: an idle simulated link's
-/// receipt stamp never advances, so "silent" there only means "idle", and the
-/// sweep would drop live links that have a slow request waiting on them (it
-/// broke the QUIC upgrade sims that way). A sim that needs the sweep, because
-/// it makes a link truly dead, opts in. Other sims on other threads are
-/// unaffected. Production builds have no switch and always sweep.
+/// Test-only, per thread: force the sweep on or off for simulations run on
+/// this thread, until the returned guard is dropped. Without an override the
+/// sweep runs when the transport has a keepalive ([`transport_has_keepalive`]).
 #[cfg(any(test, feature = "testing"))]
-pub fn set_stale_link_sweep_enabled(enabled: bool) {
-    ENABLED_FOR_THREAD.with(|d| d.set(enabled));
+#[must_use = "the override ends when the guard is dropped"]
+pub struct StaleLinkSweepGuard(());
+
+#[cfg(any(test, feature = "testing"))]
+impl StaleLinkSweepGuard {
+    /// Force the sweep on (`true`) or off (`false`) for this thread.
+    pub fn force(on: bool) -> Self {
+        OVERRIDE_FOR_THREAD.with(|o| o.set(Some(on)));
+        Self(())
+    }
 }
 
-fn enabled_for_thread() -> bool {
+#[cfg(any(test, feature = "testing"))]
+impl Drop for StaleLinkSweepGuard {
+    fn drop(&mut self) {
+        OVERRIDE_FOR_THREAD.with(|o| o.set(None));
+    }
+}
+
+fn override_for_thread() -> Option<bool> {
     #[cfg(any(test, feature = "testing"))]
     {
-        ENABLED_FOR_THREAD.with(|d| d.get())
+        OVERRIDE_FOR_THREAD.with(|o| o.get())
     }
     #[cfg(not(any(test, feature = "testing")))]
     {
-        true
+        None
+    }
+}
+
+/// Whether the transport of the node listening on `listen` sends keepalives.
+///
+/// This is the real reason the sweep needs a switch: without a keepalive an
+/// idle link's receipt stamp never advances, so "silent" only means "idle" and
+/// the sweep would drop live links that have a slow request waiting. Simulated
+/// connections run on `VirtualTime`, whose `supports_keepalive()` is `false`
+/// (and the direct runner's relaxed timers, `SimulationTransportOpt`, turn it
+/// off too), so a node is simulated when its address is registered with an
+/// in-memory network or that option is set. Decided from the transport, not
+/// from a cargo feature: feature unification has put `testing` into shipped
+/// binaries before.
+pub(super) fn transport_has_keepalive(listen: SocketAddr) -> bool {
+    !(crate::config::SimulationTransportOpt::is_enabled()
+        || crate::transport::in_memory_socket::get_socket_virtual_time(&listen).is_some())
+}
+
+/// Whether the sweep is active for the node listening on `listen`, and why.
+pub(super) fn activation(listen: SocketAddr) -> (bool, &'static str) {
+    match override_for_thread() {
+        Some(true) => (true, "forced on by a test"),
+        Some(false) => (false, "forced off by a test"),
+        None if transport_has_keepalive(listen) => (true, "transport has a keepalive"),
+        None => (false, "transport has no keepalive (simulation)"),
     }
 }
 
@@ -100,6 +163,18 @@ fn enabled_for_thread() -> bool {
 pub(super) enum LinkKind {
     Udp,
     Quic,
+}
+
+/// The window class of a connection. A UDP connection that has carried a QUIC
+/// path counts as QUIC: its receipt stamp includes that path's receipts, which
+/// arrive at the QUIC keepalive (15 s), so the 14 s UDP window would drop a
+/// healthy link between two of them.
+pub(super) fn link_kind(native: bool, quic_path_seen: bool) -> LinkKind {
+    if native || quic_path_seen {
+        LinkKind::Quic
+    } else {
+        LinkKind::Udp
+    }
 }
 
 /// `W = max(2 x keepalive + 2 x srtt + 2 s, 12 s)`: longer than two missed
@@ -120,6 +195,11 @@ pub(super) struct PeerSample {
     pub(super) kind: LinkKind,
     /// Time since the connection last received an authenticated packet.
     pub(super) since_last_receipt: Duration,
+    /// How long since the connection's listener last held a received message
+    /// for the event loop: zero while it holds one now, and `Duration::MAX`
+    /// if it never has. While the loop is behind the listener stops reading
+    /// the connection, so `since_last_receipt` freezes for a live peer.
+    pub(super) since_listener_progress: Duration,
     /// Transactions awaiting a reply from this peer.
     pub(super) outstanding: usize,
     /// How long requests have been continuously waiting on this peer, as far
@@ -132,7 +212,9 @@ impl PeerSample {
     /// shorter of the time since its last packet and the time since we began
     /// waiting, so an old stamp from before the request does not count.
     fn silence(&self) -> Duration {
-        self.since_last_receipt.min(self.outstanding_for)
+        self.since_last_receipt
+            .min(self.outstanding_for)
+            .min(self.since_listener_progress)
     }
 
     fn is_stale(&self) -> bool {
@@ -221,27 +303,29 @@ impl P2pConnManager {
         if !sweep.due(now) {
             return;
         }
-        if !enabled_for_thread() {
-            return;
-        }
         let awaiting = self
             .bridge
             .op_manager
             .ring
             .live_tx_tracker
             .awaiting_by_peer(is_awaiting_reply);
-        let observed: Vec<(SocketAddr, LinkKind, Duration, usize)> = self
+        let observed: Vec<PeerObservation> = self
             .connections
             .iter()
             .filter_map(|(addr, entry)| {
                 // A transport that reports no receipt time cannot be judged.
-                let since = entry.receipt.as_ref()?.since_last_receipt();
-                let kind = if entry.native {
-                    LinkKind::Quic
-                } else {
-                    LinkKind::Udp
-                };
-                Some((*addr, kind, since, awaiting.get(addr).copied().unwrap_or(0)))
+                let receipt = entry.receipt.as_ref()?;
+                // The receipt stamp of a UDP connection that has carried a QUIC
+                // path includes that path's receipts, which arrive at the QUIC
+                // keepalive, so it gets the QUIC window.
+                let kind = link_kind(entry.native, receipt.quic_path_seen());
+                Some(PeerObservation {
+                    addr: *addr,
+                    kind,
+                    since_last_receipt: receipt.since_last_receipt(),
+                    since_listener_progress: entry.link_use.since_forwarded(now),
+                    awaiting: awaiting.get(addr).copied().unwrap_or(0),
+                })
             })
             .collect();
         let decision = sweep.tick(now, &observed);
@@ -255,8 +339,8 @@ impl P2pConnManager {
         for addr in decision.drops {
             let (kind, since, waiting) = observed
                 .iter()
-                .find(|o| o.0 == addr)
-                .map(|o| (o.1, o.2, o.3))
+                .find(|o| o.addr == addr)
+                .map(|o| (o.kind, o.since_last_receipt, o.awaiting))
                 .unwrap_or((LinkKind::Udp, Duration::ZERO, 0));
             tracing::warn!(
                 peer_addr = %addr,
@@ -279,17 +363,31 @@ impl P2pConnManager {
     }
 }
 
+/// What the node reads from one connection at a tick.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PeerObservation {
+    pub(super) addr: SocketAddr,
+    pub(super) kind: LinkKind,
+    pub(super) since_last_receipt: Duration,
+    pub(super) since_listener_progress: Duration,
+    /// Live transactions awaiting a reply from this peer.
+    pub(super) awaiting: usize,
+}
+
 /// Per-node sweep state: the tick clock and, per peer, since when requests
 /// have been waiting on it.
 pub(super) struct StaleLinkSweep {
+    active: bool,
     last_tick: Option<Instant>,
     next_due: Instant,
     outstanding_since: HashMap<SocketAddr, Instant>,
 }
 
 impl StaleLinkSweep {
-    pub(super) fn new(now: Instant) -> Self {
+    /// `active` is [`activation`]'s verdict, taken once when the loop starts.
+    pub(super) fn new(now: Instant, active: bool) -> Self {
         Self {
+            active,
             last_tick: None,
             next_due: now + STALE_LINK_SWEEP_INTERVAL,
             outstanding_since: HashMap::new(),
@@ -297,27 +395,24 @@ impl StaleLinkSweep {
     }
 
     /// The timer deadline for the next tick, for the event loop's wake-up.
-    /// `None` while the sweep is off for this thread (simulations), so a sim
-    /// that did not opt in runs the same event loop as before the sweep.
+    /// `None` while the sweep is inactive, so a node without it runs the same
+    /// event loop as before the sweep.
     pub(super) fn deadline(&self) -> Option<Instant> {
-        enabled_for_thread().then_some(self.next_due)
+        self.active.then_some(self.next_due)
     }
 
     /// Whether a tick is due at `now`.
     pub(super) fn due(&self, now: Instant) -> bool {
-        now >= self.next_due
+        self.active && now >= self.next_due
     }
 
     /// Run one tick over `observed` (address, kind, time since last receipt,
     /// awaiting count) at `now`, returning the links to drop.
-    pub(super) fn tick(
-        &mut self,
-        now: Instant,
-        observed: &[(SocketAddr, LinkKind, Duration, usize)],
-    ) -> Decision {
+    pub(super) fn tick(&mut self, now: Instant, observed: &[PeerObservation]) -> Decision {
         let samples: Vec<PeerSample> = observed
             .iter()
-            .map(|&(addr, kind, since_last_receipt, outstanding)| {
+            .map(|o| {
+                let (addr, outstanding) = (o.addr, o.awaiting);
                 let outstanding_for = if outstanding == 0 {
                     Duration::ZERO
                 } else {
@@ -326,8 +421,9 @@ impl StaleLinkSweep {
                 };
                 PeerSample {
                     addr,
-                    kind,
-                    since_last_receipt,
+                    kind: o.kind,
+                    since_last_receipt: o.since_last_receipt,
+                    since_listener_progress: o.since_listener_progress,
                     outstanding,
                     outstanding_for,
                 }
@@ -336,7 +432,7 @@ impl StaleLinkSweep {
         // Forget peers with nothing waiting and peers that are gone, so a
         // later request starts a fresh wait.
         self.outstanding_since
-            .retain(|addr, _| observed.iter().any(|(a, _, _, n)| a == addr && *n > 0));
+            .retain(|addr, _| observed.iter().any(|o| o.addr == *addr && o.awaiting > 0));
         let decision = decide(now, self.last_tick, &samples);
         self.last_tick = Some(now);
         self.next_due = now + STALE_LINK_SWEEP_INTERVAL;
@@ -372,6 +468,7 @@ mod tests {
             addr: addr(n),
             kind: LinkKind::Udp,
             since_last_receipt: silent_for,
+            since_listener_progress: Duration::MAX,
             outstanding,
             outstanding_for,
         }
@@ -401,12 +498,25 @@ mod tests {
     }
 
     /// `UDP_KEEPALIVE_INTERVAL` is a copy of a private constant in a file this
-    /// sweep does not edit; fail if they drift apart.
+    /// sweep does not edit; fail if they drift apart. Reads only the constant's
+    /// own definition, with comments stripped, so a mention elsewhere in that
+    /// large file cannot satisfy it.
     #[test]
     fn udp_keepalive_matches_the_transport() {
-        let src = include_str!("../../../transport/peer_connection.rs");
-        assert!(
-            src.contains("const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);"),
+        let src = crate::contract::source_pin_util::strip_comments(include_str!(
+            "../../../transport/peer_connection.rs"
+        ));
+        let start = src
+            .find("const KEEP_ALIVE_INTERVAL")
+            .expect("peer_connection.rs defines KEEP_ALIVE_INTERVAL");
+        let definition: String = src[start..]
+            .split(';')
+            .next()
+            .expect("the definition ends")
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            definition, "constKEEP_ALIVE_INTERVAL:Duration=Duration::from_secs(5)",
             "peer_connection.rs KEEP_ALIVE_INTERVAL changed: update UDP_KEEPALIVE_INTERVAL"
         );
         assert_eq!(UDP_KEEPALIVE_INTERVAL, Duration::from_secs(5));
@@ -419,7 +529,13 @@ mod tests {
         let d = decide(
             now,
             last,
-            &[peer(1, Duration::from_secs(600), 0, Duration::ZERO)],
+            // Stale in every other respect: only "nothing is waiting" saves it.
+            &[peer(
+                1,
+                Duration::from_secs(600),
+                0,
+                Duration::from_secs(600),
+            )],
         );
         assert_eq!(d, Decision::default());
     }
@@ -584,12 +700,14 @@ mod tests {
 
     // ---- StaleLinkSweep state ----
 
-    fn obs(
-        n: u8,
-        silent_for: Duration,
-        outstanding: usize,
-    ) -> (SocketAddr, LinkKind, Duration, usize) {
-        (addr(n), LinkKind::Udp, silent_for, outstanding)
+    fn obs(n: u8, silent_for: Duration, outstanding: usize) -> PeerObservation {
+        PeerObservation {
+            addr: addr(n),
+            kind: LinkKind::Udp,
+            since_last_receipt: silent_for,
+            since_listener_progress: Duration::MAX,
+            awaiting: outstanding,
+        }
     }
 
     /// A request that begins waiting on a long-idle peer is judged from when
@@ -597,7 +715,7 @@ mod tests {
     #[test]
     fn sweep_measures_from_when_requests_began_waiting() {
         let c = clock();
-        let mut sweep = StaleLinkSweep::new(c.now());
+        let mut sweep = StaleLinkSweep::new(c.now(), true);
         let idle = Duration::from_secs(3600);
         let mut dropped_at = None;
         for i in 1..=10u32 {
@@ -626,7 +744,7 @@ mod tests {
     #[test]
     fn sweep_forgets_a_peer_with_nothing_waiting() {
         let c = clock();
-        let mut sweep = StaleLinkSweep::new(c.now());
+        let mut sweep = StaleLinkSweep::new(c.now(), true);
         let idle = Duration::from_secs(3600);
         for _ in 0..2 {
             c.advance_time(STALE_LINK_SWEEP_INTERVAL);
@@ -644,7 +762,7 @@ mod tests {
     #[test]
     fn sweep_forgets_a_closed_connection() {
         let c = clock();
-        let mut sweep = StaleLinkSweep::new(c.now());
+        let mut sweep = StaleLinkSweep::new(c.now(), true);
         c.advance_time(STALE_LINK_SWEEP_INTERVAL);
         sweep.tick(c.now(), &[obs(1, Duration::from_secs(1), 1)]);
         assert_eq!(sweep.outstanding_since.len(), 1);
@@ -658,7 +776,7 @@ mod tests {
     #[test]
     fn sweep_skips_a_stalled_tick_then_remeasures() {
         let c = clock();
-        let mut sweep = StaleLinkSweep::new(c.now());
+        let mut sweep = StaleLinkSweep::new(c.now(), true);
         let idle = Duration::from_secs(3600);
         c.advance_time(STALE_LINK_SWEEP_INTERVAL);
         sweep.tick(c.now(), &[obs(1, idle, 1)]);
@@ -676,15 +794,134 @@ mod tests {
     #[test]
     fn due_follows_the_interval() {
         let c = clock();
-        let mut sweep = StaleLinkSweep::new(c.now());
+        let mut sweep = StaleLinkSweep::new(c.now(), true);
         assert!(!sweep.due(c.now()));
         c.advance_time(STALE_LINK_SWEEP_INTERVAL);
         assert!(sweep.due(c.now()));
         sweep.tick(c.now(), &[]);
         assert!(!sweep.due(c.now()));
-        set_stale_link_sweep_enabled(true);
         assert_eq!(sweep.deadline(), Some(c.now() + STALE_LINK_SWEEP_INTERVAL));
-        set_stale_link_sweep_enabled(false);
-        assert_eq!(sweep.deadline(), None);
+        let off = StaleLinkSweep::new(c.now(), false);
+        assert_eq!(off.deadline(), None);
+        c.advance_time(STALE_LINK_SWEEP_INTERVAL * 10);
+        assert!(!off.due(c.now()));
+    }
+
+    // ---- a blocked listener is not a silent peer ----
+
+    /// The listener holds a message the event loop has not taken, so the
+    /// connection is not being read and its stamp is frozen at 100 s, with a
+    /// request waiting for 100 s: a live peer, not dropped.
+    #[test]
+    fn a_blocked_listener_with_an_old_stamp_is_not_dropped() {
+        let c = clock();
+        let (now, last) = normal_tick(&c);
+        let mut p = stale_for(1, Duration::from_secs(100));
+        p.since_listener_progress = Duration::ZERO;
+        assert_eq!(decide(now, last, &[p]), Decision::default());
+        // Finished forwarding 3 s ago: the listener has only just resumed
+        // reading, the stamp has not caught up yet.
+        p.since_listener_progress = Duration::from_secs(3);
+        assert_eq!(decide(now, last, &[p]), Decision::default());
+        // Nothing forwarded for the whole window: silent after all.
+        p.since_listener_progress = udp_w();
+        assert_eq!(decide(now, last, &[p]).drops, vec![addr(1)]);
+        p.since_listener_progress = Duration::MAX;
+        assert_eq!(decide(now, last, &[p]).drops, vec![addr(1)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_listener_stamp_reads_forwarding_now_then_the_time_since() {
+        let base = Instant::now();
+        let stamp = super::super::zombie_sweep::LinkUseStamp::new(base);
+        assert_eq!(stamp.since_forwarded(base), Duration::MAX);
+        let guard = stamp.begin_forward();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(stamp.since_forwarded(Instant::now()), Duration::ZERO);
+        drop(guard);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            stamp.since_forwarded(Instant::now()),
+            Duration::from_secs(10)
+        );
+    }
+
+    /// The guard must be bound to a name that lives across the sends, taken
+    /// before the first one: `let _ = ...` would drop it at once and the test
+    /// above would still pass.
+    #[test]
+    fn the_listener_holds_the_forward_guard_across_its_sends() {
+        let src = crate::contract::source_pin_util::strip_comments(
+            include_str!("../p2p_protoc.rs")
+                .split("\n#[cfg(test)]\nmod ")
+                .next()
+                .expect("production source"),
+        );
+        let guard = src
+            .find("let _forwarding = link_use.begin_forward();")
+            .expect("the listener takes the guard under a name");
+        let first = src[guard..]
+            .find("ConnEvent::NativeFirstFrame {")
+            .expect("first-frame send follows");
+        let second = src[guard..]
+            .find("ConnEvent::InboundMessage(IncomingMessage::with_remote(")
+            .expect("inbound send follows");
+        assert!(first > 0 && second > 0);
+        // And the guard is in the listener, after its `conn.recv()` arm.
+        assert!(src[..guard].rfind("msg = conn.recv()").is_some());
+    }
+
+    // ---- production default ----
+
+    /// A live link: keepalive stamps are fresh (a ping answered every 5 s)
+    /// while a request waits for minutes. The sweep never drops it.
+    #[test]
+    fn a_live_link_with_fresh_keepalive_stamps_is_never_dropped() {
+        let c = clock();
+        let mut sweep = StaleLinkSweep::new(c.now(), true);
+        for _ in 0..120 {
+            c.advance_time(STALE_LINK_SWEEP_INTERVAL);
+            let d = sweep.tick(c.now(), &[obs(1, Duration::from_secs(4), 1)]);
+            assert_eq!(d, Decision::default());
+        }
+    }
+
+    // ---- window class ----
+
+    #[test]
+    fn an_upgraded_udp_connection_gets_the_quic_window() {
+        assert_eq!(link_kind(false, false), LinkKind::Udp);
+        assert_eq!(link_kind(true, false), LinkKind::Quic);
+        assert_eq!(link_kind(false, true), LinkKind::Quic);
+        let stamp = crate::transport::ReceiptStamp::new(
+            Default::default(),
+            Default::default(),
+            std::sync::Arc::new(|| 0),
+        );
+        assert!(!stamp.quic_path_seen());
+        let with_path = crate::transport::ReceiptStamp::new(
+            Default::default(),
+            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(7)),
+            std::sync::Arc::new(|| 0),
+        );
+        assert!(with_path.quic_path_seen());
+    }
+
+    // ---- activation ----
+
+    #[test]
+    fn the_override_decides_and_ends_with_its_guard() {
+        let listen: SocketAddr = "10.9.9.9:1".parse().unwrap();
+        let (auto, _) = activation(listen);
+        assert!(auto, "an address no simulated network owns has a keepalive");
+        {
+            let _off = StaleLinkSweepGuard::force(false);
+            assert!(!activation(listen).0);
+        }
+        {
+            let _on = StaleLinkSweepGuard::force(true);
+            assert!(activation(listen).0);
+        }
+        assert_eq!(override_for_thread(), None);
     }
 }

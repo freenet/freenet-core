@@ -64,7 +64,7 @@ mod zombie_sweep;
 
 use connection_map::ConnectionMap;
 #[cfg(any(test, feature = "testing"))]
-pub use stale_link_sweep::set_stale_link_sweep_enabled;
+pub use stale_link_sweep::StaleLinkSweepGuard;
 use zombie_sweep::ZombieSweepState;
 #[cfg(test)]
 use zombie_sweep::{TransportActivity, is_zombie};
@@ -1801,7 +1801,15 @@ impl P2pConnManager {
             PENDING_CLAIM_RETRY_INTERVAL,
         );
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
-        let mut stale_link_sweep = stale_link_sweep::StaleLinkSweep::new(Instant::now());
+        let (stale_sweep_active, stale_sweep_reason) =
+            stale_link_sweep::activation(SocketAddr::new(ctx.listening_ip, ctx.listening_port));
+        tracing::info!(
+            active = stale_sweep_active,
+            reason = stale_sweep_reason,
+            "Stale-link sweep (drops links silent with requests waiting)"
+        );
+        let mut stale_link_sweep =
+            stale_link_sweep::StaleLinkSweep::new(Instant::now(), stale_sweep_active);
         let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
@@ -1985,7 +1993,11 @@ impl P2pConnManager {
             // Links gone silent while requests wait on them (see
             // `stale_link_sweep`); a no-op until its interval has passed.
             ctx.run_stale_link_sweep(&mut stale_link_sweep, &handshake_cmd_sender, |tx| {
-                state.pending_op_results.contains_key(tx)
+                // A waiter whose receiver is gone is not waiting on anyone.
+                state
+                    .pending_op_results
+                    .get(tx)
+                    .is_some_and(|sender| !sender.is_closed())
             })
             .await;
 
@@ -4225,6 +4237,11 @@ async fn peer_connection_listener(
                             // may not dequeue it for a while, and the zombie sweep
                             // must already see this transport as in use (#5654).
                             zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
+                            // Held while waiting for room on the event loop's
+                            // channel: the connection is not read meanwhile, so
+                            // its receipt stamp freezes for a live peer, and the
+                            // stale-link sweep must not read that as silence.
+                            let _forwarding = link_use.begin_forward();
                             if first_frame_pending {
                                 first_frame_pending = false;
                                 if conn_events

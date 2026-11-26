@@ -646,9 +646,10 @@ pub enum ConnectionType {
 /// `ConnectionLimitReached` is passed for a connection refused at the cap,
 /// but that connection never joined the ring, so no `disconnect` event is
 /// emitted for it. `RemoteDropped` is only produced by
-/// `P2pBridge::drop_connection` (test callers), and `Unresponsive` is not
-/// produced at all: the transport has no close message, so a remote close
-/// surfaces as `Timeout`.
+/// `P2pBridge::drop_connection` (test callers). `Unresponsive` is produced by
+/// the stale-link sweep (`p2p_protoc::stale_link_sweep`) when a link has gone
+/// silent while requests wait on it; the transport has no close message, so
+/// any other remote close surfaces as `Timeout`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub enum DisconnectReason {
