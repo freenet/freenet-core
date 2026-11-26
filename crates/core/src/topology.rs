@@ -968,62 +968,10 @@ impl TopologyManager {
             return TopologyAdjustment::NoChange;
         }
 
-        // Never swap away a guaranteed nearest-neighbor lattice edge
-        // (mechanism 4). Gated on the lattice being active for this peer's budget
-        // (empty below the minimum-degree floor).
-        let protected =
-            protected_nearest_neighbors(self.nn_lattice_active(), my_location, neighbor_locations);
-
-        // Collect raw routing values for normalization.
-        // Note: uses raw request count (not requests/bandwidth like the removal path)
-        // because swap decisions care about routing utility, not bandwidth cost.
-        // Both paths normalize to [0,1] so the ranking within each is correct.
-        let peers_with_routing: Vec<_> = neighbor_locations
-            .iter()
-            .filter(|(loc, _)| !protected.contains(loc))
-            .flat_map(|(loc, conns)| {
-                let count = conns.len();
-                conns.iter().map(move |conn| (loc, conn, count))
-            })
-            .map(|(loc, conn, count)| {
-                let peer_signed_dist = my_loc.signed_distance(*loc);
-                let routing_value = self
-                    .outbound_request_counter
-                    .get_request_count(&conn.location) as f64;
-                (
-                    conn.location.clone(),
-                    peer_signed_dist,
-                    routing_value,
-                    count,
-                )
-            })
-            .collect();
-
-        let max_routing = peers_with_routing
-            .iter()
-            .map(|(_, _, rv, _)| *rv)
-            .fold(0.0_f64, f64::max);
-
-        // Find the best peer to drop: lowest composite score of normalized
-        // routing value and topology importance, respecting the topology guard.
-        let remove = peers_with_routing
-            .into_iter()
-            .filter_map(|(peer, peer_signed_dist, routing_value, peers_at_loc)| {
-                let normalized = if max_routing > 0.0 {
-                    routing_value / max_routing
-                } else {
-                    0.0
-                };
-                let score = composite_score(
-                    normalized,
-                    peer_signed_dist,
-                    &signed_distances,
-                    peers_at_loc,
-                )?;
-                Some((peer, score))
-            })
-            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-            .map(|(peer, _)| peer);
+        let remove =
+            self.least_routed_removable_peer(my_loc, neighbor_locations, &signed_distances, |_| {
+                false
+            });
 
         let Some(remove) = remove else {
             return TopologyAdjustment::NoChange;
@@ -1046,6 +994,90 @@ impl TopologyManager {
             remove,
             add_location,
         }
+    }
+
+    /// The peer a topology swap (and a lattice displacement) would drop: the one
+    /// with the lowest composite score of normalized routing value and topology
+    /// importance. Never returns a guaranteed nearest-neighbor lattice edge
+    /// (mechanism 4) and skips topology-critical peers and any peer for which
+    /// `excluded` returns true.
+    fn least_routed_removable_peer(
+        &self,
+        my_loc: Location,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        signed_distances: &[f64],
+        excluded: impl Fn(&PeerKeyLocation) -> bool,
+    ) -> Option<PeerKeyLocation> {
+        let my_location = Some(my_loc);
+        // Never swap away a guaranteed nearest-neighbor lattice edge
+        // (mechanism 4). Gated on the lattice being active for this peer's budget
+        // (empty below the minimum-degree floor).
+        let protected =
+            protected_nearest_neighbors(self.nn_lattice_active(), &my_location, neighbor_locations);
+
+        // Collect raw routing values for normalization.
+        // Note: uses raw request count (not requests/bandwidth like the removal path)
+        // because swap decisions care about routing utility, not bandwidth cost.
+        // Both paths normalize to [0,1] so the ranking within each is correct.
+        let peers_with_routing: Vec<_> = neighbor_locations
+            .iter()
+            .filter(|(loc, _)| !protected.contains(loc))
+            .flat_map(|(loc, conns)| {
+                let count = conns.len();
+                conns.iter().map(move |conn| (loc, conn, count))
+            })
+            .filter(|(_, conn, _)| !excluded(&conn.location))
+            .map(|(loc, conn, count)| {
+                let peer_signed_dist = my_loc.signed_distance(*loc);
+                let routing_value = self
+                    .outbound_request_counter
+                    .get_request_count(&conn.location) as f64;
+                (
+                    conn.location.clone(),
+                    peer_signed_dist,
+                    routing_value,
+                    count,
+                )
+            })
+            .collect();
+
+        let max_routing = peers_with_routing
+            .iter()
+            .map(|(_, _, rv, _)| *rv)
+            .fold(0.0_f64, f64::max);
+
+        // Find the best peer to drop: lowest composite score of normalized
+        // routing value and topology importance, respecting the topology guard.
+        peers_with_routing
+            .into_iter()
+            .filter_map(|(peer, peer_signed_dist, routing_value, peers_at_loc)| {
+                let normalized = if max_routing > 0.0 {
+                    routing_value / max_routing
+                } else {
+                    0.0
+                };
+                let score =
+                    composite_score(normalized, peer_signed_dist, signed_distances, peers_at_loc)?;
+                Some((peer, score))
+            })
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+            .map(|(peer, _)| peer)
+    }
+
+    /// Victim for a lattice displacement: the least-routed non-lattice peer
+    /// (same ranking as a topology swap) among those `excluded` does not rule out.
+    pub(crate) fn select_displacement_victim(
+        &self,
+        my_location: &Option<Location>,
+        neighbor_locations: &BTreeMap<Location, Vec<Connection>>,
+        excluded: impl Fn(&PeerKeyLocation) -> bool,
+    ) -> Option<PeerKeyLocation> {
+        let my_loc = (*my_location)?;
+        let signed_distances: Vec<f64> = neighbor_locations
+            .keys()
+            .map(|nloc| my_loc.signed_distance(*nloc))
+            .collect();
+        self.least_routed_removable_peer(my_loc, neighbor_locations, &signed_distances, excluded)
     }
 }
 

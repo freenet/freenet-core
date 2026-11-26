@@ -104,6 +104,8 @@ pub(crate) use connection_manager::{
 // (see the module docs).
 pub(crate) use connection_manager::nn_lattice_active_for;
 #[cfg(any(test, feature = "testing"))]
+pub use connection_manager::{set_lattice_displacement_enabled, take_lattice_displacements_total};
+#[cfg(any(test, feature = "testing"))]
 pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 mod connection;
 mod hosting;
@@ -756,6 +758,7 @@ impl Ring {
         task_monitor: &crate::node::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Arc<Self>> {
         let live_tx_tracker = LiveTransactionTracker::new();
+        connection_manager.set_live_tx_tracker(live_tx_tracker.clone());
 
         let max_hops_to_live = if let Some(v) = config.max_hops_to_live {
             v
@@ -6729,6 +6732,22 @@ impl Ring {
             // `self.time_source` (rather than `Instant::now()` directly) allows tests
             // to supply a `SharedMockTimeSource` without pausing the whole tokio runtime.
             let tick_now = self.time_source.now();
+
+            // Backstop for lattice displacement: normally the CONNECT acceptor
+            // hands the victim to the drop path as soon as it is chosen.
+            for victim in self.connection_manager.take_displacement_victims() {
+                notifier
+                    .notifications_sender
+                    .send(Either::Right(crate::message::NodeEvent::DropConnection(
+                        victim,
+                        crate::tracing::DisconnectReason::Pruned,
+                    )))
+                    .await
+                    .map_err(|error| {
+                        tracing::debug!(error = ?error, "Shutting down connection maintenance task");
+                        error
+                    })?;
+            }
 
             // Expire old NAT traversal failure entries
             self.connection_manager.cleanup_stale_failed_addrs();

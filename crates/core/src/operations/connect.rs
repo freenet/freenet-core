@@ -1122,10 +1122,38 @@ impl RelayContext for RelayEnv<'_> {
             }
         }
 
-        self.op_manager
+        let accepted = self
+            .op_manager
             .ring
             .connection_manager
-            .should_accept(location, addr)
+            .should_accept(location, addr);
+        // Lattice displacement may have chosen a link to drop to make room for
+        // this joiner. Hand it to the normal drop path now, so the slot is free
+        // before the joiner's handshake completes. Best effort: if the event
+        // queue is full the maintenance loop's backstop sends it.
+        let victims = self
+            .op_manager
+            .ring
+            .connection_manager
+            .take_displacement_victims();
+        for (i, victim) in victims.iter().enumerate() {
+            if self
+                .op_manager
+                .try_notify_node_event(crate::message::NodeEvent::DropConnection(
+                    *victim,
+                    crate::tracing::DisconnectReason::Pruned,
+                ))
+                .is_err()
+            {
+                // Re-queue the rest for the backstop rather than losing them.
+                self.op_manager
+                    .ring
+                    .connection_manager
+                    .requeue_displacement_victims(&victims[i..]);
+                break;
+            }
+        }
+        accepted
     }
 
     fn select_next_hop(

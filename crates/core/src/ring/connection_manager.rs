@@ -140,6 +140,40 @@ thread_local! {
     // sets this too so those tests keep exercising the ON path at their sparse
     // `max_connections`.
     static NN_LATTICE_FORCE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Test-only switch for lattice displacement (see `DISPLACEMENT_COOLDOWN`).
+    // ON by default so the production behavior is what tests exercise; a
+    // before/after comparison on one seed turns it off.
+    static LATTICE_DISPLACEMENT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    // Displacements performed on this thread (the simulation runs every node on
+    // the test's thread), for before/after churn comparisons.
+    static LATTICE_DISPLACEMENTS_TOTAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Displacements performed on the CURRENT THREAD since the last call, then reset
+/// (test/validation only).
+#[cfg(any(test, feature = "testing"))]
+pub fn take_lattice_displacements_total() -> u64 {
+    LATTICE_DISPLACEMENTS_TOTAL.with(|c| c.replace(0))
+}
+
+/// Enable/disable lattice displacement for the CURRENT THREAD (test/validation
+/// only; production is always enabled). Thread-local for the same reason as
+/// [`set_nn_lattice_enabled`].
+#[cfg(any(test, feature = "testing"))]
+pub fn set_lattice_displacement_enabled(enabled: bool) {
+    LATTICE_DISPLACEMENT_ENABLED.with(|c| c.set(enabled));
+}
+
+#[inline]
+fn lattice_displacement_enabled() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        LATTICE_DISPLACEMENT_ENABLED.with(|c| c.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        true
+    }
 }
 
 /// Enable/disable the nearest-neighbor ring lattice for the CURRENT THREAD
@@ -277,6 +311,20 @@ const MAX_CONCURRENT_GATEWAY_CONNECTS: usize = 8;
 /// (successor + predecessor), so both edges can tighten in the same window before
 /// the prune catches up.
 pub(crate) const LATTICE_OVERMAX_SLACK: usize = 2;
+
+/// Minimum time between two lattice displacements at one node.
+///
+/// A node whose connections are at the over-cap ceiling admits a strictly closer
+/// ring neighbour by dropping one non-lattice link (see
+/// [`ConnectionManager::try_lattice_displacement`]). Every displacement costs
+/// the victim a link it may try to re-establish, so a node does it at most once
+/// per this interval. 5 minutes is a JUDGEMENT, not a measurement: long enough
+/// that two peers seeking lattice edges cannot displace each other's long links
+/// in a loop faster than the topology maintenance loop re-forms them, short
+/// enough that a node whose true neighbour appears after a join burst is not
+/// locked out for long. Revisit with field telemetry on the
+/// "lattice displacement" INFO line.
+pub(crate) const DISPLACEMENT_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Base TTL for a peer address in the recently-failed cache after a NAT traversal
 /// failure. Repeated failures to the same address scale the TTL exponentially:
@@ -500,8 +548,32 @@ pub(crate) enum ObservedAddrOutcome {
     Applied { location_changed: bool },
 }
 
+/// Book-keeping for lattice displacement (see
+/// [`ConnectionManager::try_lattice_displacement`]).
+#[derive(Default)]
+struct DisplacementState {
+    /// When this node last displaced a link.
+    last: Option<Instant>,
+    /// Candidates admitted by displacement: addr -> (location, granted at). While a
+    /// grant is live the over-cap predicate admits that location against the
+    /// ESTABLISHED count alone (the victim's slot is already free).
+    grants: BTreeMap<SocketAddr, (Location, Instant)>,
+    /// Victims chosen but not yet handed to the connection-drop path.
+    drops: Vec<SocketAddr>,
+    /// Displacements performed since start (telemetry / tests).
+    total: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
+    /// Lattice-displacement book-keeping; innermost lock, never held across
+    /// another ConnectionManager lock.
+    displacement: Arc<Mutex<DisplacementState>>,
+    /// In-flight transaction map, installed by `Ring::new`. Without it
+    /// displacement is disabled (no way to tell which links are busy).
+    live_tx: Arc<std::sync::OnceLock<super::LiveTransactionTracker>>,
+    /// Socket addresses of the configured gateways.
+    gateway_addrs: Arc<std::collections::HashSet<SocketAddr>>,
     /// Pending connection reservations, keyed by socket address.
     /// Each entry records the advertised location and the time the reservation was created,
     /// allowing stale entries to be expired via `PENDING_RESERVATION_TTL`.
@@ -805,6 +877,13 @@ impl ConnectionManager {
                 .filter_map(crate::node::InitPeerNode::native_addr),
         );
         cm.native_connect = Arc::new(native_connect);
+        cm.gateway_addrs = Arc::new(
+            config
+                .gateways
+                .iter()
+                .filter_map(crate::node::InitPeerNode::socket_addr)
+                .collect(),
+        );
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
@@ -885,6 +964,9 @@ impl ConnectionManager {
             connected_since: Arc::new(RwLock::new(BTreeMap::new())),
             peer_health: Arc::new(Mutex::new(PeerHealthTracker::new())),
             connect_jitter_failures: Arc::new(parking_lot::Mutex::new((0, None))),
+            displacement: Arc::new(Mutex::new(DisplacementState::default())),
+            live_tx: Arc::new(std::sync::OnceLock::new()),
+            gateway_addrs: Arc::new(std::collections::HashSet::new()),
             acceptor_reliability: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
             lattice_probes_issued: Arc::new(AtomicU64::new(0)),
             lattice_probe_improvements: Arc::new(AtomicU64::new(0)),
@@ -1194,7 +1276,10 @@ impl ConnectionManager {
             || (nn_override && total_conn < self.max_connections)
             // At/over max, admit a strictly-closer per-side nearest (tighten OR
             // fill) within the over-cap ceiling.
-            || self.admits_lattice_edge_over_cap(location);
+            || self.admits_lattice_edge_over_cap(location)
+            // At the ceiling itself: make room by dropping one non-lattice link.
+            // Last, so a candidate any other clause admits never costs a link.
+            || (nn_override && self.try_lattice_displacement(addr, location));
         tracing::debug!(
             addr = %addr,
             peer_location = %location,
@@ -1633,7 +1718,156 @@ impl ConnectionManager {
             .values()
             .filter(|(_, created)| now.duration_since(*created) <= PENDING_RESERVATION_TTL)
             .count();
-        established + pending < self.max_connections + LATTICE_OVERMAX_SLACK
+        let ceiling = self.max_connections + LATTICE_OVERMAX_SLACK;
+        established + pending < ceiling
+            // A displacement grant means a victim's slot was already freed for
+            // this candidate, so the candidate's own reservation (and unrelated
+            // ones) must not count against it; the ESTABLISHED count is still
+            // held under the hard ceiling.
+            || (established < ceiling && self.has_displacement_grant(loc))
+    }
+
+    /// Whether a live displacement grant exists for a candidate at `loc`.
+    fn has_displacement_grant(&self, loc: Location) -> bool {
+        let now = Instant::now();
+        self.displacement
+            .lock()
+            .grants
+            .values()
+            .any(|(l, at)| *l == loc && now.duration_since(*at) <= PENDING_RESERVATION_TTL)
+    }
+
+    /// Install the in-flight transaction map (called once by `Ring::new`).
+    /// Displacement stays disabled until it is set.
+    pub(crate) fn set_live_tx_tracker(&self, tracker: super::LiveTransactionTracker) {
+        let _ = self.live_tx.set(tracker);
+    }
+
+    /// Victims chosen by lattice displacement that the caller must now drop
+    /// through the normal connection-drop path (`NodeEvent::DropConnection`).
+    /// Drained by the CONNECT acceptor right after `should_accept`, with the
+    /// maintenance loop as a backstop.
+    pub(crate) fn take_displacement_victims(&self) -> Vec<SocketAddr> {
+        std::mem::take(&mut self.displacement.lock().drops)
+    }
+
+    /// Put victims back when the event queue was full; the maintenance loop
+    /// drains them.
+    pub(crate) fn requeue_displacement_victims(&self, victims: &[SocketAddr]) {
+        self.displacement.lock().drops.extend_from_slice(victims);
+    }
+
+    /// Number of lattice displacements this node has performed.
+    #[cfg(test)]
+    pub(crate) fn lattice_displacements(&self) -> u64 {
+        self.displacement.lock().total
+    }
+
+    /// LATTICE DISPLACEMENT. A CONNECT arrives from a peer that would be this
+    /// node's new nearest ring neighbour on its side (the caller has checked
+    /// that), and the node already holds `max_connections + LATTICE_OVERMAX_SLACK`
+    /// established links, so the over-cap predicate refuses it. Without this the
+    /// true neighbour can never link to a saturated peer, and a key that sits
+    /// between them is unreachable from that side (see #4760's findability gap).
+    ///
+    /// Instead of refusing, drop exactly ONE existing link and admit the
+    /// candidate. The victim is the one a topology swap would pick (least-routed,
+    /// via `TopologyManager::select_displacement_victim`), never:
+    ///  - either side's current nearest ring neighbour (a lattice edge);
+    ///  - a peer with transactions in flight (`LiveTransactionTracker`);
+    ///  - a configured gateway, unless the node would still hold at least
+    ///    `min_connections` non-gateway links afterwards.
+    ///
+    /// At most one displacement per node per [`DISPLACEMENT_COOLDOWN`]. With no
+    /// eligible victim, or inside the cooldown, returns false (the candidate is
+    /// refused as before). The victim is queued for
+    /// [`Self::take_displacement_victims`] so the drop runs through the normal
+    /// path, which cleans every per-peer map.
+    fn try_lattice_displacement(&self, candidate: SocketAddr, candidate_loc: Location) -> bool {
+        if !lattice_displacement_enabled() {
+            return false;
+        }
+        let Some(live_tx) = self.live_tx.get() else {
+            return false;
+        };
+        let Some(me) = self.get_stored_location() else {
+            return false;
+        };
+        let now = Instant::now();
+        let in_cooldown = |st: &DisplacementState| {
+            st.last
+                .is_some_and(|t| now.saturating_duration_since(t) < DISPLACEMENT_COOLDOWN)
+        };
+        if in_cooldown(&self.displacement.lock()) {
+            return false;
+        }
+        let snapshot: BTreeMap<Location, Vec<Connection>> =
+            self.connections_by_location.read().clone();
+        let established: usize = snapshot.values().map(Vec::len).sum();
+        if established < self.max_connections + LATTICE_OVERMAX_SLACK {
+            // Below the ceiling the ordinary over-cap path decides.
+            return false;
+        }
+        let gateway_links = snapshot
+            .values()
+            .flatten()
+            .filter(|c| {
+                c.location
+                    .socket_addr()
+                    .is_some_and(|a| self.gateway_addrs.contains(&a))
+            })
+            .count();
+        let gateway_displaceable = established - gateway_links >= self.min_connections;
+        let victim =
+            self.topology_manager
+                .read()
+                .select_displacement_victim(&Some(me), &snapshot, |peer| {
+                    match peer.socket_addr() {
+                        None => true,
+                        Some(a) => {
+                            live_tx.has_live_connection(a)
+                                || (self.gateway_addrs.contains(&a) && !gateway_displaceable)
+                        }
+                    }
+                });
+        let Some(victim) = victim else {
+            tracing::debug!(
+                candidate = %candidate,
+                candidate_location = %candidate_loc,
+                established,
+                "lattice displacement: no eligible victim, refusing"
+            );
+            return false;
+        };
+        let Some(victim_addr) = victim.socket_addr() else {
+            return false;
+        };
+        let victim_loc = victim.location();
+        let mut st = self.displacement.lock();
+        if in_cooldown(&st) {
+            return false;
+        }
+        st.last = Some(now);
+        st.total += 1;
+        #[cfg(any(test, feature = "testing"))]
+        LATTICE_DISPLACEMENTS_TOTAL.with(|c| c.set(c.get() + 1));
+        st.drops.push(victim_addr);
+        st.grants
+            .retain(|_, (_, at)| now.duration_since(*at) <= PENDING_RESERVATION_TTL);
+        st.grants.insert(candidate, (candidate_loc, now));
+        let total = st.total;
+        drop(st);
+        tracing::info!(
+            victim = %victim_addr,
+            victim_location = ?victim_loc,
+            admitted = %candidate,
+            admitted_location = %candidate_loc,
+            side = if me.signed_distance(candidate_loc) > 0.0 { "successor" } else { "predecessor" },
+            established,
+            displacements_total = total,
+            "lattice displacement: dropping one non-lattice link to admit a ring neighbour"
+        );
+        true
     }
 
     /// Record the advertised location for a peer that we have decided to accept.
@@ -2862,6 +3096,9 @@ impl ConnectionManager {
             count_after
         };
 
+        // The grant (if any) has done its job; the connection is established.
+        self.displacement.lock().grants.remove(&addr);
+
         // Verify the insertion actually persisted — detect silent state corruption.
         let in_location_map = self.location_for_peer.read().contains_key(&addr);
         if !in_location_map || count_after == 0 {
@@ -2948,6 +3185,7 @@ impl ConnectionManager {
                 tracing::debug!("no location found for peer, skip pruning");
                 return None;
             } else {
+                self.displacement.lock().grants.remove(&addr);
                 let removed = self.pending_reservations.write().remove(&addr).is_some();
                 if !removed {
                     tracing::warn!(
@@ -2974,6 +3212,7 @@ impl ConnectionManager {
 
         if !is_alive {
             self.pending_reservations.write().remove(&addr);
+            self.displacement.lock().grants.remove(&addr);
         }
 
         self.forget_pruned_peer(addr);
@@ -8270,8 +8509,223 @@ mod tests {
             "fresh entry after cleanup should reflect new data, got {score}"
         );
     }
-}
 
-#[cfg(test)]
-#[path = "lattice_degree_model.rs"]
-mod lattice_degree_model;
+    // ============ lattice displacement (full peer admits its ring neighbour) ============
+
+    /// A node at 0.5 holding `max + LATTICE_OVERMAX_SLACK` = 6 links: lattice edges
+    /// 0.52 (successor) and 0.45 (predecessor), long links 0.6, 0.7, 0.2, 0.3.
+    /// Returns the manager, the in-flight tracker and the long links' addresses.
+    fn displacement_fixture(
+        min_conn: usize,
+    ) -> (
+        ConnectionManager,
+        crate::ring::LiveTransactionTracker,
+        Vec<(f64, SocketAddr)>,
+    ) {
+        set_nn_lattice_enabled(true);
+        let cm = make_connection_manager(None, min_conn, 4, false);
+        cm.update_location(Some(Location::new(0.5)));
+        let tracker = crate::ring::LiveTransactionTracker::new();
+        cm.set_live_tx_tracker(tracker.clone());
+        let kp = TransportKeypair::new();
+        let mut long_links = Vec::new();
+        // Fill to max with the long links, then tighten over max with the edges.
+        for (i, l) in [0.7_f64, 0.6, 0.2, 0.3].into_iter().enumerate() {
+            let addr = make_addr(9100 + i as u16);
+            assert!(cm.add_connection(Location::new(l), addr, kp.public().clone(), false));
+            long_links.push((l, addr));
+        }
+        for (i, l) in [0.52_f64, 0.45].into_iter().enumerate() {
+            assert!(cm.add_connection(
+                Location::new(l),
+                make_addr(9110 + i as u16),
+                kp.public().clone(),
+                false
+            ));
+        }
+        assert_eq!(cm.connection_count(), 4 + LATTICE_OVERMAX_SLACK);
+        (cm, tracker, long_links)
+    }
+
+    fn busy(tracker: &crate::ring::LiveTransactionTracker, addr: SocketAddr) {
+        tracker.add_transaction(
+            addr,
+            crate::message::Transaction::new::<crate::operations::connect::ConnectMsg>(),
+        );
+    }
+
+    /// A strictly closer true neighbour at a node already at the over-cap ceiling:
+    /// admitted, and exactly one non-lattice link is chosen to drop. Before the
+    /// fix this candidate was refused (`established >= max + slack`).
+    #[test]
+    fn displacement_admits_strictly_closer_neighbour_and_drops_one_long_link() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, _tracker, long_links) = displacement_fixture(2);
+        let cand = make_addr(9200);
+        assert!(
+            cm.should_accept(Location::new(0.51), cand),
+            "a strictly closer successor must be admitted at the ceiling"
+        );
+        let victims = cm.take_displacement_victims();
+        assert_eq!(
+            victims.len(),
+            1,
+            "exactly one link is displaced: {victims:?}"
+        );
+        assert!(
+            long_links.iter().any(|(_, a)| *a == victims[0]),
+            "the victim is a non-lattice long link, got {:?}",
+            victims[0]
+        );
+        assert_eq!(cm.lattice_displacements(), 1);
+        // The cap gates must admit the candidate once the victim is gone, and not
+        // before (the victim's slot is what makes room).
+        assert!(
+            cm.refuses_connection_at_cap(Location::new(0.51)),
+            "ceiling still full until the victim is dropped"
+        );
+        cm.prune_connection(victims[0], true);
+        assert!(
+            !cm.refuses_connection_at_cap(Location::new(0.51)),
+            "the granted candidate passes the cap gates after the drop"
+        );
+        let kp = TransportKeypair::new();
+        assert!(cm.add_connection(Location::new(0.51), cand, kp.public().clone(), true));
+        assert_eq!(cm.connection_count(), 4 + LATTICE_OVERMAX_SLACK);
+        assert!(
+            (cm.nearest_lattice_neighbor_dist(true).unwrap() - 0.01).abs() < 1e-9,
+            "0.51 is now the nearest successor"
+        );
+    }
+
+    /// Neither lattice edge is ever the victim, however many long links are busy.
+    #[test]
+    fn displacement_never_drops_a_lattice_edge_and_refuses_without_a_victim() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, tracker, long_links) = displacement_fixture(2);
+        for (_, a) in &long_links {
+            busy(&tracker, *a);
+        }
+        let cand = make_addr(9201);
+        assert!(
+            !cm.should_accept(Location::new(0.51), cand),
+            "only lattice edges and busy links remain: refuse as before"
+        );
+        assert!(cm.take_displacement_victims().is_empty());
+        assert_eq!(cm.lattice_displacements(), 0);
+        assert!(
+            !cm.pending_reservations.read().contains_key(&cand),
+            "a refusal must not leave a reservation behind"
+        );
+    }
+
+    /// A link with a transaction in flight is skipped; the idle one is chosen.
+    #[test]
+    fn displacement_skips_links_with_transactions_in_flight() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, tracker, long_links) = displacement_fixture(2);
+        let idle = long_links[2].1; // 0.2
+        for (_, a) in long_links.iter().filter(|(_, a)| *a != idle) {
+            busy(&tracker, *a);
+        }
+        assert!(cm.should_accept(Location::new(0.51), make_addr(9202)));
+        assert_eq!(cm.take_displacement_victims(), vec![idle]);
+    }
+
+    /// At most one displacement per node per `DISPLACEMENT_COOLDOWN`.
+    #[tokio::test(start_paused = true)]
+    async fn displacement_is_rate_limited_per_node() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, _tracker, _long) = displacement_fixture(2);
+        let kp = TransportKeypair::new();
+        let first = make_addr(9203);
+        assert!(cm.should_accept(Location::new(0.51), first));
+        let victims = cm.take_displacement_victims();
+        cm.prune_connection(victims[0], true);
+        assert!(cm.add_connection(Location::new(0.51), first, kp.public().clone(), true));
+        // Back at the ceiling; an even closer neighbour arrives inside the cooldown.
+        let second = make_addr(9204);
+        tokio::time::advance(DISPLACEMENT_COOLDOWN - Duration::from_secs(1)).await;
+        assert!(
+            !cm.should_accept(Location::new(0.505), second),
+            "inside the cooldown the candidate is refused"
+        );
+        assert!(cm.take_displacement_victims().is_empty());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            cm.should_accept(Location::new(0.505), second),
+            "after the cooldown it is admitted"
+        );
+        assert_eq!(cm.take_displacement_victims().len(), 1);
+        assert_eq!(cm.lattice_displacements(), 2);
+    }
+
+    /// A candidate that is not strictly closer than the current nearest on its
+    /// side is an ordinary peer: refused at the ceiling, nothing displaced.
+    #[test]
+    fn displacement_ignores_candidates_that_are_not_new_nearest() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, _tracker, _long) = displacement_fixture(2);
+        assert!(!cm.should_accept(Location::new(0.55), make_addr(9205)));
+        assert!(cm.take_displacement_victims().is_empty());
+        assert_eq!(cm.lattice_displacements(), 0);
+    }
+
+    /// Without the in-flight map installed (or with the switch off) displacement
+    /// is disabled and the node behaves as before.
+    #[test]
+    fn displacement_disabled_without_tracker_or_when_switched_off() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, _tracker, _long) = displacement_fixture(2);
+        set_lattice_displacement_enabled(false);
+        let off = cm.should_accept(Location::new(0.51), make_addr(9206));
+        set_lattice_displacement_enabled(true);
+        assert!(!off, "switched off: refused as before");
+        assert!(cm.take_displacement_victims().is_empty());
+
+        set_nn_lattice_enabled(true);
+        let bare = make_connection_manager(None, 2, 4, false);
+        bare.update_location(Some(Location::new(0.5)));
+        let kp = TransportKeypair::new();
+        for (i, l) in [0.7_f64, 0.6, 0.2, 0.3, 0.52, 0.45].into_iter().enumerate() {
+            assert!(bare.add_connection(
+                Location::new(l),
+                make_addr(9300 + i as u16),
+                kp.public().clone(),
+                false
+            ));
+        }
+        assert!(
+            !bare.should_accept(Location::new(0.51), make_addr(9207)),
+            "no in-flight map installed: displacement stays off"
+        );
+    }
+
+    /// A configured-gateway link is displaceable only while the node keeps
+    /// `min_connections` non-gateway links afterwards.
+    #[test]
+    fn displacement_protects_gateway_link_of_a_thinly_connected_node() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        // min 6: five non-gateway links would be below the floor.
+        let (mut cm, tracker, long_links) = displacement_fixture(6);
+        let gateway = long_links[0].1;
+        cm.gateway_addrs = Arc::new(HashSet::from([gateway]));
+        for (_, a) in long_links.iter().filter(|(_, a)| *a != gateway) {
+            busy(&tracker, *a);
+        }
+        assert!(
+            !cm.should_accept(Location::new(0.51), make_addr(9208)),
+            "the only idle long link is a gateway and the node has few links"
+        );
+        assert!(cm.take_displacement_victims().is_empty());
+        // With a lower floor the same link may go.
+        let (mut cm, tracker, long_links) = displacement_fixture(2);
+        let gateway = long_links[0].1;
+        cm.gateway_addrs = Arc::new(HashSet::from([gateway]));
+        for (_, a) in long_links.iter().filter(|(_, a)| *a != gateway) {
+            busy(&tracker, *a);
+        }
+        assert!(cm.should_accept(Location::new(0.51), make_addr(9209)));
+        assert_eq!(cm.take_displacement_victims(), vec![gateway]);
+    }
+}

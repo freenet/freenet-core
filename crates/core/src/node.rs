@@ -1223,6 +1223,11 @@ impl InitPeerNode {
         self
     }
 
+    /// The gateway's socket address, native or not.
+    pub(crate) fn socket_addr(&self) -> Option<SocketAddr> {
+        self.peer_key_location.socket_addr()
+    }
+
     /// The gateway's address, if the index marks it native.
     pub(crate) fn native_addr(&self) -> Option<SocketAddr> {
         self.native

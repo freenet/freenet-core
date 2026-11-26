@@ -18422,6 +18422,7 @@ impl Drop for NnLatticeTestGuard {
         // process-isolated) would see the lattice forced ON below the floor.
         freenet::dev_tool::set_nn_lattice_enabled(true);
         freenet::dev_tool::set_nn_lattice_force_active(false);
+        freenet::dev_tool::set_lattice_displacement_enabled(true);
     }
 }
 
@@ -26205,4 +26206,1365 @@ fn run_get_at_htl_zero_sim(ring_max_htl: usize, demandless: bool) -> GetAtHtlZer
         successful_attempts: freenet::tracing::summarize_get_outcomes_per_tx(&logs).successes
             as usize,
     }
+}
+
+// =============================================================================
+// PUT-then-GET findability + latency (fresh contracts, distant requester)
+// =============================================================================
+//
+// Field measurements on release builds (2026-11) showed that a GET issued a few
+// seconds after a PUT, from a different and distant node, is often slow: ~27% of
+// first GETs took >= 10 s, and the slowness tracked the KEY (when the contract
+// became reachable), not the requester. This test reproduces the same schedule in
+// the deterministic harness: PUT fresh contracts from regular nodes, then GET each
+// from a distant node at three fixed ages, and report per-GET success, sim-time to
+// find, hop count, relay-internal retries, PUT-route vs GET-route overlap and the
+// ring distance (to the key) of the first holder that answered.
+//
+// Event details (`GetEvent` / `PutEvent`) are `pub(crate)`, so the analysis parses
+// the `Debug` rendering of each logged event. `run_controlled_simulation` runs one
+// op per `controlled_op_interval`, so "age" is set by interleaving PUT and GET ops
+// on a fixed-slot timeline; the age actually achieved is re-measured from the
+// event timestamps (`datetime` is virtual time).
+
+/// First `ContractInstanceId("...")` in a rendered event.
+fn fa_instance(d: &str) -> Option<&str> {
+    let rest = d.split("ContractInstanceId(\"").nth(1)?;
+    rest.split('"').next()
+}
+
+/// The text following `pat`, up to the first of `, ` / ` ` / `}` / `)`.
+fn fa_field<'a>(d: &'a str, pat: &str) -> Option<&'a str> {
+    let rest = d.split(pat).nth(1)?;
+    let end = rest.find([',', ' ', '}', ')']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Short peer key (the part before `@`) following `pat`.
+fn fa_peer<'a>(d: &'a str, pat: &str) -> Option<&'a str> {
+    let rest = d.split(pat).nth(1)?;
+    rest.split('@').next()
+}
+
+/// Ring location of the peer following `pat` (rendered `KEY@ADDR (@ LOC)`).
+fn fa_peer_loc(d: &str, pat: &str) -> Option<f64> {
+    let rest = d.split(pat).nth(1)?;
+    let loc = rest.split("(@ ").nth(1)?;
+    loc.split(')').next()?.parse().ok()
+}
+
+fn fa_ring_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+fn fa_pct(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+    sorted[idx]
+}
+
+/// One scheduled contract in the findability experiment.
+#[derive(Clone)]
+struct FaContract {
+    cohort: usize,
+    instance: String,
+    put_node: usize,
+    get_node: usize,
+    key_loc: f64,
+}
+
+/// Measured outcome of the first GET of one contract.
+#[derive(Debug, Clone, Default)]
+struct FaGet {
+    cohort: usize,
+    found: bool,
+    local_hit: bool,
+    /// Sim seconds from the first GET request event to the client terminal.
+    latency_s: f64,
+    /// Sim seconds between the first PUT request and the first GET request.
+    age_s: f64,
+    /// Sim seconds between the last PUT-tx event and the first GET request.
+    age_after_put_settled_s: f64,
+    hops: Option<usize>,
+    client_attempts: usize,
+    wire_txs: usize,
+    relay_internal_retries: usize,
+    /// Forwards whose target never logged the request: no reply and no error.
+    silent_forwards: usize,
+    put_route: usize,
+    get_route: usize,
+    route_overlap: usize,
+    /// Ring distance (to the key) of the first peer that answered with the state.
+    holder_dist: Option<f64>,
+    holder_on_put_route: Option<bool>,
+}
+
+struct FaRun {
+    gets: Vec<FaGet>,
+    cohort_ages: Vec<&'static str>,
+}
+
+fn fa_run(
+    seed: u64,
+    network: &str,
+    num_gateways: usize,
+    num_nodes: usize,
+    contracts_per_cohort: usize,
+) -> FaRun {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+
+    // Slot length and the GET delay (in slots) of each cohort: ~0.25 s, 1 s, 10 s
+    // after the PUT was issued.
+    const OP_INTERVAL_MS: u64 = 250;
+    const COHORT_DELAY_SLOTS: [usize; 3] = [1, 4, 40];
+    const COHORT_NAMES: [&str; 3] = ["+0.25s", "+1s", "+10s"];
+
+    setup_deterministic_state(seed);
+    let nn_guard = NnLatticeTestGuard;
+    freenet::dev_tool::set_nn_lattice_enabled(true);
+
+    let rt = create_runtime();
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(network, num_gateways, num_nodes, 10, 7, 12, 4, seed).await;
+        // Measure against a formed ring, not a forming one.
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
+        sim.with_controlled_op_interval(Duration::from_millis(OP_INTERVAL_MS));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    let locs = sim.get_peer_locations();
+    assert_eq!(locs.len(), num_gateways + num_nodes);
+
+    // Build the contracts. PUT origins are a handful of regular nodes; the GET
+    // requester is a random regular node at ring distance >= 0.25 from the key.
+    let node_nos: Vec<usize> = (num_gateways..num_gateways + num_nodes).collect();
+    let mut rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = move || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as usize
+    };
+    let mut contracts = Vec::new();
+    let mut containers = Vec::new();
+    let total = COHORT_DELAY_SLOTS.len() * contracts_per_cohort;
+    assert!(total <= 200, "create_test_contract takes a u8 seed");
+    for n in 0..total {
+        let cohort = n % COHORT_DELAY_SLOTS.len();
+        let container = SimOperation::create_test_contract(n as u8 + 1);
+        let key = container.key();
+        let key_loc = Location::from(&key).as_f64();
+        let put_node = node_nos[next_rand() % node_nos.len()];
+        let candidates: Vec<usize> = node_nos
+            .iter()
+            .copied()
+            .filter(|&c| c != put_node && fa_ring_dist(locs[c], key_loc) >= 0.25)
+            .collect();
+        let get_node = candidates[next_rand() % candidates.len()];
+        contracts.push(FaContract {
+            cohort,
+            instance: key.id().to_string(),
+            put_node,
+            get_node,
+            key_loc,
+        });
+        containers.push(container);
+    }
+
+    // Timeline: one op per slot. A GET becomes due `delay` slots after its PUT.
+    let mut ops = Vec::new();
+    let mut pending_gets: Vec<(usize, usize)> = Vec::new(); // (due slot, contract)
+    let mut next_put = 0usize;
+    let mut slot = 0usize;
+    while next_put < contracts.len() || !pending_gets.is_empty() {
+        if let Some(pos) = pending_gets.iter().position(|(due, _)| *due <= slot) {
+            let (_, ci) = pending_gets.remove(pos);
+            let c = &contracts[ci];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, c.get_node),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else if next_put < contracts.len() {
+            let ci = next_put;
+            next_put += 1;
+            let c = &contracts[ci];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, c.put_node),
+                SimOperation::Put {
+                    contract: containers[ci].clone(),
+                    state: vec![ci as u8; 64],
+                    subscribe: true,
+                },
+            ));
+            pending_gets.push((slot + COHORT_DELAY_SLOTS[c.cohort], ci));
+        } else {
+            // Nothing due yet and nothing left to PUT: idle slot. Re-GET nothing;
+            // just advance by issuing the earliest-due GET.
+            let (idx, _) = pending_gets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (due, _))| *due)
+                .expect("pending");
+            let (_, ci) = pending_gets.remove(idx);
+            let c = &contracts[ci];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, c.get_node),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+        slot += 1;
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(2400),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "findability sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    drop(nn_guard);
+
+    // ---- Analysis ----
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    struct Ev {
+        dt_ns: i128,
+        tx: String,
+        peer: String,
+        d: String,
+    }
+    let t0 = logs
+        .iter()
+        .map(|l| l.datetime)
+        .min()
+        .expect("events logged");
+    let mut by_instance: HashMap<String, Vec<Ev>> = HashMap::new();
+    for l in logs.iter() {
+        // `GetEvent` / `PutEvent` are `pub(crate)`, so classify by rendering.
+        let d = format!("{:?}", l.kind);
+        if !d.starts_with("Get(") && !d.starts_with("Put(") {
+            continue;
+        }
+        let Some(inst) = fa_instance(&d).map(str::to_owned) else {
+            continue;
+        };
+        let peer = l
+            .peer_id
+            .to_string()
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        by_instance.entry(inst).or_default().push(Ev {
+            dt_ns: (l.datetime - t0).num_nanoseconds().unwrap_or(0) as i128,
+            tx: l.tx.to_string(),
+            peer,
+            d,
+        });
+    }
+
+    let mut gets = Vec::new();
+    let mut slow_traces = 0usize;
+    for c in &contracts {
+        let evs = by_instance
+            .get(&c.instance)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut g = FaGet {
+            cohort: c.cohort,
+            ..Default::default()
+        };
+        let puts: Vec<&Ev> = evs.iter().filter(|e| e.d.starts_with("Put(")).collect();
+        let getev: Vec<&Ev> = evs.iter().filter(|e| e.d.starts_with("Get(")).collect();
+        let put_start = puts.iter().map(|e| e.dt_ns).min().unwrap_or(0);
+        let put_end = puts.iter().map(|e| e.dt_ns).max().unwrap_or(0);
+        let put_peers: HashSet<&str> = puts.iter().map(|e| e.peer.as_str()).collect();
+        g.put_route = put_peers.len();
+
+        let variant = |e: &Ev| -> String {
+            e.d["Get(".len()..]
+                .split([' ', '{'])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        // The client's op: the earliest non-sub-op terminal after the PUT.
+        let term = getev
+            .iter()
+            .filter(|e| variant(e) == "ClientTerminal" && e.d.contains("is_sub_op: false"))
+            .min_by_key(|e| e.dt_ns);
+        // The client op's start: its own loopback Request (same tx as its terminal).
+        // Not the earliest Request for the contract, which can be a sub-op GET
+        // (repair / related fetch) started when the PUT lands.
+        let get_start = term.and_then(|t| {
+            getev
+                .iter()
+                .filter(|e| variant(e) == "Request" && e.tx == t.tx)
+                .map(|e| e.dt_ns)
+                .min()
+        });
+        if let Some(t) = term {
+            g.found = t.d.contains("outcome: Success");
+            g.client_attempts = fa_field(&t.d, "attempts: ")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            g.hops = fa_field(&t.d, "hop_count: Some(").and_then(|v| v.parse().ok());
+            let start = get_start.unwrap_or(t.dt_ns);
+            g.local_hit = get_start.is_none() || g.client_attempts == 0;
+            g.latency_s = (t.dt_ns - start).max(0) as f64 / 1e9;
+            g.age_s = (start - put_start).max(0) as f64 / 1e9;
+            g.age_after_put_settled_s = (start - put_end) as f64 / 1e9;
+        }
+        let reqs: Vec<&&Ev> = getev.iter().filter(|e| variant(e) == "Request").collect();
+        let txs: HashSet<&str> = reqs.iter().map(|e| e.tx.as_str()).collect();
+        g.wire_txs = txs.len();
+        // Relay-internal retries: forwards beyond the first, per (tx, peer).
+        let mut fwd: HashMap<(&str, &str), usize> = HashMap::new();
+        for e in &reqs {
+            let me = fa_peer(&e.d, "requester: ");
+            let target = fa_peer(&e.d, "target: ");
+            if me.is_some() && target.is_some() && me != target {
+                *fwd.entry((e.tx.as_str(), e.peer.as_str())).or_default() += 1;
+            }
+        }
+        g.silent_forwards = reqs
+            .iter()
+            .filter(|e| {
+                let me = fa_peer(&e.d, "requester: ");
+                let tgt = fa_peer(&e.d, "target: ");
+                me != tgt
+                    && !reqs
+                        .iter()
+                        .any(|o| o.tx == e.tx && Some(o.peer.as_str()) == tgt)
+            })
+            .count();
+        g.relay_internal_retries = fwd.values().map(|n| n.saturating_sub(1)).sum();
+        let get_peers: HashSet<&str> = reqs.iter().map(|e| e.peer.as_str()).collect();
+        g.get_route = get_peers.len();
+        g.route_overlap = get_peers.intersection(&put_peers).count();
+        // First holder to answer: earliest ResponseSent carrying a key.
+        if let Some(rs) = getev
+            .iter()
+            .filter(|e| variant(e) == "ResponseSent" && e.d.contains("key: Some("))
+            .min_by_key(|e| e.dt_ns)
+        {
+            if let Some(loc) = fa_peer_loc(&rs.d, "from: ") {
+                g.holder_dist = Some(fa_ring_dist(loc, c.key_loc));
+            }
+            g.holder_on_put_route = Some(put_peers.contains(rs.peer.as_str()));
+        }
+        if g.latency_s >= 10.0 && slow_traces < 4 {
+            slow_traces += 1;
+            let base = get_start.unwrap_or(0);
+            eprintln!(
+                "FA slow-trace contract={} cohort={} put_node={} get_node={} put_route={} latency={:.1}s",
+                c.instance, c.cohort, c.put_node, c.get_node, g.put_route, g.latency_s
+            );
+            let mut all: Vec<&&Ev> = getev.iter().collect();
+            all.sort_by_key(|e| e.dt_ns);
+            for e in all.iter().filter(|e| e.dt_ns >= base - 1_000_000_000) {
+                let v = variant(e);
+                let extra = if v == "Request" {
+                    format!(
+                        "target={} htl={}",
+                        fa_peer(&e.d, "target: ").unwrap_or("?"),
+                        fa_field(&e.d, "htl: ").unwrap_or("?")
+                    )
+                } else if v == "ResponseSent" {
+                    format!(
+                        "to={} found={}",
+                        fa_peer(&e.d, "to: ").unwrap_or("?"),
+                        e.d.contains("key: Some(")
+                    )
+                } else {
+                    String::new()
+                };
+                if v == "Request" {
+                    let me = fa_peer(&e.d, "requester: ");
+                    let tgt = fa_peer(&e.d, "target: ");
+                    let silent = me != tgt
+                        && !getev.iter().any(|o| {
+                            o.tx == e.tx && variant(o) == "Request" && Some(o.peer.as_str()) == tgt
+                        });
+                    if silent {
+                        eprintln!(
+                            "FA   ^ silent forward: target {:.6} never logged this tx (on PUT route: {})",
+                            tgt.unwrap_or("?"),
+                            put_peers.iter().any(|pp| Some(*pp) == tgt)
+                        );
+                    }
+                }
+                eprintln!(
+                    "FA   t={:+9.3}s {:>16} peer={:.6} tx=..{} {}",
+                    (e.dt_ns - base) as f64 / 1e9,
+                    v,
+                    e.peer,
+                    &e.tx[e.tx.len().saturating_sub(5)..],
+                    extra
+                );
+            }
+        }
+        gets.push(g);
+    }
+    FaRun {
+        gets,
+        cohort_ages: COHORT_NAMES.to_vec(),
+    }
+}
+
+/// Aggregate view used by the assertions.
+struct FaSummary {
+    contracts: usize,
+    put_not_dispatched: usize,
+    found: usize,
+    network_gets: usize,
+    slow_10s: usize,
+    max_cohort_median_s: f64,
+}
+
+fn fa_summarize(run: &FaRun) -> FaSummary {
+    let mut max_cohort_median_s = 0.0f64;
+    for ci in 0..run.cohort_ages.len() {
+        let mut lat: Vec<f64> = run
+            .gets
+            .iter()
+            .filter(|g| g.cohort == ci && g.found && !g.local_hit)
+            .map(|g| g.latency_s)
+            .collect();
+        lat.sort_by(f64::total_cmp);
+        max_cohort_median_s = max_cohort_median_s.max(fa_pct(&lat, 0.5));
+    }
+    FaSummary {
+        contracts: run.gets.len(),
+        put_not_dispatched: run.gets.iter().filter(|g| g.put_route == 0).count(),
+        found: run
+            .gets
+            .iter()
+            .filter(|g| g.put_route > 0 && g.found)
+            .count(),
+        network_gets: run.gets.iter().filter(|g| !g.local_hit).count(),
+        slow_10s: run
+            .gets
+            .iter()
+            .filter(|g| !g.local_hit && g.latency_s >= 10.0)
+            .count(),
+        max_cohort_median_s,
+    }
+}
+
+fn fa_report(run: &FaRun) {
+    for (ci, name) in run.cohort_ages.iter().enumerate() {
+        let g: Vec<&FaGet> = run.gets.iter().filter(|g| g.cohort == ci).collect();
+        let net: Vec<&&FaGet> = g.iter().filter(|g| !g.local_hit).collect();
+        let found = g.iter().filter(|g| g.found).count();
+        let mut lat: Vec<f64> = net
+            .iter()
+            .filter(|g| g.found)
+            .map(|g| g.latency_s)
+            .collect();
+        lat.sort_by(f64::total_cmp);
+        let mut age: Vec<f64> = g.iter().map(|g| g.age_s).collect();
+        age.sort_by(f64::total_cmp);
+        let slow10 = net.iter().filter(|g| g.latency_s >= 10.0).count();
+        let slow1 = net.iter().filter(|g| g.latency_s >= 1.0).count();
+        let retried = net.iter().filter(|g| g.client_attempts > 1).count();
+        let relay_retried = net.iter().filter(|g| g.relay_internal_retries > 0).count();
+        let silent = net.iter().filter(|g| g.silent_forwards > 0).count();
+        let no_put = g.iter().filter(|g| g.put_route == 0).count();
+        let overlap = net.iter().filter(|g| g.route_overlap > 1).count();
+        let holder_off = net
+            .iter()
+            .filter(|g| g.holder_on_put_route == Some(false))
+            .count();
+        let mut hops: Vec<f64> = net
+            .iter()
+            .filter_map(|g| g.hops.map(|h| h as f64))
+            .collect();
+        hops.sort_by(f64::total_cmp);
+        let mut hd: Vec<f64> = net.iter().filter_map(|g| g.holder_dist).collect();
+        hd.sort_by(f64::total_cmp);
+        eprintln!(
+            "FA cohort {name}: n={} found={} network_gets={} local_hits={} | achieved_age_s med={:.2} \
+             | latency_s med={:.3} p90={:.3} max={:.3} | >=1s:{} >=10s:{} | client_retried={} \
+             relay_retried={} silent_forward_gets={} put_not_dispatched={} | hops med={:.0} p90={:.0} | route_overlap>1:{} | holder_off_put_route={} \
+             holder_ring_dist med={:.3} p90={:.3}",
+            g.len(),
+            found,
+            net.len(),
+            g.len() - net.len(),
+            fa_pct(&age, 0.5),
+            fa_pct(&lat, 0.5),
+            fa_pct(&lat, 0.9),
+            lat.last().copied().unwrap_or(f64::NAN),
+            slow1,
+            slow10,
+            retried,
+            relay_retried,
+            silent,
+            no_put,
+            fa_pct(&hops, 0.5),
+            fa_pct(&hops, 0.9),
+            overlap,
+            holder_off,
+            fa_pct(&hd, 0.5),
+            fa_pct(&hd, 0.9),
+        );
+    }
+    for g in run
+        .gets
+        .iter()
+        .filter(|g| !g.found || g.latency_s >= 1.0 || g.client_attempts > 1)
+    {
+        eprintln!("FA outlier: {g:?}");
+    }
+}
+
+// Long-running diagnostic test (~6 min in a debug build). Runs in nightly CI.
+//
+// MEASURED on current main (3 gateways + 60 nodes, 102 contracts, seed below):
+// every GET is found and the median is ~20 ms, but 13 of 100 network GETs take
+// 100-111 s. All 13 had a forward to a peer that never logged the request (no
+// reply and no error); the relay then waits its full 60 s `OPERATION_TTL` for it
+// (`get/op_ctx_task.rs`, `send_to_and_await` under `timeout(OPERATION_TTL)`)
+// before the client retries via another first hop and succeeds in ~10 ms. The thresholds
+// below are RATCHETS taken from that measurement with margin for run-to-run
+// variation (the run is not bit-exact); tighten them when the tail is fixed.
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_then_get_findability_latency() {
+    const SEED: u64 = 0xF1ED_0002;
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let run = fa_run(
+        SEED,
+        "findability-put-get",
+        3,
+        env("FA_NODES", 60),
+        env("FA_PER_COHORT", 34),
+    );
+    fa_report(&run);
+    let sum = fa_summarize(&run);
+    eprintln!(
+        "FA summary: contracts={} found={} network_gets={} slow_10s={} ({:.1}%) max_cohort_median_s={:.3}",
+        sum.contracts,
+        sum.found,
+        sum.network_gets,
+        sum.slow_10s,
+        100.0 * sum.slow_10s as f64 / sum.network_gets.max(1) as f64,
+        sum.max_cohort_median_s
+    );
+
+    assert!(
+        sum.put_not_dispatched <= sum.contracts / 20,
+        "{} of {} PUTs never produced a PUT event: the harness did not dispatch them",
+        sum.put_not_dispatched,
+        sum.contracts
+    );
+    let dispatched = sum.contracts - sum.put_not_dispatched;
+    assert!(
+        sum.found as f64 >= 0.97 * dispatched as f64,
+        "only {} of {} freshly PUT contracts were found by a distant GET",
+        sum.found,
+        dispatched
+    );
+    assert!(
+        sum.max_cohort_median_s < 1.0,
+        "median time-to-find of a fresh contract is {:.3}s in some cohort (expected well under 1s)",
+        sum.max_cohort_median_s
+    );
+    assert!(
+        (sum.slow_10s as f64) <= 0.25 * sum.network_gets as f64,
+        "{} of {} network GETs of fresh contracts took >= 10s (ratchet: 25%; measured ~13%)",
+        sum.slow_10s,
+        sum.network_gets
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PUT-bracket-gap experiment: gateway-originated PUTs into a sparse band of
+// the ring, fetched from requesters on the far side of the key.
+//
+// Real-network symptom (2026-11): rooms created through a gateway at ring
+// location 0.92 were persistently "not found" from requesters at 0.41 when the
+// key sat at 0.54-0.69, where the ring is sparse. Hypothesis: the PUT's greedy
+// chain arrives from above and ends at a peer on the gateway side of the key,
+// while a GET from below ends at the closer peer on the other side, which does
+// not forward "away" from the key to the holder.
+//
+// Test-only scenario: every location is relative to the gateway's derived
+// location `g`; the key band centre is `c = g - 0.31`.
+// ---------------------------------------------------------------------------
+
+/// Contract whose key depends on a u16 seed (`create_test_contract` takes a u8,
+/// which yields too few keys inside one narrow band).
+#[cfg(feature = "nightly_tests")]
+fn pg_contract(seed: u16) -> freenet_stdlib::prelude::ContractContainer {
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractWasmAPIVersion, Parameters, WrappedContract,
+    };
+    let s = seed.to_le_bytes();
+    let code: Vec<u8> = (0..32u8)
+        .map(|i| s[(i % 2) as usize].wrapping_add(i).wrapping_mul(7) ^ s[1])
+        .collect();
+    let params: Vec<u8> = (0..16u8)
+        .map(|i| s[(i % 2) as usize].wrapping_add(i.wrapping_mul(3)))
+        .collect();
+    ContractWasmAPIVersion::V1(WrappedContract::new(
+        Arc::new(ContractCode::from(code)),
+        Parameters::from(params),
+    ))
+    .into()
+}
+
+#[cfg(feature = "nightly_tests")]
+fn pg_wrap(x: f64) -> f64 {
+    x.rem_euclid(1.0)
+}
+
+#[cfg(feature = "nightly_tests")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PgOrigin {
+    Gateway,
+    /// Ordinary node nearest the gateway's ring location.
+    NodeNearGateway,
+}
+
+#[cfg(feature = "nightly_tests")]
+fn subject_succ(sorted: &[f64], l: f64) -> f64 {
+    sorted
+        .iter()
+        .copied()
+        .find(|&x| x > l + 1e-9)
+        .unwrap_or(sorted[0])
+}
+
+#[cfg(feature = "nightly_tests")]
+fn subject_pred(sorted: &[f64], l: f64) -> f64 {
+    sorted
+        .iter()
+        .rev()
+        .copied()
+        .find(|&x| x < l - 1e-9)
+        .unwrap_or(sorted[sorted.len() - 1])
+}
+
+#[cfg(feature = "nightly_tests")]
+fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool) {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+    const OP_INTERVAL_MS: u64 = 250;
+    const NODES: usize = 60;
+    const KEYS: usize = 66;
+    // GET delays in slots after the PUT: 1 s, 10 s, 60 s.
+    const DELAYS: [usize; 3] = [4, 40, 240];
+
+    // Probe the gateway's derived location.
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let g = rt.block_on(async {
+        let probe = SimNetwork::new(network, 1, 1, 10, 7, 12, 4, seed).await;
+        probe.get_peer_locations()[0]
+    });
+    drop(rt);
+    let c = pg_wrap(g - 0.31);
+
+    // Node targets (regular nodes).
+    let mut targets: Vec<f64> = Vec::new();
+    if sparse {
+        for off in [-0.065, -0.02, 0.012, 0.05] {
+            targets.push(pg_wrap(c + off));
+        }
+    } else {
+        for i in 0..24 {
+            targets.push(pg_wrap(c - 0.075 + 0.15 * (i as f64 + 0.5) / 24.0));
+        }
+    }
+    let rest = NODES - targets.len();
+    // The rest spread evenly over the arc outside c +/- 0.15.
+    for i in 0..rest {
+        targets.push(pg_wrap(c + 0.15 + 0.70 * (i as f64 + 0.5) / rest as f64));
+    }
+
+    setup_deterministic_state(seed);
+    let nn_guard = NnLatticeTestGuard;
+    freenet::dev_tool::set_nn_lattice_enabled(true);
+    // PG_DISPLACE=0 runs the same seed with lattice displacement off (the
+    // behavior before the fix), for before/after comparisons.
+    let displace = std::env::var("PG_DISPLACE").map_or(true, |v| v != "0");
+    freenet::dev_tool::set_lattice_displacement_enabled(displace);
+    let rt = create_runtime();
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim =
+            SimNetwork::new_with_node_locations(network, 1, NODES, 10, 7, 12, 4, seed, &targets)
+                .await;
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
+        sim.with_controlled_op_interval(Duration::from_millis(OP_INTERVAL_MS));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    let locs = sim.get_peer_locations(); // gateway first
+    assert_eq!(locs.len(), 1 + NODES);
+    assert!((locs[0] - g).abs() < 1e-9, "gateway location changed");
+
+    // Keys inside c +/- 0.075.
+    let mut containers = Vec::new();
+    let mut key_locs = Vec::new();
+    for s in 0..u16::MAX {
+        let ct = pg_contract(s);
+        let kl = Location::from(&ct.key()).as_f64();
+        if fa_ring_dist(kl, c) <= 0.075 {
+            containers.push(ct);
+            key_locs.push(kl);
+            if containers.len() == KEYS {
+                break;
+            }
+        }
+    }
+    assert_eq!(containers.len(), KEYS, "not enough keys in the band");
+
+    let origin_node = (1..=NODES)
+        .min_by(|&a, &b| fa_ring_dist(locs[a], g).total_cmp(&fa_ring_dist(locs[b], g)))
+        .unwrap();
+    let origin_label = match origin {
+        PgOrigin::Gateway => NodeLabel::gateway(network, 0),
+        PgOrigin::NodeNearGateway => NodeLabel::node(network, origin_node),
+    };
+    let origin_loc = match origin {
+        PgOrigin::Gateway => g,
+        PgOrigin::NodeNearGateway => locs[origin_node],
+    };
+
+    let mut rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = move || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as usize
+    };
+    // Requesters: below the key, ring distance 0.18..0.40 from it.
+    let mut get_nodes: Vec<[usize; 3]> = Vec::new();
+    for kl in &key_locs {
+        let cand: Vec<usize> = (1..=NODES)
+            .filter(|&n| {
+                let below = pg_wrap(kl - locs[n]);
+                (0.18..=0.40).contains(&below)
+            })
+            .collect();
+        assert!(!cand.is_empty(), "no requesters below key {kl}");
+        // Three DISTINCT requesters, so a later GET is never a local hit from
+        // an earlier one by the same node.
+        let mut pick: Vec<usize> = Vec::new();
+        while pick.len() < 3.min(cand.len()) {
+            let n = cand[next_rand() % cand.len()];
+            if !pick.contains(&n) {
+                pick.push(n);
+            }
+        }
+        while pick.len() < 3 {
+            pick.push(pick[0]);
+        }
+        get_nodes.push([pick[0], pick[1], pick[2]]);
+    }
+
+    // Timeline, one op per slot.
+    let mut ops = Vec::new();
+    let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (due, contract, delay idx)
+    let mut next_put = 0usize;
+    let mut slot = 0usize;
+    while next_put < KEYS || !pending.is_empty() {
+        let due_pos = pending.iter().position(|(due, _, _)| *due <= slot);
+        let pick = if due_pos.is_some() {
+            due_pos
+        } else if next_put >= KEYS {
+            pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (due, _, _))| *due)
+                .map(|(i, _)| i)
+        } else {
+            None
+        };
+        if let Some(pos) = pick {
+            let (_, ci, di) = pending.remove(pos);
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, get_nodes[ci][di]),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else {
+            let ci = next_put;
+            next_put += 1;
+            ops.push(ScheduledOperation::new(
+                origin_label.clone(),
+                SimOperation::Put {
+                    contract: containers[ci].clone(),
+                    state: vec![ci as u8; 64],
+                    subscribe: true,
+                },
+            ));
+            for (di, d) in DELAYS.iter().enumerate() {
+                pending.push((slot + d, ci, di));
+            }
+        }
+        slot += 1;
+    }
+
+    // Optional extra warm-up (virtual time = pads * OP_INTERVAL_MS): cheap GETs
+    // for a contract that does not exist, so the lattice probe gets time to run
+    // before the first PUT.
+    let pads: usize = std::env::var("PG_WARMUP_PADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if pads > 0 {
+        let dummy = *pg_contract(60000).key().id();
+        let mut padded: Vec<ScheduledOperation> = (0..pads)
+            .map(|i| {
+                ScheduledOperation::new(
+                    NodeLabel::node(network, 1 + i % NODES),
+                    SimOperation::Get {
+                        contract_id: dummy,
+                        return_contract_code: false,
+                        subscribe: false,
+                    },
+                )
+            })
+            .collect();
+        padded.extend(ops);
+        ops = padded;
+    }
+    // Churn is measured over the operation phase only: everything the join
+    // phase logged, and every displacement it performed, is excluded.
+    let pre_len = rt.block_on(async { logs_handle.lock().await.len() });
+    let join_phase_displacements = freenet::dev_tool::take_lattice_displacements_total();
+    let op_phase_slots = ops.len();
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(2400),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "sim failed: {:?}",
+        result.turmoil_result.as_ref().err()
+    );
+    let op_phase_displacements = freenet::dev_tool::take_lattice_displacements_total();
+    drop(nn_guard);
+
+    // ---- Analysis ----
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    assert!(!logs.is_empty());
+    struct Ev {
+        dt_ns: i128,
+        d: String,
+    }
+    let mut by_instance: HashMap<String, Vec<Ev>> = HashMap::new();
+    for (seq, l) in logs.iter().enumerate() {
+        let d = format!("{:?}", l.kind);
+        if !d.starts_with("Get(") {
+            continue;
+        }
+        let Some(inst) = fa_instance(&d).map(str::to_owned) else {
+            continue;
+        };
+        by_instance.entry(inst).or_default().push(Ev {
+            dt_ns: seq as i128, // log order (datetime is wall clock)
+            d,
+        });
+    }
+    let variant = |e: &Ev| -> String {
+        e.d["Get(".len()..]
+            .split([' ', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    let mut found_by_delay = [0usize; 3];
+    let mut total_by_delay = [0usize; 3];
+    let mut found_any = 0usize;
+    let mut missing_terminal = [0usize; 3];
+    let mut never = Vec::new();
+    let mut hops: Vec<f64> = Vec::new();
+    let mut holder_counts: Vec<f64> = Vec::new();
+    let mut nearest_holds = 0usize;
+    let mut both_sides = 0usize;
+    let mut holder_rank: Vec<f64> = Vec::new();
+    let mut holder_dist: Vec<f64> = Vec::new();
+    let mut zero_holders = 0usize;
+    let mut served_dist: Vec<f64> = Vec::new();
+    for (ci, ct) in containers.iter().enumerate() {
+        let key = ct.key();
+        let kl = key_locs[ci];
+        let inst = key.id().to_string();
+        let evs = by_instance.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
+        // Attribute each client terminal to its delay slot by REQUESTER
+        // location (the requester differs per delay), not by wall-clock order,
+        // and do not require a Request event (a local hit has none).
+        let mut any = false;
+        for di in 0..3 {
+            total_by_delay[di] += 1;
+            let rloc = locs[get_nodes[ci][di]];
+            let term = evs.iter().find(|e| {
+                variant(e) == "ClientTerminal"
+                    && e.d.contains("is_sub_op: false")
+                    && fa_peer_loc(&e.d, "requester: ").is_some_and(|l| (l - rloc).abs() < 1e-6)
+            });
+            match term {
+                Some(t) if t.d.contains("outcome: Success") => {
+                    found_by_delay[di] += 1;
+                    any = true;
+                    if let Some(h) =
+                        fa_field(&t.d, "hop_count: Some(").and_then(|v| v.parse::<f64>().ok())
+                    {
+                        hops.push(h);
+                    }
+                }
+                Some(_) => {}
+                None => missing_terminal[di] += 1,
+            }
+        }
+        if any {
+            found_any += 1;
+        } else {
+            never.push(ci);
+        }
+        if let Some(rs) = evs
+            .iter()
+            .filter(|e| variant(e) == "ResponseSent" && e.d.contains("key: Some("))
+            .min_by_key(|e| e.dt_ns)
+        {
+            if let Some(loc) = fa_peer_loc(&rs.d, "from: ") {
+                served_dist.push(fa_ring_dist(loc, kl));
+            }
+        }
+        // Holders at end of run, by ring distance to the key.
+        let mut peers: Vec<(f64, NodeLabel, f64)> = vec![(
+            fa_ring_dist(locs[0], kl),
+            NodeLabel::gateway(network, 0),
+            locs[0],
+        )];
+        for (n, &loc) in locs.iter().enumerate().skip(1) {
+            peers.push((fa_ring_dist(loc, kl), NodeLabel::node(network, n), loc));
+        }
+        peers.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let holders: Vec<(usize, &(f64, NodeLabel, f64))> = peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| result.is_node_hosting(&p.1, &key))
+            .collect();
+        holder_counts.push(holders.len() as f64);
+        if holders.is_empty() {
+            zero_holders += 1;
+        }
+        // Exclude the PUT originator (always hosts its own copy) from placement stats.
+        let non_origin: Vec<_> = holders
+            .iter()
+            .filter(|(_, p)| p.1 != origin_label)
+            .collect();
+        if let Some((r, _)) = non_origin.first() {
+            if *r == 0 {
+                nearest_holds += 1;
+            }
+        }
+        for (r, p) in &non_origin {
+            holder_rank.push((*r + 1) as f64);
+            holder_dist.push(p.0);
+        }
+        let above = non_origin.iter().any(|(_, p)| pg_wrap(p.2 - kl) < 0.5);
+        let below = non_origin.iter().any(|(_, p)| pg_wrap(p.2 - kl) >= 0.5);
+        if above && below {
+            both_sides += 1;
+        }
+        if never.last() == Some(&ci) {
+            let desc: Vec<String> = holders
+                .iter()
+                .map(|(r, p)| {
+                    format!("rank{}@{:+.3}", r + 1, {
+                        let o = pg_wrap(p.2 - kl);
+                        if o > 0.5 { o - 1.0 } else { o }
+                    })
+                })
+                .collect();
+            eprintln!(
+                "PG never-found key_loc={kl:.3} closest3={:?} holders=[{}]",
+                peers
+                    .iter()
+                    .take(3)
+                    .map(|p| {
+                        let o = pg_wrap(p.2 - kl);
+                        format!("{:+.3}", if o > 0.5 { o - 1.0 } else { o })
+                    })
+                    .collect::<Vec<_>>(),
+                desc.join(" ")
+            );
+        }
+    }
+    // Trace: every event mentioning the key, for the first 3 never-found keys
+    // (log order; peer shown as logged).
+    // Observed ring edges: any event naming a `target:`/`to:` peer is a use of
+    // a live connection between the logging peer and that peer.
+    {
+        let mut edges: std::collections::BTreeSet<(i64, i64)> = Default::default();
+        let q = |x: f64| (x * 1000.0).round() as i64;
+        for l in logs.iter() {
+            let pd = format!("{:?}", l.peer_id);
+            let Some(a) = pd
+                .split("(@ ")
+                .nth(1)
+                .and_then(|r| r.split(')').next())
+                .and_then(|v| v.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            let d = format!("{:?}", l.kind);
+            for pat in ["target: ", "to: "] {
+                if let Some(b) = fa_peer_loc(&d, pat) {
+                    if (a - b).abs() > 1e-6 {
+                        let (x, y) = (q(a), q(b));
+                        edges.insert((x.min(y), x.max(y)));
+                    }
+                }
+            }
+        }
+        for &nloc in locs.iter() {
+            let a = q(nloc);
+            if !(400..=720).contains(&a) {
+                continue;
+            }
+            let nb: Vec<String> = edges
+                .iter()
+                .filter_map(|&(x, y)| {
+                    if x == a {
+                        Some(y)
+                    } else if y == a {
+                        Some(x)
+                    } else {
+                        None
+                    }
+                })
+                .map(|v| format!("{:.3}", v as f64 / 1000.0))
+                .collect();
+            eprintln!("PG EDGES {:.3}: {}", nloc, nb.join(" "));
+        }
+    }
+    // ---- Lattice analysis from Connect events (log order) ----
+    {
+        let q = |x: f64| (x * 1000.0).round() as i64;
+        let ploc = |d: &str| -> Option<f64> {
+            d.split("(@ ")
+                .nth(1)
+                .and_then(|r| r.split(')').next())
+                .and_then(|v| v.parse().ok())
+        };
+        let mut links: std::collections::BTreeSet<(i64, i64)> = Default::default();
+        let mut sorted: Vec<f64> = locs.clone();
+        sorted.sort_by(f64::total_cmp);
+        let band_lo = pg_wrap(c - 0.075);
+        let subject = sorted
+            .iter()
+            .copied()
+            .filter(|&l| l < band_lo && l > 0.2)
+            .fold(f64::MIN, f64::max);
+        let succ_of = subject_succ(&sorted, subject);
+        let (mut sent, mut resp_recv, mut rejected, mut disc) = (0, 0, 0, 0);
+        let mut desired: Vec<String> = Vec::new();
+        let mut acceptors: std::collections::BTreeSet<i64> = Default::default();
+        let mut rej_reasons: HashMap<String, usize> = HashMap::new();
+        let (mut recv_at_succ, mut recv_at_succ_acc) = (0, 0);
+        let mut pair_events: Vec<String> = Vec::new();
+        let mut connected_events = 0usize;
+        let mut succ_conn_count = 0usize;
+        for (seq, l) in logs.iter().enumerate() {
+            let pd = format!("{:?}", l.peer_id);
+            let Some(a) = ploc(&pd) else { continue };
+            let d = format!("{:?}", l.kind);
+            if d.starts_with("Connect(Connected") {
+                connected_events += 1;
+                if (a - succ_of).abs() < 1e-6 {
+                    if let Some(n) = fa_field(&d, "this_peer_connection_count: ") {
+                        succ_conn_count = n.parse().unwrap_or(0);
+                    }
+                }
+                if let Some(b) = fa_peer_loc(&d, "connected: ") {
+                    let (x, y) = (q(a), q(b));
+                    if x != y {
+                        links.insert((x.min(y), x.max(y)));
+                    }
+                    if (a - subject).abs() < 1e-6 || (b - subject).abs() < 1e-6 {
+                        pair_events.push(format!("#{seq} Connected {:.3}<->{:.3}", a, b));
+                    }
+                }
+            } else if d.starts_with("Disconnected") {
+                if let Some(b) = fa_peer_loc(&d, "from: ") {
+                    let (x, y) = (q(a), q(b));
+                    links.remove(&(x.min(y), x.max(y)));
+                    if (a - subject).abs() < 1e-6 || (b - subject).abs() < 1e-6 {
+                        disc += 1;
+                        pair_events.push(format!(
+                            "#{seq} Disconnected {:.3}-{:.3} {}",
+                            a,
+                            b,
+                            d.split("reason: ")
+                                .nth(1)
+                                .unwrap_or("")
+                                .chars()
+                                .take(40)
+                                .collect::<String>()
+                        ));
+                    }
+                }
+            } else if d.starts_with("Connect(RequestSent") && (a - subject).abs() < 1e-6 {
+                sent += 1;
+                if let Some(r) = fa_field(&d, "desired_location: Location(") {
+                    desired.push(r.chars().take(5).collect());
+                }
+            } else if d.starts_with("Connect(ResponseReceived") && (a - subject).abs() < 1e-6 {
+                resp_recv += 1;
+                if let Some(b) = fa_peer_loc(&d, "acceptor: ") {
+                    acceptors.insert(q(b));
+                }
+            } else if d.starts_with("Connect(Rejected") && (a - subject).abs() < 1e-6 {
+                rejected += 1;
+                let r = d
+                    .split("reason: ")
+                    .nth(1)
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
+                *rej_reasons.entry(r).or_default() += 1;
+            } else if d.starts_with("Connect(RequestReceived") {
+                if let (Some(j), true) = (fa_peer_loc(&d, "joiner: "), (a - succ_of).abs() < 1e-6) {
+                    if (j - subject).abs() < 1e-6 {
+                        if recv_at_succ < 4 {
+                            pair_events.push(format!(
+                                "#{seq} AT-SUCC {}",
+                                d.chars().take(520).collect::<String>()
+                            ));
+                        }
+                        recv_at_succ += 1;
+                        if d.contains("accepted: true") {
+                            recv_at_succ_acc += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // Established peers of the subject's true successor, with lattice-edge marks.
+        {
+            let mut nb: Vec<f64> = links
+                .iter()
+                .filter_map(|&(x, y)| {
+                    if x == q(succ_of) {
+                        Some(y as f64 / 1000.0)
+                    } else if y == q(succ_of) {
+                        Some(x as f64 / 1000.0)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            nb.sort_by(f64::total_cmp);
+            let sd = |b: f64| {
+                let d = pg_wrap(b - succ_of);
+                if d > 0.5 { d - 1.0 } else { d }
+            };
+            let nearest_succ = nb
+                .iter()
+                .copied()
+                .filter(|&b| sd(b) > 0.0)
+                .min_by(|a, b| sd(*a).total_cmp(&sd(*b)));
+            let nearest_pred = nb
+                .iter()
+                .copied()
+                .filter(|&b| sd(b) < 0.0)
+                .max_by(|a, b| sd(*a).total_cmp(&sd(*b)));
+            let desc: Vec<String> = nb
+                .iter()
+                .map(|&b| {
+                    let mark = if Some(b) == nearest_succ {
+                        " [LATTICE succ]"
+                    } else if Some(b) == nearest_pred {
+                        " [LATTICE pred]"
+                    } else {
+                        ""
+                    };
+                    format!("{b:.3}(sd {:+.3}){mark}", sd(b))
+                })
+                .collect();
+            eprintln!(
+                "PG LATTICE succ-peers n={} (subject {subject:.3} sd {:+.3}): {}",
+                nb.len(),
+                sd(subject),
+                desc.join(", ")
+            );
+        }
+        // Ring successor/predecessor link completeness over all peers.
+        let (mut succ_ok, mut pred_ok) = (0, 0);
+        let mut missing: Vec<String> = Vec::new();
+        for &l in sorted.iter() {
+            let su = subject_succ(&sorted, l);
+            let pr = subject_pred(&sorted, l);
+            let has = |b: f64| {
+                let (x, y) = (q(l), q(b));
+                links.contains(&(x.min(y), x.max(y)))
+            };
+            if has(su) {
+                succ_ok += 1;
+            } else {
+                missing.push(format!("{l:.3}->succ {su:.3}"));
+            }
+            if has(pr) {
+                pred_ok += 1;
+            }
+        }
+        eprintln!(
+            "PG LATTICE: succ_last_conn_count={succ_conn_count} peers={} links_to_true_succ={succ_ok} links_to_true_pred={pred_ok} (n={}) pads={pads} connected_events={connected_events}",
+            sorted.len(),
+            sorted.len()
+        );
+        eprintln!("PG LATTICE missing-succ: {}", missing.join(", "));
+        eprintln!(
+            "PG LATTICE subject={subject:.3} true_succ={succ_of:.3} linked={} requests_sent={sent} desired={:?} responses={resp_recv} acceptors={:?} rejected={rejected} {:?} disconnects={disc} recv_at_succ={recv_at_succ} accepted={recv_at_succ_acc}",
+            links.contains(&(q(subject).min(q(succ_of)), q(subject).max(q(succ_of)))),
+            desired.iter().take(12).collect::<Vec<_>>(),
+            acceptors
+                .iter()
+                .map(|v| *v as f64 / 1000.0)
+                .collect::<Vec<_>>(),
+            rej_reasons
+        );
+        for e in pair_events.iter().take(40) {
+            eprintln!("PG LATTICE ev {e}");
+        }
+    }
+    {
+        // Churn: connections dropped and CONNECT requests sent, per node per
+        // simulated minute, over the operation phase. The denominator is the
+        // scheduled op timeline (one op per OP_INTERVAL_MS), a lower bound on
+        // the virtual time the phase ran; compare on/off at the same seed.
+        let (mut disconnects, mut connect_requests, mut connected) = (0usize, 0usize, 0usize);
+        for l in logs.iter().skip(pre_len) {
+            let d = format!("{:?}", l.kind);
+            if d.starts_with("Disconnected") {
+                disconnects += 1;
+            } else if d.starts_with("Connect(RequestSent") {
+                connect_requests += 1;
+            } else if d.starts_with("Connect(Connected") {
+                connected += 1;
+            }
+        }
+        let minutes = (op_phase_slots as f64 * OP_INTERVAL_MS as f64 / 1000.0) / 60.0;
+        let per_node_min = |n: usize| n as f64 / (NODES + 1) as f64 / minutes;
+        eprintln!(
+            "PG CHURN: displace={displace} seed={seed:#x} op_phase_minutes={minutes:.1} disconnects={disconnects} ({:.3}/node/min) connect_requests={connect_requests} ({:.3}/node/min) connected={connected} ({:.3}/node/min) displacements op_phase={op_phase_displacements} join_phase={join_phase_displacements}",
+            per_node_min(disconnects),
+            per_node_min(connect_requests),
+            per_node_min(connected),
+        );
+    }
+    let trace_keys: Vec<usize> = if never.is_empty() {
+        vec![0, 1]
+    } else {
+        never.iter().take(3).copied().collect()
+    };
+    for &ci in trace_keys.iter() {
+        let inst = containers[ci].key().id().to_string();
+        eprintln!("PG TRACE key#{ci} loc={:.3} inst={inst}", key_locs[ci]);
+        for (seq, l) in logs.iter().enumerate() {
+            let d = format!("{:?}", l.kind);
+            if d.contains(&inst) {
+                let short: String = d.chars().take(420).collect();
+                eprintln!("PG TRACE #{seq} tx={} peer={:?} {short}", l.tx, l.peer_id);
+            }
+        }
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        fa_pct(v, 0.5)
+    };
+    let band_peers = (0..=NODES)
+        .filter(|&n| fa_ring_dist(locs[n], c) <= 0.075)
+        .count();
+    eprintln!(
+        "PG config: sparse={sparse} origin={origin:?} p1={env_p1} g={g:.3} c={c:.3} origin_loc={origin_loc:.3} peers_in_band(+-0.075)={band_peers} keys={KEYS}"
+    );
+    eprintln!(
+        "PG RESULT: missing_terminal={missing_terminal:?} found@1s={}/{} found@10s={}/{} found@60s={}/{} never_found_any={} | hops med={:.0} | served_by_dist med={:.3}",
+        found_by_delay[0],
+        total_by_delay[0],
+        found_by_delay[1],
+        total_by_delay[1],
+        found_by_delay[2],
+        total_by_delay[2],
+        never.len(),
+        med(&mut hops),
+        med(&mut served_dist)
+    );
+    eprintln!(
+        "PG PLACEMENT: found_any={found_any} zero_holders={zero_holders} holders/key med={:.0} | nearest_peer_holds={nearest_holds}/{KEYS} | both_sides={both_sides}/{KEYS} | non-origin holder rank med={:.0} dist med={:.3}",
+        med(&mut holder_counts),
+        med(&mut holder_rank),
+        med(&mut holder_dist)
+    );
+    assert!(
+        never.is_empty(),
+        "{} of {KEYS} keys were never found by any of 3 GETs (key indexes {never:?})",
+        never.len()
+    );
+}
+
+#[cfg(feature = "nightly_tests")]
+const PG_DEFAULT_SEED: u64 = 0xF1ED_0A11;
+
+/// `PG_SEED` overrides the default (decimal, or hex with a 0x prefix).
+#[cfg(feature = "nightly_tests")]
+fn pg_seed() -> u64 {
+    std::env::var("PG_SEED")
+        .ok()
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .unwrap_or(PG_DEFAULT_SEED)
+}
+
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_bracket_gap_sparse_gateway() {
+    pg_run(pg_seed(), "pg-sg", true, PgOrigin::Gateway, false);
+}
+
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_bracket_gap_dense_gateway_control() {
+    pg_run(pg_seed(), "pg-dg", false, PgOrigin::Gateway, false);
+}
+
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_bracket_gap_sparse_node_control() {
+    pg_run(pg_seed(), "pg-sn", true, PgOrigin::NodeNearGateway, false);
 }

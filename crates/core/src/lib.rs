@@ -242,6 +242,11 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 
+    // Lattice displacement (a full peer drops one non-lattice link to admit its
+    // strictly closer ring neighbour): per-thread test switch and counter.
+    #[cfg(any(test, feature = "testing"))]
+    pub use ring::{set_lattice_displacement_enabled, take_lattice_displacements_total};
+
     // Test hook: connection identity decisions since process start, by kind
     // (labels as in the `conn_identity_*` telemetry). Never reset.
     #[cfg(any(test, feature = "testing"))]
