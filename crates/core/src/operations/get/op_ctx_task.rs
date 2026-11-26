@@ -4272,7 +4272,7 @@ where
     }
     new_visited.mark_visited(upstream_addr);
 
-    // ── Short-circuit 2: Local cache hit with interest ───────────────────
+    // ── Short-circuit 1: Local cache hit with interest ───────────────────
     let (local_value, local_fallback) = match check_local_with_interest_gate(
         op_manager,
         &instance_id,
@@ -4459,7 +4459,7 @@ where
         return Ok(());
     }
 
-    // ── Short-circuit 3: HTL = 0, nothing held to serve ─────────────────
+    // ── Short-circuit 2: HTL = 0, nothing fresh to serve ─────────────────
     // Runs AFTER the local-hit arm above on purpose: a peer that holds a
     // fresh copy answers Found whatever the HTL. HTL only bounds FORWARDING,
     // so HTL = 0 never forwards but must not hide a copy this node serves at
@@ -7733,9 +7733,9 @@ mod tests {
     // without requiring a full simulation harness.  They mirror the pattern
     // established by the client driver tests above.
 
-    /// T1: HTL=0 short-circuit must send NotFound upstream without entering
-    /// the retry loop.  The source must contain the htl==0 guard BEFORE the
-    /// first `relay_advance_to_next_peer` call.
+    /// T1: the HTL=0 short-circuit (serve a held copy, else NotFound) must
+    /// return without entering the retry loop.  The source must contain the
+    /// htl==0 guard BEFORE the first `relay_advance_to_next_peer` call.
     #[test]
     fn relay_driver_htl_zero_guard_precedes_retry_loop() {
         let src = production_source();
@@ -7755,7 +7755,9 @@ mod tests {
 
     /// T2: Local cache short-circuit must send Found upstream without entering
     /// the retry loop.  The source must contain the local-cache check BEFORE
-    /// `relay_advance_to_next_peer` and AFTER the HTL guard.
+    /// `relay_advance_to_next_peer` and BEFORE the HTL guard (HTL only bounds
+    /// forwarding, so a held copy is served at HTL 0 too; see
+    /// `htl_zero_relay_serves_a_held_copy_before_answering_not_found`).
     #[test]
     fn relay_driver_local_cache_check_precedes_retry_loop() {
         let src = production_source();
@@ -7939,12 +7941,12 @@ mod tests {
         );
     }
 
-    /// T4b: All three relay-driver callsites must forward upstream
+    /// T4b: All four relay-driver callsites must forward upstream
     /// BEFORE caching locally (issue #4155). Mirrors T4 for the other
-    /// two relay paths that the source-scrape
+    /// three relay paths that the source-scrape
     /// `all_relay_callsites_pass_is_client_requester_false` test already
-    /// recognizes (R4 immediate-serve, R10 exhaustion fallback, R12a
-    /// bubble-up).
+    /// recognizes (R4 immediate-serve, the HTL-0 stale fallback, R10
+    /// exhaustion fallback, R12a bubble-up).
     #[test]
     fn all_relay_callsites_forward_before_caching() {
         let src = production_source();
@@ -7989,7 +7991,7 @@ mod tests {
         // and are covered by `relay_streaming_arm_forwards_before_caching`,
         // so they are intentionally excluded from this positional pairing.
         // The four sends all precede the streaming arm in source order, so
-        // zipping against the first three caches is correct.
+        // zipping against the first four caches is correct.
         for (idx, (send_pos, cache_pos)) in send_positions
             .iter()
             .zip(cache_positions.iter())
@@ -8264,8 +8266,13 @@ mod tests {
             "HTL=0 NotFound must be sent to `upstream_addr`, not any other \
              peer. Guard body was: {guard_block}"
         );
+        // The fallback arm also returns, so look for the return only after the
+        // NotFound send.
+        let not_found_at = guard_block
+            .find("relay_send_not_found")
+            .expect("checked above");
         assert!(
-            guard_block.contains("return Ok(())"),
+            guard_block[not_found_at..].contains("return Ok(())"),
             "HTL=0 guard must return early after sending NotFound; otherwise \
              execution would fall into the retry loop with htl=0."
         );
@@ -8316,6 +8323,11 @@ mod tests {
         assert!(
             fallback < not_found,
             "the HTL-0 fallback must be tried before NotFound is sent"
+        );
+        let fallback_arm = &tail[fallback..not_found];
+        assert!(
+            fallback_arm.contains("relay_send_found("),
+            "the HTL-0 fallback arm must send Found upstream, not just log"
         );
         let guard_end = not_found
             + tail[not_found..]
