@@ -2753,3 +2753,42 @@ pub(in crate::transport) async fn route_attempts_queued_before_a_driver_panic() 
     );
     failed.abort();
 }
+
+/// D-8: a release dials only the native ALPN. The constant is false, a build
+/// that does not dial refuses locally, and a build that does gives no refusal.
+#[test]
+fn a_release_does_not_dial_the_upgrade_alpn() {
+    const { assert!(!crate::transport::quic::config::UPGRADE_DIAL) };
+    assert_eq!(
+        upgrade_dial_refusal(false),
+        Some(QuicErrorKind::Refused {
+            reason: QuicRefusal::Local
+        })
+    );
+    assert_eq!(upgrade_dial_refusal(true), None);
+}
+
+/// The only production dial of `freenet-quic/1` is `SessionDriver::dial`, and
+/// it checks the refusal before it connects. Source scan of production code,
+/// failing loudly if either site moves.
+#[test]
+fn the_only_upgrade_dial_checks_the_refusal_first() {
+    let driver = include_str!("../driver.rs");
+    let guard = driver
+        .find("if let Some(kind) = refusal {")
+        .expect("dial's refusal guard moved");
+    let dial = driver
+        .find("hub.endpoint.connect(remote, &key)")
+        .expect("the upgrade dial moved");
+    assert!(guard < dial, "the dial must come after its refusal check");
+    assert_eq!(driver.matches(".endpoint.connect(").count(), 1);
+    let quic = include_str!("../../../quic.rs");
+    assert_eq!(
+        quic.matches("self.identity.client_tls(&peer)?").count(),
+        1,
+        "a second /1 client TLS site: it must be gated like dial"
+    );
+    // Every other client TLS is the native one.
+    let native = include_str!("../../native/endpoint.rs");
+    assert!(native.contains("client_tls_for(&peer, config::Alpn::Native)"));
+}

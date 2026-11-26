@@ -61,6 +61,19 @@ pub(crate) const QUIC_VERSION: u32 = 1;
 /// fails the handshake.
 pub(crate) const ALPN: &[u8] = b"freenet-quic/1";
 
+/// Whether this build dials [`ALPN`] (`freenet-quic/1`, the upgrade of a UDP
+/// session). `false` since D-8: a release dials only [`NATIVE_ALPN`]. The
+/// server side still accepts `/1` for one release after D, for a peer of the
+/// floor release that upgrades a session it already has; D-9 removes the
+/// `/1` accept. A test build ([`upgrade_dial_enabled`]) still dials it, because
+/// the upgrade suites run until D-9 deletes them.
+pub(crate) const UPGRADE_DIAL: bool = false;
+
+/// [`UPGRADE_DIAL`], or `true` in a test build (`cfg(test)`).
+pub(crate) fn upgrade_dial_enabled() -> bool {
+    UPGRADE_DIAL || cfg!(test)
+}
+
 /// The ALPN protocol of a native connection (#5940): one set up without a UDP
 /// session, which begins with the Hello exchange (`native::exchange`). Only
 /// an attempt the endpoint was told to expect as native offers it, and such

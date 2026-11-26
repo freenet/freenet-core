@@ -1043,6 +1043,14 @@ fn closed_for(state: &SessionState) -> Option<QuicPathEnd> {
 /// path ends, only the ones a closer records for this node's own close get a
 /// local label; `ClosedByPeer` and `Lost` describe no close of this node's and
 /// stay `reset` should one ever be recorded.
+/// Why an upgrade dial (`freenet-quic/1`) is not made: `Some` when this build
+/// does not dial it (`config::upgrade_dial_enabled`), `None` when it does.
+fn upgrade_dial_refusal(enabled: bool) -> Option<QuicErrorKind> {
+    (!enabled).then_some(QuicErrorKind::Refused {
+        reason: QuicRefusal::Local,
+    })
+}
+
 fn fallback_label(cause: FallbackCause, closed_for: Option<QuicPathEnd>) -> QuicFallback {
     match cause {
         FallbackCause::Idle => QuicFallback::Idle,
@@ -1334,8 +1342,15 @@ impl Session {
         let hub = Arc::clone(&self.hub);
         let inbox = self.inbox.clone();
         let remote = self.remote;
+        let refusal = upgrade_dial_refusal(crate::transport::quic::config::upgrade_dial_enabled());
         let mut held = Attempt::new(attempt, self.remote);
         held.tasks.push(GlobalExecutor::spawn(async move {
+            // D-8: a release dials only the native ALPN. The attempt ends as a
+            // local refusal, which the machine handles like any failed dial.
+            if let Some(kind) = refusal {
+                report(&inbox, SessionEvent::ConnectFailed { attempt, kind }).await;
+                return;
+            }
             let event = match hub.endpoint.connect(remote, &key).await {
                 Ok(connection) => SessionEvent::Connected {
                     attempt,
