@@ -227,8 +227,7 @@ mod tests {
         let (logs, guard) = crate::util::test_log_capture::install();
         f();
         drop(guard);
-        let lines = logs.lock().unwrap().clone();
-        lines
+        logs.lock().unwrap().clone()
     }
 
     #[test]
