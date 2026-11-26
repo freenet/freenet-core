@@ -850,6 +850,12 @@ mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
 
+    /// The decision with a UDP session to fall back to. The production switch
+    /// (`UDP_FALLBACK`) is false since D-8, but this code (the with-UDP trip
+    /// count and cooldown) stays until D-9 deletes it, so its tests pass the
+    /// value explicitly.
+    const WITH_UDP: bool = true;
+
     const T0: u64 = 1_800_000_000;
     const NONCE: u64 = 7;
 
@@ -875,13 +881,12 @@ mod tests {
             now_secs,
             ignore_breaker,
             BreakerRole::Peer,
-            super::super::UDP_FALLBACK,
+            WITH_UDP,
         )
     }
 
     /// The trip count of the role these tests use, a peer.
-    const SHORT_RUNS_TO_TRIP: u32 =
-        short_runs_to_trip(BreakerRole::Peer, super::super::UDP_FALLBACK);
+    const SHORT_RUNS_TO_TRIP: u32 = short_runs_to_trip(BreakerRole::Peer, WITH_UDP);
 
     /// The trip count follows the UDP switch: two on a peer while UDP exists,
     /// three once it is removed, three on a gateway either way, so "back to
@@ -901,8 +906,8 @@ mod tests {
         for udp in [true, false] {
             assert_eq!(short_runs_to_trip(BreakerRole::Gateway, udp), 3);
         }
-        // UDP exists today; the UDP-removal release flips the switch.
-        const { assert!(super::super::UDP_FALLBACK) };
+        // D-8 flipped the switch: there is no UDP to fall back to.
+        const { assert!(!super::super::UDP_FALLBACK) };
     }
 
     /// `marker` with a backoff step.
@@ -1051,33 +1056,15 @@ mod tests {
     fn a_peer_trips_one_run_sooner_than_a_gateway_while_udp_exists() {
         let panicked_runs = |short_runs| panicked(short_runs, T0);
         for role in [BreakerRole::Peer, BreakerRole::Gateway] {
-            let at = short_runs_to_trip(role, super::super::UDP_FALLBACK);
-            let before = super::decide(
-                &panicked_runs(at - 2),
-                T0 + 1,
-                false,
-                role,
-                super::super::UDP_FALLBACK,
-            );
+            let at = short_runs_to_trip(role, WITH_UDP);
+            let before = super::decide(&panicked_runs(at - 2), T0 + 1, false, role, WITH_UDP);
             assert_eq!(before.verdict, Verdict::Arm, "{role:?}");
-            let trip = super::decide(
-                &panicked_runs(at - 1),
-                T0 + 1,
-                false,
-                role,
-                super::super::UDP_FALLBACK,
-            );
+            let trip = super::decide(&panicked_runs(at - 1), T0 + 1, false, role, WITH_UDP);
             assert_eq!(trip.verdict, Verdict::Trip, "{role:?}");
             assert_eq!(trip.short_runs, at, "{role:?}");
         }
-        assert_eq!(
-            short_runs_to_trip(BreakerRole::Peer, super::super::UDP_FALLBACK),
-            2
-        );
-        assert_eq!(
-            short_runs_to_trip(BreakerRole::Gateway, super::super::UDP_FALLBACK),
-            3
-        );
+        assert_eq!(short_runs_to_trip(BreakerRole::Peer, WITH_UDP), 2);
+        assert_eq!(short_runs_to_trip(BreakerRole::Gateway, WITH_UDP), 3);
     }
 
     /// The short-run clear and the endpoint-death record, in either order,
@@ -1152,13 +1139,7 @@ mod tests {
         };
         let long_after = T0 + 3 * SHORT_RUN.as_secs();
         let first = died(vec![long_after]);
-        let decision = super::decide(
-            &first,
-            long_after + 5,
-            false,
-            gw,
-            super::super::UDP_FALLBACK,
-        );
+        let decision = super::decide(&first, long_after + 5, false, gw, WITH_UDP);
         assert_eq!(decision, arm(0), "a long run's first death restarts QUIC");
         assert!(matches!(
             super::marker_after(decision, &first, long_after + 5, NONCE, gw),
@@ -1166,36 +1147,17 @@ mod tests {
         ));
         let second = died(vec![T0 - 3600, long_after]);
         assert_eq!(
-            super::decide(
-                &second,
-                long_after + 5,
-                false,
-                gw,
-                super::super::UDP_FALLBACK
-            )
-            .verdict,
+            super::decide(&second, long_after + 5, false, gw, WITH_UDP).verdict,
             Verdict::Trip,
             "the second in the window trips, however long the runs"
         );
         assert_eq!(
-            super::decide(
-                &second,
-                long_after + 5,
-                true,
-                gw,
-                super::super::UDP_FALLBACK
-            ),
+            super::decide(&second, long_after + 5, true, gw, WITH_UDP),
             arm(0),
             "the override never trips"
         );
         assert_eq!(
-            super::decide(
-                &died(vec![T0 - 60]),
-                long_after + 5,
-                false,
-                gw,
-                super::super::UDP_FALLBACK
-            ),
+            super::decide(&died(vec![T0 - 60]), long_after + 5, false, gw, WITH_UDP),
             arm(0),
             "an exit before this run started is not this run's death"
         );
@@ -1222,7 +1184,7 @@ mod tests {
             backoff_step: 0,
             prior_trip: Some(prior),
         });
-        let decision = super::decide(&previous, T0, false, gw, super::super::UDP_FALLBACK);
+        let decision = super::decide(&previous, T0, false, gw, WITH_UDP);
         assert_eq!(decision.verdict, Verdict::Trip);
         assert_eq!(
             super::marker_after(decision, &previous, T0, NONCE, gw),
@@ -1237,17 +1199,10 @@ mod tests {
         });
         let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
         assert!(matches!(
-            super::decide(
-                &tripped,
-                T0 + 2 * g - 1,
-                false,
-                gw,
-                super::super::UDP_FALLBACK
-            )
-            .verdict,
+            super::decide(&tripped, T0 + 2 * g - 1, false, gw, WITH_UDP).verdict,
             Verdict::Cool { .. }
         ));
-        let decision = super::decide(&tripped, T0 + 2 * g, false, gw, super::super::UDP_FALLBACK);
+        let decision = super::decide(&tripped, T0 + 2 * g, false, gw, WITH_UDP);
         assert_eq!(decision.verdict, Verdict::Arm);
         assert!(matches!(
             super::marker_after(decision, &tripped, T0 + 2 * g, NONCE, gw),
@@ -1272,13 +1227,7 @@ mod tests {
     fn a_gateway_cools_for_the_gateway_cooldown_and_counts_like_a_peer() {
         let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
         let gw = |previous: &Previous, now_secs: u64| {
-            super::decide(
-                previous,
-                now_secs,
-                false,
-                BreakerRole::Gateway,
-                super::super::UDP_FALLBACK,
-            )
+            super::decide(previous, now_secs, false, BreakerRole::Gateway, WITH_UDP)
         };
         assert_eq!(gw(&panicked(2, T0), T0 + g - 1).verdict, Verdict::Trip);
         assert_eq!(
@@ -1610,7 +1559,7 @@ mod tests {
             false,
             now,
             BreakerRole::Peer,
-            super::super::UDP_FALLBACK,
+            WITH_UDP,
             &super::super::Backoff::new(),
         );
         assert_eq!(empty.settings, None);
@@ -1625,7 +1574,7 @@ mod tests {
             false,
             now,
             BreakerRole::Peer,
-            super::super::UDP_FALLBACK,
+            WITH_UDP,
             &super::super::Backoff::new(),
         );
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
@@ -1658,7 +1607,7 @@ mod tests {
             false,
             now,
             BreakerRole::Peer,
-            super::super::UDP_FALLBACK,
+            WITH_UDP,
             &super::super::Backoff::new(),
         );
         assert_eq!(gated.settings, None);
@@ -1672,7 +1621,7 @@ mod tests {
             false,
             now,
             BreakerRole::Peer,
-            super::super::UDP_FALLBACK,
+            WITH_UDP,
             &super::super::Backoff::new(),
         );
         assert_eq!(cooling.settings, None);
@@ -1718,7 +1667,7 @@ mod tests {
             false,
             now,
             BreakerRole::Peer,
-            super::super::UDP_FALLBACK,
+            WITH_UDP,
             &super::super::Backoff::new(),
         );
         assert_eq!(gated.settings, None);
@@ -2079,13 +2028,7 @@ mod tests {
         let place = |previous: Previous| {
             counted_panic_at(
                 &previous,
-                super::decide(
-                    &previous,
-                    now,
-                    false,
-                    BreakerRole::Peer,
-                    super::super::UDP_FALLBACK,
-                ),
+                super::decide(&previous, now, false, BreakerRole::Peer, WITH_UDP),
             )
         };
         assert_eq!(place(previous(T0, true)), Some(at.clone()));

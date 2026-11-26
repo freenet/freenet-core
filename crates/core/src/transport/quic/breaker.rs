@@ -242,7 +242,7 @@ pub(crate) use short_runs::QuicCode;
 
 /// Whether UDP is still there to fall back to when the breaker trips (#6151).
 /// While it is, a trip keeps QUIC off for a cooldown and the node runs over
-/// UDP. The UDP-removal release (#5940 phase D) sets this to `false`: a
+/// UDP. The UDP-removal release (#5940 phase D, D-8) sets this to `false`: a
 /// peer's trip then keeps QUIC on and delays the start instead
 /// ([`Verdict::Backoff`]), runs the update check within seconds, and a supervised
 /// peer exits when its QUIC endpoint dies, as a gateway does; and a peer
@@ -261,14 +261,14 @@ pub(crate) use short_runs::QuicCode;
 /// (D-8), so a simulation or soak with this constant false is a partial check
 /// and cannot show what a network with no UDP costs.
 ///
-/// Flipping it also turns on `fatal_exit` (the update check before a
+/// It is `false` since D-8. Flipping it also turned on `fatal_exit` (the update check before a
 /// transport-fatal exit, and a failed bind ending the process). That check
 /// logs `Preparing the update before exiting (#5790)` through
 /// `stage_latest_release` with no update trigger after it, which the release
 /// canary's Gate B (`scripts/auto-update-canary.sh`, `MARKER_STAGE_STARTED`)
 /// reads as a staging that began: re-read Gate B's staging assertions when
 /// flipping.
-pub const UDP_FALLBACK: bool = true;
+pub const UDP_FALLBACK: bool = false;
 
 /// [`UDP_FALLBACK`], or `false` in a test build whose process environment sets
 /// `FREENET_TEST_NO_UDP_FALLBACK` (the `testing` feature and unit tests, see

@@ -12,8 +12,9 @@
 //! the reply does not depend on the intro's size, and a global token bucket
 //! limits how many intros are decrypted per second.
 //!
-//! Shipped dark: [`LEGACY_RESPONDER_ENABLED`] is `false` until step D-8 turns
-//! it on. While it is `false` the gateway handshake is unchanged.
+//! [`LEGACY_RESPONDER_ENABLED`] is `true` since step D-8 (the flag day): a
+//! gateway answers every legacy intro this way instead of running the legacy
+//! handshake. Removed two releases after D.
 
 use aes_gcm::{Aes128Gcm, KeyInit};
 
@@ -24,8 +25,8 @@ use crate::transport::packet_data::{PacketData, SymmetricAES};
 use crate::transport::symmetric_message::SymmetricMessage;
 
 /// Whether gateways answer legacy intros statelessly instead of running the
-/// legacy handshake. Off until D-8.
-pub(crate) const LEGACY_RESPONDER_ENABLED: bool = false;
+/// legacy handshake. On since D-8 (the flag day).
+pub(crate) const LEGACY_RESPONDER_ENABLED: bool = true;
 
 /// Intros decrypted per second, across all senders.
 pub(super) const LEGACY_RESPONDER_DECRYPTS_PER_SEC: u64 = 20;
@@ -74,13 +75,20 @@ impl<T: TimeSource> DecryptBucket<T> {
 
 /// The responder a listener holds: on when [`LEGACY_RESPONDER_ENABLED`] is, or
 /// when a test names a reply version.
+///
+/// A build with `cfg(test)` or the `testing` feature (unit tests, fdev
+/// simulations) keeps the legacy UDP handshake when no version is named: the
+/// simulation and mock-transport suites still set up their connections over
+/// it until D-9 deletes both, and the responder has its own tests, which name
+/// a version. The released binary has neither, so it reads the constant.
 pub(super) fn build<T: TimeSource>(
     time_source: T,
     test_override: Option<String>,
 ) -> Option<LegacyResponder<T>> {
     match test_override {
         Some(version) => Some(LegacyResponder::with_reply_version(time_source, &version)),
-        None => LEGACY_RESPONDER_ENABLED.then(|| LegacyResponder::new(time_source)),
+        None => (LEGACY_RESPONDER_ENABLED && !cfg!(any(test, feature = "testing")))
+            .then(|| LegacyResponder::new(time_source)),
     }
 }
 
@@ -282,11 +290,11 @@ mod tests {
         assert_eq!(admitted as u64, LEGACY_RESPONDER_DECRYPTS_PER_SEC);
     }
 
-    /// Dark until D-8, which flips this constant together with the switch-on
-    /// of D-3 and D-4.
+    /// On since D-8, which flipped this constant together with D-3 and D-4.
     #[test]
-    fn responder_is_off_by_default() {
-        const { assert!(!LEGACY_RESPONDER_ENABLED) };
+    fn responder_is_enabled_in_production_and_absent_in_test_builds() {
+        const { assert!(LEGACY_RESPONDER_ENABLED) };
+        // Not on in a test build: see `build`.
         assert!(build(VirtualTime::new(), None).is_none());
         assert!(build(VirtualTime::new(), Some("1.2.3".into())).is_some());
     }
