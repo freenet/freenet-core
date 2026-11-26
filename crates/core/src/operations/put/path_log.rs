@@ -8,7 +8,12 @@
 //!
 //! Volume: each helper is called at most once per hop per PUT (a decision, not
 //! a message or a fragment), the same cadence as the existing
-//! `PUT relay: processing Request` line, so there is no limiter.
+//! `PUT relay: processing Request` line. These helpers add no limiter of their
+//! own, but the process-wide per-callsite limiter (`util/rate_limit_layer.rs`,
+//! 30 events/s per callsite by default) still applies, and `log_forwarded` is one
+//! callsite shared by the streaming and non-streaming drivers, so a node past
+//! 30 forwarded PUT hops a second drops the excess (counted in the limiter's
+//! periodic summary line).
 //!
 //! Fields are limited to values the drivers already hold. The geometrically
 //! closest candidate is not logged: finding it needs a second routing pass over

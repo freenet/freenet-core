@@ -4999,8 +4999,13 @@ async fn drive_relay_probe(
     // which may be stale — see `.claude/rules/hosting-invariants.md`,
     // `feedback_hosted_cache_freshness`). A stale cached copy must not
     // short-circuit the probe into reporting a holder.
-    if op_manager.ring.is_receiving_updates(&key) {
-        let receiving_source = op_manager.ring.receiving_updates_source(&key);
+    //
+    // The decision is taken from ONE snapshot (`receiving_updates_source`,
+    // which `HostingManager` tests pin to agree with `is_receiving_updates`),
+    // so the source logged below always matches the decision: a lease expiring
+    // during the summary await cannot log holder_found=true with no source.
+    let receiving_source = op_manager.ring.receiving_updates_source(&key);
+    if receiving_source.is_receiving() {
         let holder_summary = op_manager
             .interest_manager
             .get_contract_summary(op_manager, &key)
@@ -9036,9 +9041,11 @@ mod tests {
             + start;
         let body = &src[start..end];
         assert!(
-            body.contains("is_receiving_updates(&key)"),
-            "drive_relay_probe must gate holder detection on \
-             Ring::is_receiving_updates"
+            body.contains("receiving_updates_source(&key)")
+                && body.contains("receiving_source.is_receiving()"),
+            "drive_relay_probe must gate holder detection on the \
+             receiving_updates_source snapshot (pinned to agree with \
+             Ring::is_receiving_updates)"
         );
         assert!(
             !body.contains("is_hosting_contract("),

@@ -634,7 +634,6 @@ pub(crate) struct ReceivingUpdatesSource {
 }
 
 impl ReceivingUpdatesSource {
-    #[cfg(test)]
     pub(crate) fn is_receiving(&self) -> bool {
         self.lease_age.is_some() || self.local_clients + self.local_delegates > 0
     }
