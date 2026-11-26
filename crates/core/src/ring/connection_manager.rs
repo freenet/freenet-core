@@ -326,6 +326,14 @@ pub(crate) const LATTICE_OVERMAX_SLACK: usize = 2;
 /// "lattice displacement" INFO line.
 pub(crate) const DISPLACEMENT_COOLDOWN: Duration = Duration::from_secs(300);
 
+/// A candidate displaces a link only if it is at most this fraction of the
+/// distance to the current nearest neighbour on its side: it must at least halve
+/// the gap. Also a JUDGEMENT, not a measurement. Without it every marginal
+/// tightening (0.0105 to 0.0100) costs a link; in the placement sim that was 12
+/// to 15 displacements among 61 nodes in the first two minutes, against one
+/// that mattered (a predecessor 0.09 away replacing one 0.24 away, ratio 0.38).
+pub(crate) const DISPLACEMENT_MAX_DIST_RATIO: f64 = 0.5;
+
 /// Base TTL for a peer address in the recently-failed cache after a NAT traversal
 /// failure. Repeated failures to the same address scale the TTL exponentially:
 /// `min(BASE * 2^count, MAX)` — so 5 min → 10 → 20 → 40 → 60 min (cap).
@@ -1786,6 +1794,9 @@ impl ConnectionManager {
     ///  - a configured gateway, unless the node would still hold at least
     ///    `min_connections` non-gateway links afterwards.
     ///
+    /// The candidate must also at least halve the distance to the current nearest
+    /// on its side ([`DISPLACEMENT_MAX_DIST_RATIO`]).
+    ///
     /// At most one displacement per node per [`DISPLACEMENT_COOLDOWN`]. With no
     /// eligible victim, or inside the cooldown, returns false (the candidate is
     /// refused as before). The victim is queued for
@@ -1815,6 +1826,19 @@ impl ConnectionManager {
         if established < self.max_connections {
             // Below max the ordinary path decides; displacement is for a node that
             // is full, or that the over-cap predicate counts as full.
+            return false;
+        }
+        let candidate_signed = me.signed_distance(candidate_loc);
+        let side_nearest = self
+            .nearest_lattice_neighbor_dist_in(&snapshot, candidate_signed > 0.0)
+            .unwrap_or(f64::INFINITY);
+        if candidate_signed.abs() > side_nearest * DISPLACEMENT_MAX_DIST_RATIO {
+            tracing::debug!(
+                candidate = %candidate,
+                candidate_distance = candidate_signed.abs(),
+                side_nearest,
+                "lattice displacement: candidate does not at least halve the gap, refusing"
+            );
             return false;
         }
         let gateway_links = snapshot
@@ -8674,13 +8698,13 @@ mod tests {
         let second = make_addr(9204);
         tokio::time::advance(DISPLACEMENT_COOLDOWN - Duration::from_secs(1)).await;
         assert!(
-            !cm.should_accept(Location::new(0.505), second),
+            !cm.should_accept(Location::new(0.504), second),
             "inside the cooldown the candidate is refused"
         );
         assert!(cm.take_displacement_victims().is_empty());
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(
-            cm.should_accept(Location::new(0.505), second),
+            cm.should_accept(Location::new(0.504), second),
             "after the cooldown it is admitted"
         );
         assert_eq!(cm.take_displacement_victims().len(), 1);
@@ -8721,6 +8745,19 @@ mod tests {
         );
         assert!(cm.should_accept(Location::new(0.51), cand));
         assert_eq!(cm.take_displacement_victims().len(), 1);
+    }
+
+    /// A marginal tightening (strictly closer, but not by half) does not cost a link.
+    #[test]
+    fn displacement_requires_the_candidate_to_halve_the_gap() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, _tracker, _long) = displacement_fixture(2);
+        // Nearest successor is 0.52 (distance 0.02): 0.515 is 0.015, ratio 0.75.
+        assert!(!cm.should_accept(Location::new(0.515), make_addr(9211)));
+        assert!(cm.take_displacement_victims().is_empty());
+        assert_eq!(cm.lattice_displacements(), 0);
+        // 0.509 is 0.009, ratio 0.45: admitted.
+        assert!(cm.should_accept(Location::new(0.509), make_addr(9212)));
     }
 
     /// A candidate that is not strictly closer than the current nearest on its

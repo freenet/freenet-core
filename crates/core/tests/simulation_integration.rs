@@ -27482,6 +27482,16 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
         };
         let (jd, jr, jc) = count(0..pre_len);
         let (od, or, oc) = count(pre_len..logs.len());
+        // A displacement storm shows as a rising rate: disconnects and CONNECT
+        // requests in four equal slices of the operation phase's log.
+        let span = logs.len() - pre_len;
+        let quarters: Vec<(usize, usize)> = (0..4)
+            .map(|q| {
+                let (d, r, _) = count(pre_len + span * q / 4..pre_len + span * (q + 1) / 4);
+                (d, r)
+            })
+            .collect();
+        eprintln!("PG CHURN quarters (disconnects, connect_requests): {quarters:?}");
         let minutes = (op_phase_slots as f64 * OP_INTERVAL_MS as f64 / 1000.0 + 60.0) / 60.0;
         let per_node_min = |n: usize| n as f64 / (NODES + 1) as f64 / minutes;
         eprintln!(
