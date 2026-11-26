@@ -991,6 +991,16 @@ async fn try_summary_first_put(
     let reply = match round_trip {
         Ok(Ok(reply)) => reply,
         Ok(Err(err)) => {
+            super::path_log::log_summary_first_outcome(
+                client_tx,
+                key,
+                "probe_failed",
+                None,
+                Some(target_addr),
+                target.location(),
+                crate::ring::Location::from(&key),
+                true,
+            );
             tracing::debug!(
                 tx = %client_tx,
                 probe_tx = %probe_tx,
@@ -1029,6 +1039,16 @@ async fn try_summary_first_put(
             ..
         })) => (holder_found, hop_count, holder_summary, reverse_delta),
         _other => {
+            super::path_log::log_summary_first_outcome(
+                client_tx,
+                key,
+                "unexpected_reply",
+                None,
+                Some(target_addr),
+                target.location(),
+                crate::ring::Location::from(&key),
+                true,
+            );
             tracing::debug!(
                 tx = %client_tx,
                 probe_tx = %probe_tx,
@@ -1041,6 +1061,16 @@ async fn try_summary_first_put(
     };
 
     if !holder_found {
+        super::path_log::log_summary_first_outcome(
+            client_tx,
+            key,
+            "new_contract",
+            Some(false),
+            Some(target_addr),
+            target.location(),
+            crate::ring::Location::from(&key),
+            true,
+        );
         tracing::debug!(
             tx = %client_tx,
             contract = %key,
@@ -1060,6 +1090,16 @@ async fn try_summary_first_put(
         // Wire invariant violation (`holder_found` without `holder_summary`)
         // — treat defensively as a probe failure rather than trust a
         // malformed/unexpected reply.
+        super::path_log::log_summary_first_outcome(
+            client_tx,
+            key,
+            "missing_holder_summary",
+            Some(true),
+            Some(target_addr),
+            target.location(),
+            crate::ring::Location::from(&key),
+            true,
+        );
         tracing::warn!(
             tx = %client_tx,
             contract = %key,
@@ -1131,6 +1171,16 @@ async fn try_summary_first_put(
     // instead — the same recovery the delta-computation-failure arm uses.
     // See `crate::ring::delta_incompat`.
     if op_manager.ring.delta_incompat.suppress_deltas(key.id()) {
+        super::path_log::log_summary_first_outcome(
+            client_tx,
+            key,
+            "delta_suppressed_incompat",
+            Some(true),
+            Some(target_addr),
+            target.location(),
+            crate::ring::Location::from(&key),
+            true,
+        );
         tracing::debug!(
             tx = %client_tx,
             contract = %key,
@@ -1156,6 +1206,16 @@ async fn try_summary_first_put(
     {
         Ok(delta) => delta,
         Err(err) => {
+            super::path_log::log_summary_first_outcome(
+                client_tx,
+                key,
+                "delta_failed",
+                Some(true),
+                Some(target_addr),
+                target.location(),
+                crate::ring::Location::from(&key),
+                true,
+            );
             tracing::debug!(
                 tx = %client_tx,
                 contract = %key,
@@ -1210,6 +1270,16 @@ async fn try_summary_first_put(
     };
 
     record_put_probe_outcome(false, delta_bytes);
+    super::path_log::log_summary_first_outcome(
+        client_tx,
+        key,
+        "reconciled_existing",
+        Some(true),
+        Some(target_addr),
+        target.location(),
+        crate::ring::Location::from(&key),
+        false,
+    );
 
     SummaryFirstOutcome::ReconciledExisting {
         target: target.clone(),
@@ -2153,6 +2223,7 @@ where
         None
     };
 
+    let mut hop_source = super::path_log::HopSource::Router;
     let (next_peer, next_addr) = match next_hop {
         Some(peer) => {
             // Greedy-routing terminus guard (#4363): finalize here only
@@ -2184,21 +2255,14 @@ where
                 .and_then(|p| p.location());
             let next_hop_loc = peer.location();
             if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
-                tracing::info!(
-                    tx = %incoming_tx,
-                    contract = %key,
-                    upstream_location = ?upstream_loc.map(|l| l.as_f64()),
-                    own_location = ?own_loc.map(|l| l.as_f64()),
-                    next_hop_location = ?next_hop_loc.map(|l| l.as_f64()),
-                    target_location = %target.as_f64(),
-                    phase = "relay_put_terminus",
-                    "PUT relay: chain descended here and next hop moves away; finalizing here (#4363)"
-                );
                 // Finalize the operation at this closest-seen node (#4363
                 // placement) but STILL replicate the contract one hop onward so
                 // the UPDATE broadcast tree stays connected (#4509 convergence).
                 // See `relay_put_replicate_forward` for why both are required.
-                if let Some(next_addr) = peer.socket_addr() {
+                // The one INFO line for this decision is logged after the
+                // replication attempt so it can say whether the copy went out.
+                let replicate_to = peer.socket_addr();
+                let replicate_sent = if let Some(next_addr) = replicate_to {
                     relay_put_replicate_forward(
                         op_manager,
                         next_addr,
@@ -2209,8 +2273,23 @@ where
                         htl,
                         new_skip_list.clone(),
                     )
-                    .await;
-                }
+                    .await
+                } else {
+                    false
+                };
+                super::path_log::log_finalized(
+                    incoming_tx,
+                    key,
+                    false,
+                    super::path_log::FinalizeReason::TerminusGuard,
+                    htl,
+                    upstream_loc,
+                    own_loc,
+                    next_hop_loc,
+                    target,
+                    replicate_to,
+                    replicate_sent,
+                );
                 let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                 // EXPERIMENT-ONLY (findability_probe): record the PUT terminus
                 // (#4363 guard) + store the single copy here. NOT for ship.
@@ -2333,13 +2412,9 @@ where
             // "harmonize" the two paths — there is no correctness gain.
             match bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains(&addr)) {
                 Some((gateway, gateway_addr)) => {
-                    tracing::info!(
-                        tx = %incoming_tx,
-                        contract = %key,
-                        gateway = %gateway_addr,
-                        phase = "relay_put_bootstrap_gateway",
-                        "PUT relay: ring empty — forwarding to configured gateway"
-                    );
+                    // The forward below logs this hop (hop_source =
+                    // bootstrap_gateway), so no separate line here.
+                    hop_source = super::path_log::HopSource::BootstrapGateway;
                     crate::router::dataset::record_bypass(
                         crate::node::network_status::OpType::Put,
                         crate::ring::Location::from(&key),
@@ -2351,11 +2426,22 @@ where
                 None => {
                     // No next hop and no configured gateway — genuinely
                     // isolated, so this node is the final destination.
-                    tracing::info!(
-                        tx = %incoming_tx,
-                        contract = %key,
-                        phase = "relay_put_complete",
-                        "PUT relay: no next hop, finalizing at this node"
+                    super::path_log::log_finalized(
+                        incoming_tx,
+                        key,
+                        false,
+                        super::path_log::FinalizeReason::for_missing_next_hop(htl),
+                        htl,
+                        op_manager
+                            .ring
+                            .connection_manager
+                            .get_peer_by_addr(upstream_addr)
+                            .and_then(|p| p.location()),
+                        op_manager.ring.connection_manager.own_location().location(),
+                        None,
+                        crate::ring::Location::from(&key),
+                        None,
+                        false,
                     );
                     // Same arm as above: this node IS the storer.
                     let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
@@ -2417,13 +2503,16 @@ where
         op_manager.ring.register_events(Either::Left(event)).await;
     }
 
-    tracing::debug!(
-        tx = %incoming_tx,
-        contract = %key,
-        peer_addr = %next_addr,
-        htl = new_htl,
-        phase = "relay_put_forward",
-        "PUT relay: forwarding to next hop"
+    super::path_log::log_forwarded(
+        incoming_tx,
+        key,
+        false,
+        new_htl,
+        next_addr,
+        next_peer.location(),
+        op_manager.ring.connection_manager.own_location().location(),
+        crate::ring::Location::from(&key),
+        hop_source,
     );
 
     // Originator-loopback mode (`upstream_addr == own_addr`): the
@@ -3139,6 +3228,7 @@ async fn relay_put_store_locally(
 /// rides along unchanged, and HTL is decremented, so the replication copy is
 /// bounded and cannot loop back upstream. This is the "ensure terminated PUTs
 /// still replicate to the contract neighbourhood" resolution.
+/// Returns whether the replication copy was dispatched, for the hop's INFO line.
 #[allow(clippy::too_many_arguments)]
 async fn relay_put_replicate_forward(
     op_manager: &OpManager,
@@ -3149,12 +3239,12 @@ async fn relay_put_replicate_forward(
     merged_value: WrappedState,
     htl: usize,
     skip_list: HashSet<SocketAddr>,
-) {
+) -> bool {
     // EXPERIMENT-ONLY (findability_probe): suppress the one-hop-past terminus
     // replication so the PUT copy stays SINGULAR. NOT for ship.
     #[cfg(any(test, feature = "testing"))]
     if crate::operations::findability_probe::scatter_disabled() {
-        return;
+        return false;
     }
     // The replication copy is sent as a single `PutMsg::Request`. For a
     // payload that would need streaming we skip the replication forward rather
@@ -3177,7 +3267,7 @@ async fn relay_put_replicate_forward(
             phase = "relay_put_terminus_replicate",
             "PUT relay: terminus replication skipped for streaming-size payload (placement still correct)"
         );
-        return;
+        return false;
     }
 
     // Fresh tx: the upstream Response under `incoming_tx` already satisfies
@@ -3204,6 +3294,7 @@ async fn relay_put_replicate_forward(
             phase = "relay_put_terminus_replicate",
             "PUT relay: terminus replication forward failed (best-effort)"
         );
+        false
     } else {
         tracing::debug!(
             replication_tx = %replication_tx,
@@ -3212,6 +3303,7 @@ async fn relay_put_replicate_forward(
             phase = "relay_put_terminus_replicate",
             "PUT relay: finalized locally but forwarded replication copy onward (#4509)"
         );
+        true
     }
 }
 
@@ -4072,14 +4164,9 @@ where
     // originator keeps its replica while the gateway relays onward.
     let bootstrap_gateway = if next_hop.is_none() && htl > 0 {
         match bootstrap_gateway_target(op_manager, |addr| new_skip_list.contains(&addr)) {
-            Some((gateway, gateway_addr)) => {
-                tracing::info!(
-                    tx = %incoming_tx,
-                    contract = %contract_key,
-                    gateway = %gateway_addr,
-                    phase = "relay_put_streaming_bootstrap_gateway",
-                    "PUT streaming relay: ring empty — forwarding to configured gateway"
-                );
+            Some((gateway, _gateway_addr)) => {
+                // The piped-forward line below logs this hop (hop_source =
+                // bootstrap_gateway), so no separate line here.
                 crate::router::dataset::record_bypass(
                     crate::node::network_status::OpType::Put,
                     crate::ring::Location::from(&contract_key),
@@ -4108,7 +4195,10 @@ where
     // `relay_put_replicate_forward`). The streaming payload isn't assembled
     // until step 5, so we remember the next-hop address here and forward a
     // replication copy after the local store in step 6.
+    let via_bootstrap_gateway = bootstrap_gateway.is_some();
     let mut terminus_replicate_to: Option<SocketAddr> = None;
+    let mut terminus_next_hop_loc: Option<Location> = None;
+    let mut terminus_fired = false;
     let next_hop = match next_hop {
         Some(peer) => {
             let target = crate::ring::Location::from(&contract_key);
@@ -4124,16 +4214,9 @@ where
                 .and_then(|p| p.location());
             let next_hop_loc = peer.location();
             if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
-                tracing::info!(
-                    tx = %incoming_tx,
-                    contract = %contract_key,
-                    upstream_location = ?upstream_loc.map(|l| l.as_f64()),
-                    own_location = ?own_loc.map(|l| l.as_f64()),
-                    next_hop_location = ?next_hop_loc.map(|l| l.as_f64()),
-                    target_location = %target.as_f64(),
-                    phase = "relay_put_streaming_terminus",
-                    "PUT streaming relay: chain descended here and next hop moves away; finalizing here (#4363)"
-                );
+                // Logged once, at step 6, after the replication attempt.
+                terminus_next_hop_loc = next_hop_loc;
+                terminus_fired = true;
                 terminus_replicate_to = peer.socket_addr();
                 None
             } else {
@@ -4190,12 +4273,26 @@ where
                 }
             };
 
-            tracing::info!(
+            super::path_log::log_forwarded(
+                incoming_tx,
+                contract_key,
+                true,
+                new_htl,
+                next_addr,
+                next_hop.as_ref().and_then(|p| p.location()),
+                op_manager.ring.connection_manager.own_location().location(),
+                crate::ring::Location::from(&contract_key),
+                if via_bootstrap_gateway {
+                    super::path_log::HopSource::BootstrapGateway
+                } else {
+                    super::path_log::HopSource::Router
+                },
+            );
+            tracing::debug!(
                 tx = %incoming_tx,
                 inbound_stream_id = %stream_id,
                 outbound_stream_id = %outbound_sid,
                 total_size,
-                peer_addr = %next_addr,
                 "Starting piped stream forwarding to next hop"
             );
 
@@ -4221,6 +4318,18 @@ where
         } else {
             None
         }
+    } else {
+        None
+    };
+
+    // Why this hop will NOT forward the stream, if it will not. Logged at
+    // step 6 as the hop's single finalize line.
+    let finalize_reason = if terminus_fired {
+        Some(super::path_log::FinalizeReason::TerminusGuard)
+    } else if next_hop_addr.is_none() {
+        Some(super::path_log::FinalizeReason::for_missing_next_hop(htl))
+    } else if piping.is_none() {
+        Some(super::path_log::FinalizeReason::BelowStreamingThreshold)
     } else {
         None
     };
@@ -4370,8 +4479,10 @@ where
     // still replicate the assembled contract one hop onward so the UPDATE
     // broadcast tree stays connected (#4509). Mirrors the non-streaming guard
     // branch; see `relay_put_replicate_forward`.
+    let replicate_to = replicate_payload.as_ref().map(|(addr, _, _)| *addr);
+    let mut replicate_sent = false;
     if let Some((next_addr, contract, related_contracts)) = replicate_payload {
-        relay_put_replicate_forward(
+        replicate_sent = relay_put_replicate_forward(
             op_manager,
             next_addr,
             key,
@@ -4382,6 +4493,25 @@ where
             new_skip_list.clone(),
         )
         .await;
+    }
+    if let Some(reason) = finalize_reason {
+        super::path_log::log_finalized(
+            incoming_tx,
+            key,
+            true,
+            reason,
+            htl,
+            op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(upstream_addr)
+                .and_then(|p| p.location()),
+            op_manager.ring.connection_manager.own_location().location(),
+            terminus_next_hop_loc,
+            crate::ring::Location::from(&key),
+            replicate_to,
+            replicate_sent,
+        );
     }
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
@@ -4870,12 +5000,22 @@ async fn drive_relay_probe(
     // `feedback_hosted_cache_freshness`). A stale cached copy must not
     // short-circuit the probe into reporting a holder.
     if op_manager.ring.is_receiving_updates(&key) {
+        let receiving_source = op_manager.ring.receiving_updates_source(&key);
         let holder_summary = op_manager
             .interest_manager
             .get_contract_summary(op_manager, &key)
             .await;
         return match holder_summary {
             Some(s) => {
+                super::path_log::log_probe_answered(
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    op_manager.ring.connection_manager.own_location().location(),
+                    true,
+                    "holder",
+                    &receiving_source,
+                );
                 // Reverse leg of the bidirectional reconcile (#4642 step
                 // 3-bis): compute the delta the ORIGINATOR is missing
                 // relative to our (the holder's) state — the mirror of the
@@ -4903,6 +5043,15 @@ async fn drive_relay_probe(
                 .await
             }
             None => {
+                super::path_log::log_probe_answered(
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    op_manager.ring.connection_manager.own_location().location(),
+                    false,
+                    "holder_summary_failed",
+                    &receiving_source,
+                );
                 // Summary computation failed despite being a genuine
                 // holder. Fail safe: report no-holder so the originator
                 // falls through to the full-state `Request` path. Shipping
@@ -5929,6 +6078,96 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// Code of `body` with `//` comments removed, so a call that was commented
+    /// out does not satisfy a pin.
+    fn without_line_comments(body: &str) -> String {
+        body.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Number of statement-position calls (the call is the first thing on its
+    /// line) to `super::path_log::<name>(` in `body`.
+    fn path_log_calls(body: &str, name: &str) -> usize {
+        let needle = format!("super::path_log::{name}(");
+        without_line_comments(body)
+            .lines()
+            .filter(|l| l.trim_start().starts_with(&needle))
+            .count()
+    }
+
+    /// Each PUT hop decision emits its INFO line through `path_log` (the
+    /// helpers log at INFO; `path_log`'s own tests capture the lines), one call
+    /// per decision branch. A hop that decides without calling a helper is
+    /// invisible in a gateway's INFO log, which is what misled the
+    /// investigation this was added for.
+    ///
+    /// FALSIFY: delete or comment out any one of these calls (verified for the
+    /// non-streaming terminus `log_finalized` and the probe `log_probe_answered`).
+    #[test]
+    fn every_put_hop_decision_logs_through_path_log() {
+        let src = production_source();
+
+        let body = extract_fn_body(src, "async fn drive_relay_put<CB>(");
+        assert_eq!(path_log_calls(body, "log_forwarded"), 1, "forward line");
+        assert_eq!(
+            path_log_calls(body, "log_finalized"),
+            2,
+            "terminus guard + no-next-hop/htl-0 finalize lines"
+        );
+        let code = without_line_comments(body);
+        assert!(
+            code.contains("HopSource::BootstrapGateway"),
+            "the bootstrap-gateway fallback must be reported as the hop source"
+        );
+        assert!(
+            !code.contains("\"relay_put_forward\""),
+            "the forward decision must not drop back to a DEBUG-only line"
+        );
+
+        let body = extract_fn_body(src, "async fn drive_relay_put_streaming<CB>(");
+        assert_eq!(
+            path_log_calls(body, "log_forwarded"),
+            1,
+            "streaming forward"
+        );
+        assert_eq!(
+            path_log_calls(body, "log_finalized"),
+            1,
+            "streaming finalize"
+        );
+        let code = without_line_comments(body);
+        assert!(code.contains("FinalizeReason::TerminusGuard"));
+        assert!(code.contains("HopSource::BootstrapGateway"));
+
+        let body = extract_fn_body(src, "async fn try_summary_first_put(");
+        assert_eq!(
+            path_log_calls(body, "log_summary_first_outcome"),
+            7,
+            "probe_failed, unexpected_reply, new_contract, missing_holder_summary, \
+             delta_suppressed_incompat, delta_failed, reconciled_existing"
+        );
+        let code = without_line_comments(body);
+        for outcome in ["\"new_contract\"", "\"reconciled_existing\""] {
+            assert!(code.contains(outcome), "missing outcome {outcome}");
+        }
+
+        let body = extract_fn_body(src, "async fn drive_relay_probe(");
+        assert_eq!(
+            path_log_calls(body, "log_probe_answered"),
+            2,
+            "holder answer and holder-summary-failed answer"
+        );
+        assert!(
+            without_line_comments(body).contains("receiving_updates_source(&key)"),
+            "the probe answer must say why the node counts as receiving updates"
+        );
     }
 
     /// ANT-2026-K0YQ8CG4: `start_relay_put` takes a relay driver permit after
