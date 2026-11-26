@@ -677,7 +677,7 @@ impl RelayState {
         let mut arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
         #[cfg(any(test, feature = "testing"))]
         let arm_cause = native::acceptor_verdict(Some(offer), readiness, bucket, holds)
-            .map_or("native", |(_, cause)| cause.label());
+            .map_or("no_offer", |(_, cause)| cause.label());
         // A `Native` decision holds a native setup slot and an allow-set slot
         // here for up to the server's window. Admit it first; with no room
         // (or too many pending from the joiner's source) decide `Udp`, so the

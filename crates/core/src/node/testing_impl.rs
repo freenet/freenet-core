@@ -9035,28 +9035,54 @@ mod tests {
     /// left off has none.
     #[tokio::test(flavor = "current_thread")]
     async fn transport_quic_builds_the_endpoint_of_a_running_simulated_node() {
+        quic_endpoint_of_a_running_simulated_node(
+            "shadow",
+            "quic-running-endpoint-e5a1",
+            crate::transport::metrics::QuicIngressOutcome::NotAllowed,
+        )
+        .await;
+    }
+
+    /// A `prefer` gateway admits native joins from unknown sources, so it
+    /// queues a stranger's datagram (`Forwarded`); the `shadow` gateway of the
+    /// test above, which keeps application data on UDP, does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prefer_gateway_queues_a_strangers_datagram_for_admission() {
+        quic_endpoint_of_a_running_simulated_node(
+            "prefer",
+            "quic-running-endpoint-prefer-e5a2",
+            crate::transport::metrics::QuicIngressOutcome::Forwarded,
+        )
+        .await;
+    }
+
+    async fn quic_endpoint_of_a_running_simulated_node(
+        mode: &'static str,
+        network: &'static str,
+        gateway_outcome: crate::transport::metrics::QuicIngressOutcome,
+    ) {
         use crate::transport::in_memory_socket::deliver_packet_to_network;
         use crate::transport::metrics::{QuicIngressOutcome, TRANSPORT_METRICS};
-        const NETWORK: &str = "quic-running-endpoint-e5a1";
-        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
+        let mut sim = SimNetwork::new(network, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
         let labels = labels_in_order(&sim);
-        sim.with_node_transport_quic(&labels[0], "shadow");
+        sim.with_node_transport_quic(&labels[0], mode);
         // The second node must have no QUIC endpoint, which is no longer the
         // simulation default.
         sim.with_node_transport_quic(&labels[1], "off");
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;
-        // `labels[0]` is the gateway (one gateway, one node): with admission
-        // on in production it queues a stranger's datagram instead.
+        // `labels[0]` is the gateway (one gateway, one node): a `prefer` one
+        // queues a stranger's datagram for admission, a `shadow` one refuses it.
         assert!(labels[0].is_gateway(), "premise: labels[0] is the gateway");
         let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
-            (&labels[0], 1, QuicIngressOutcome::Forwarded),
+            (&labels[0], 1, gateway_outcome),
             (&labels[1], 2, QuicIngressOutcome::NoIngress),
         ]
         .into_iter()
         .map(|(label, port, expected)| {
-            let stranger = SocketAddr::from(([10, 201, 39, 1], port));
+            let stranger =
+                SocketAddr::from(([10, 201, if mode == "prefer" { 40 } else { 39 }, 1], port));
             (sim.all_node_addresses()[label], stranger, expected)
         })
         .collect();
@@ -9072,7 +9098,7 @@ mod tests {
                     tokio::time::Instant::now() < deadline,
                     "{target} never read the datagram"
                 );
-                deliver_packet_to_network(NETWORK, target, initial.clone(), stranger);
+                deliver_packet_to_network(network, target, initial.clone(), stranger);
                 sim.advance_time(Duration::from_millis(100));
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

@@ -1,12 +1,16 @@
 //! Gateway admission of native joins from sources nobody named (#5940,
 //! phase B; A7b). **On** since the floor release: [`GATEWAY_NATIVE_ADMISSION`]
 //! is true, so every node that is a gateway (published in the index or not)
-//! admits native joins from unknown sources from release day. The index
-//! mark (`GatewayConfig::native`) only steers which gateways default joiners
-//! dial natively; no gateway reads its own mark. There is no switch in the
-//! binary; an operator turns it off on one gateway with `transport-quic =
-//! "off"`, which builds no QUIC endpoint, and reversing it for everyone takes
-//! a release. Tests also turn it on
+//! and configured `transport-quic = "prefer"` (the default) admits native
+//! joins from unknown sources from release day. A `shadow` or `off` gateway
+//! does not: native joins carry application data, which `shadow` keeps on
+//! UDP. The index mark (`GatewayConfig::native`) only steers which gateways
+//! default joiners dial natively; no gateway reads its own mark. There is no
+//! switch in the binary; an operator turns it off on one gateway with
+//! `transport-quic = "off"` (or `"shadow"`), which stays possible only while
+//! UDP exists ([`super::breaker::UDP_FALLBACK`] is true; the UDP-removal
+//! release drops it), and reversing it for everyone takes a release. Tests
+//! also turn it on
 //! per endpoint ([`super::QuicEndpoint::enable_gateway_admission`]) or per
 //! listener ([`force_on_for_test`]).
 //!

@@ -6870,7 +6870,7 @@ fn a_gateway_listener_with_admission_hands_a_join_to_the_node() {
         let wait = tokio::spawn(monitor.wait_for_any_exit());
         let mut network_config: crate::config::NetworkApiConfig =
             toml::from_str("").expect("default network config");
-        network_config.transport_quic = Some("shadow".to_string());
+        network_config.transport_quic = Some("prefer".to_string());
         let gateway_keys = TransportKeypair::new();
         let (outbound, mut inbound, listener) = bind_udp_listener::<SimulationSocket>(
             gateway_keys.clone(),
