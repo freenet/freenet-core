@@ -2358,7 +2358,11 @@ mod tests {
     /// - `path method`: a path's own value, `.udp_fallback()`, in `data_route.rs`;
     /// - `field`: a read of a `udp_fallback` field, only the path's own copy
     ///   (`path.rs`, `route.rs`, `recycle.rs`), never a `limits.udp_fallback`;
-    /// - `constant`: the constant named, in `breaker.rs` and the `lib.rs` re-export.
+    /// - `constant`: the constant named, in `breaker.rs` and the `lib.rs` re-export;
+    /// - `queue_short caller`: a call of `DataRoute::queue_short`, whose full-or-closed
+    ///   branch is gated on the path flag, so it must stay reachable only from a path
+    ///   built with the default or shadow limits (`peer_connection.rs`; a native
+    ///   connection uses `queue_native_short`).
     ///
     /// A new reader anywhere else fails this test: route it through
     /// `effective_udp_fallback` (a path) or the accessor, and add it here with
@@ -2419,6 +2423,9 @@ mod tests {
                     bump("bare");
                 }
             }
+            for _ in flat.match_indices(".queue_short(") {
+                bump("queue_short caller");
+            }
             for (at, _) in flat.match_indices(".udp_fallback") {
                 if !flat[at + ".udp_fallback".len()..].starts_with('(') {
                     bump("field");
@@ -2471,6 +2478,7 @@ mod tests {
 
     const EXPECTED_READERS: &[(&str, &str, usize)] = &[
         ("lib.rs", "constant", 1),
+        ("transport/peer_connection.rs", "queue_short caller", 1),
         ("transport/quic/breaker.rs", "bare", 3),
         ("transport/quic/breaker.rs", "constant", 2),
         ("transport/quic/fatal_exit.rs", "accessor", 2),
