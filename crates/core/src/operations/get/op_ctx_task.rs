@@ -4255,59 +4255,6 @@ where
     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
     let htl = htl.min(ring_max_htl);
 
-    // ── Short-circuit 1: HTL = 0 ────────────────────────────────────────
-    if htl == 0 {
-        tracing::warn!(
-            tx = %incoming_tx,
-            %instance_id,
-            %upstream_addr,
-            htl = 0,
-            phase = "not_found",
-            "GET relay: HTL exhausted — sending NotFound upstream"
-        );
-        if let Some(event) = crate::tracing::NetEventLog::get_not_found(
-            &incoming_tx,
-            &op_manager.ring,
-            instance_id,
-            Some(op_manager.ring.max_hops_to_live),
-            None,
-        ) {
-            op_manager
-                .ring
-                .register_events(either::Either::Left(event))
-                .await;
-        }
-        // HTL=0 path: the original Request reached us with htl already at 0,
-        // meaning the request traversed the full max_htl forward hops to get
-        // here. hop_count = max_htl - 0 = max_htl.
-        let hop_count = op_manager.ring.max_hops_to_live;
-        // EXPERIMENT-ONLY (findability_probe): record the HTL-exhaustion GET
-        // terminus. NOT for ship.
-        #[cfg(any(test, feature = "testing"))]
-        {
-            let visited = visited.clone();
-            crate::operations::findability_probe::record_terminus(
-                &op_manager.ring,
-                crate::operations::findability_probe::ProbeOpKind::Get,
-                &incoming_tx,
-                crate::ring::Location::from(&instance_id),
-                htl,
-                hop_count,
-                crate::operations::findability_probe::ProbeStopReason::HtlZero,
-                move |addr| visited.probably_visited(addr),
-            );
-        }
-        relay_send_not_found(
-            op_manager,
-            incoming_tx,
-            instance_id,
-            upstream_addr,
-            hop_count,
-        )
-        .await;
-        return Ok(());
-    }
-
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
 
     // Hosting attribution for EVERY local store this driver makes. Computed once
@@ -4509,6 +4456,65 @@ where
         )
         .await;
         send_result?;
+        return Ok(());
+    }
+
+    // ── Short-circuit 3: HTL = 0, nothing held to serve ─────────────────
+    // Runs AFTER the local-hit arm above on purpose: a peer that holds a
+    // fresh copy answers Found whatever the HTL. HTL only bounds FORWARDING,
+    // so HTL = 0 never forwards but must not hide a copy this node serves at
+    // any other HTL (the sim trace in ~/code/scratch/placement-gap/TRACE.md:
+    // a GET reached the holder exactly at HTL 0 and got NotFound). Reaching
+    // here means the local arm found nothing servable, so NotFound is right.
+    if htl == 0 {
+        tracing::warn!(
+            tx = %incoming_tx,
+            %instance_id,
+            %upstream_addr,
+            htl = 0,
+            phase = "not_found",
+            "GET relay: HTL exhausted — sending NotFound upstream"
+        );
+        if let Some(event) = crate::tracing::NetEventLog::get_not_found(
+            &incoming_tx,
+            &op_manager.ring,
+            instance_id,
+            Some(op_manager.ring.max_hops_to_live),
+            None,
+        ) {
+            op_manager
+                .ring
+                .register_events(either::Either::Left(event))
+                .await;
+        }
+        // HTL=0 path: the original Request reached us with htl already at 0,
+        // meaning the request traversed the full max_htl forward hops to get
+        // here. hop_count = max_htl - 0 = max_htl.
+        let hop_count = op_manager.ring.max_hops_to_live;
+        // EXPERIMENT-ONLY (findability_probe): record the HTL-exhaustion GET
+        // terminus. NOT for ship.
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let visited = new_visited.clone();
+            crate::operations::findability_probe::record_terminus(
+                &op_manager.ring,
+                crate::operations::findability_probe::ProbeOpKind::Get,
+                &incoming_tx,
+                crate::ring::Location::from(&instance_id),
+                htl,
+                hop_count,
+                crate::operations::findability_probe::ProbeStopReason::HtlZero,
+                move |addr| visited.probably_visited(addr),
+            );
+        }
+        relay_send_not_found(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            upstream_addr,
+            hop_count,
+        )
+        .await;
         return Ok(());
     }
 
@@ -8231,9 +8237,7 @@ mod tests {
             .find("check_local_with_interest_gate(")
             .expect("local lookup must exist");
         let serve = body
-            .find("iflet Some((key,state,contract))=local_value{"
-                .replace(' ', "")
-                .as_str())
+            .find("ifletSome((key,state,contract))=local_value{")
             .expect("local-hit arm must exist");
         assert!(
             lookup < guard && serve < guard,
@@ -8243,7 +8247,7 @@ mod tests {
         );
         // The not-held branch keeps the NotFound frame and never forwards.
         let tail = &body[guard..];
-        let guard_end = tail.find("return Ok(());").expect("guard returns early");
+        let guard_end = tail.find("returnOk(());").expect("guard returns early");
         let guard_block = &tail[..guard_end];
         assert!(
             guard_block.contains("relay_send_not_found("),
