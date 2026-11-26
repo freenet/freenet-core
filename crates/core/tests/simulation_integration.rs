@@ -13098,9 +13098,12 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
 
     const SEED: u64 = 0x57A1_E11C_0001;
     const NETWORK_NAME: &str = "get-dead-first-hop";
-    // Silence window (14 s on UDP) plus one retry, with headroom. The
-    // un-swept behaviour is the 60 s attempt deadline plus the retry.
-    const MAX_LATENCY_S: f64 = 25.0;
+    // The retry goes through a relay that is also connected to the dead host
+    // (it is closest to the key), so the GET pays the silence window twice:
+    // once at the requester (14 s window plus up to one 5 s tick) and once at
+    // that relay, about 34 s in all. Without the sweep each of the two waits is
+    // the 60 s attempt deadline.
+    const MAX_LATENCY_S: f64 = 40.0;
     setup_deterministic_state(SEED);
 
     let contract = SimOperation::create_test_contract(0x59);
@@ -13185,12 +13188,30 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
         operations.push(filler_get());
     }
 
+    // `NetLogMessage::datetime` is the wall clock, so sample (wall, virtual)
+    // pairs from another thread while the simulation runs and map each event
+    // onto virtual time afterwards.
+    let virtual_time = sim.virtual_time().clone();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut samples: Vec<(chrono::DateTime<chrono::Utc>, u64)> = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                samples.push((chrono::Utc::now(), virtual_time.now_nanos()));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            samples
+        })
+    };
     let result = sim.run_controlled_simulation(
         SEED,
         operations,
         Duration::from_secs(900),
         Duration::from_secs(120),
     );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let samples = sampler.join().expect("sampler thread");
     assert!(
         result.turmoil_result.is_ok(),
         "simulation failed: {:?}",
@@ -13204,15 +13225,21 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     // ---- Analysis ----
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
     let instance = contract_id.to_string();
-    let mine: Vec<(chrono::DateTime<chrono::Utc>, String, String)> = logs
+    let virt_s = |dt: chrono::DateTime<chrono::Utc>| -> f64 {
+        let idx = samples.partition_point(|(w, _)| *w <= dt);
+        samples[idx.saturating_sub(1)].1 as f64 / 1e9
+    };
+    let get_events: Vec<(chrono::DateTime<chrono::Utc>, String, String, String)> = logs
         .iter()
-        .filter(|l| {
-            l.peer_id
-                .to_string()
-                .contains(&format!("@{requester_addr}"))
+        .map(|l| {
+            (
+                l.datetime,
+                l.peer_id.to_string(),
+                l.tx.to_string(),
+                format!("{:?}", l.kind),
+            )
         })
-        .map(|l| (l.datetime, l.tx.to_string(), format!("{:?}", l.kind)))
-        .filter(|(_, _, d)| d.starts_with("Get(") && d.contains(&instance))
+        .filter(|(_, _, _, d)| d.starts_with("Get("))
         .collect();
     let variant = |d: &str| -> String {
         d["Get(".len()..]
@@ -13221,54 +13248,58 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
             .unwrap_or_default()
             .to_owned()
     };
-    let terminal = mine
+    let at_requester = |peer: &str| peer.contains(&format!("@{requester_addr}"));
+    let terminal_idx = get_events
         .iter()
-        .filter(|(_, _, d)| variant(d) == "ClientTerminal" && d.contains("is_sub_op: false"))
-        .min_by_key(|(t, _, _)| *t)
+        .position(|(_, peer, _, d)| {
+            at_requester(peer)
+                && d.contains(&instance)
+                && variant(d) == "ClientTerminal"
+                && d.contains("is_sub_op: false")
+        })
         .expect("the requester's GET reached a client terminal");
-    let start = mine
+    let (terminal_at, _, terminal_tx, terminal_d) = &get_events[terminal_idx];
+    let (start_at, _, _, _) = get_events
         .iter()
-        .filter(|(_, tx, d)| variant(d) == "Request" && *tx == terminal.1)
-        .map(|(t, _, _)| *t)
-        .min()
+        .find(|(_, peer, tx, d)| at_requester(peer) && tx == terminal_tx && variant(d) == "Request")
         .expect("the requester's GET has a Request event");
-    let latency_s = (terminal.0 - start).num_milliseconds() as f64 / 1000.0;
-    let first_target_is_dead = mine
-        .iter()
-        .filter(|(_, tx, d)| variant(d) == "Request" && *tx == terminal.1)
-        .min_by_key(|(t, _, _)| *t)
-        .map(|(_, _, d)| {
-            d.split("target: ").nth(1).is_some_and(|rest| {
-                rest.split(')')
-                    .next()
-                    .unwrap_or("")
-                    .contains(&format!("@{dead_addr}"))
-            })
-        });
-    eprintln!(
-        "DEAD-FIRST-HOP latency_s={latency_s:.1} outcome_success={} first_hop_is_dead_peer={first_target_is_dead:?}",
-        terminal.2.contains("outcome: Success")
-    );
-    for (t, tx, d) in &mine {
-        if variant(d) == "Request" || variant(d) == "ClientTerminal" {
-            eprintln!(
-                "DEAD-FIRST-HOP   t={:+8.3}s tx=..{} {}",
-                (*t - start).num_milliseconds() as f64 / 1000.0,
-                &tx[tx.len().saturating_sub(5)..],
-                d.chars().take(300).collect::<String>()
-            );
-        }
+    let latency_s = virt_s(*terminal_at) - virt_s(*start_at);
+    for (at, peer, tx, d) in get_events.iter().filter(|e| e.3.contains(&instance)) {
+        eprintln!(
+            "DEAD-FIRST-HOP   t={:+7.2}s node={} tx=..{} {}",
+            virt_s(*at) - virt_s(*start_at),
+            peer.split('@').nth(1).unwrap_or("?"),
+            &tx[tx.len().saturating_sub(5)..],
+            d.chars().take(110).collect::<String>()
+        );
     }
+    // First hop: the first Request of this tx whose target is not the
+    // requester itself (the first is its own loopback).
+    let first_target_is_dead = get_events
+        .iter()
+        .find(|(_, peer, tx, d)| {
+            at_requester(peer)
+                && tx == terminal_tx
+                && variant(d) == "Request"
+                && d.split("target: ").nth(1).map(|r| r.split('@').next())
+                    != d.split("requester: ").nth(1).map(|r| r.split('@').next())
+        })
+        .map(|(_, _, _, d)| {
+            d.split("target: ")
+                .nth(1)
+                .is_some_and(|rest| rest.split(')').next().unwrap_or("").contains(&format!("@{dead_addr}")))
+        });
+    let found = terminal_d.contains("outcome: Success");
+    eprintln!(
+        "DEAD-FIRST-HOP latency_s={latency_s:.1} found={found} first_hop_is_dead_peer={first_target_is_dead:?}"
+    );
 
     assert_eq!(
         first_target_is_dead,
         Some(true),
         "precondition: the GET's first hop must be the crashed host"
     );
-    assert!(
-        terminal.2.contains("outcome: Success"),
-        "the GET must be found through the second host"
-    );
+    assert!(found, "the GET must be found through the second host");
     assert!(
         latency_s < MAX_LATENCY_S,
         "the GET waited {latency_s:.1}s on a dead first hop (limit {MAX_LATENCY_S}s): \
