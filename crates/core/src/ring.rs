@@ -186,6 +186,7 @@ mod peer_connection_backoff;
 mod peer_key_location;
 mod placement_migration_metrics;
 pub(crate) mod resync_rate_limit;
+pub(crate) mod silent_peers;
 pub(crate) mod stranded_recovery;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
@@ -4570,6 +4571,13 @@ impl Ring {
         selected.into_iter().cloned().collect()
     }
 
+    /// Peers that recently did not answer a GET (see [`silent_peers`]), for
+    /// GET next-hop and first-hop selection to route around when it can.
+    pub(crate) fn silent_get_peers(&self) -> Vec<std::net::SocketAddr> {
+        self.connection_manager
+            .silent_peers(self.time_source.now())
+    }
+
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
         self.report_route_outcome_to_health(&event);
         self.router.write().add_event(event);
@@ -4673,6 +4681,13 @@ impl Ring {
         if cause == AttemptFailure::Timeout {
             if let Some(addr) = event.peer.socket_addr() {
                 self.timeout_label_window.lock().record(addr);
+                // A GET that got no reply at all (a NotFound is a reply and
+                // never reaches here): let GET routing avoid this peer for a
+                // short window when it has an alternative.
+                if event.op_type == Some(crate::node::network_status::OpType::Get) {
+                    self.connection_manager
+                        .record_silent_peer(addr, self.time_source.now());
+                }
             }
         }
         self.record_route_event_router_only(event, source);

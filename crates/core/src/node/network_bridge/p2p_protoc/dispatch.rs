@@ -106,6 +106,11 @@ impl P2pConnManager {
             ?source_addr,
             "Handling inbound NetMessage at event loop"
         );
+        // A peer that sends us anything is alive: drop any record that it
+        // went silent on a GET.
+        if let Some(addr) = source_addr {
+            op_manager.ring.connection_manager.clear_silent_peer(addr);
+        }
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
                 tracing::debug!(

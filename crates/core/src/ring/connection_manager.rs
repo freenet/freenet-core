@@ -654,6 +654,8 @@ pub(crate) struct ConnectionManager {
     /// Jitter is applied once at `record_failed_addr` time and stored as a
     /// `retry_after` instant, so consecutive reads are always consistent.
     recently_failed_addrs: Arc<parking_lot::Mutex<TrackedBackoff<SocketAddr>>>,
+    /// Peers that recently did not answer a GET; see [`super::silent_peers`].
+    silent_peers: Arc<super::silent_peers::SilentPeers>,
     /// Peers that have advertised readiness to accept non-CONNECT operations.
     ready_peers: Arc<DashSet<SocketAddr>>,
     /// Minimum connections before this peer advertises readiness.
@@ -880,6 +882,7 @@ impl ConnectionManager {
                 ExponentialBackoff::new(FAILED_ADDR_BASE_TTL, FAILED_ADDR_MAX_TTL),
                 FAILED_ADDR_MAX_ENTRIES,
             ))),
+            silent_peers: Arc::new(super::silent_peers::SilentPeers::default()),
             ready_peers: Arc::new(DashSet::new()),
             min_ready_connections,
             connected_since: Arc::new(RwLock::new(BTreeMap::new())),
@@ -3001,6 +3004,8 @@ impl ConnectionManager {
         self.connected_since.write().remove(&addr);
         // Health tracking
         self.peer_health.lock().remove_peer(addr);
+        // A reconnect starts with a clean record.
+        self.silent_peers.clear(addr);
     }
 
     /// Test-only: push a raw [`Connection`] straight into
@@ -3376,6 +3381,22 @@ impl ConnectionManager {
     /// agree on whether the address is still blocked.
     pub fn record_failed_addr(&self, addr: SocketAddr) {
         self.recently_failed_addrs.lock().record_failure(addr);
+    }
+
+    /// Note that a GET forwarded to `addr` went unanswered. See
+    /// [`super::silent_peers`].
+    pub(crate) fn record_silent_peer(&self, addr: SocketAddr, now: Instant) {
+        self.silent_peers.record(addr, now);
+    }
+
+    /// `addr` sent us a message, so it is alive: forget any silence record.
+    pub(crate) fn clear_silent_peer(&self, addr: SocketAddr) {
+        self.silent_peers.clear(addr);
+    }
+
+    /// Peers currently recorded as silent for GET routing.
+    pub(crate) fn silent_peers(&self, now: Instant) -> Vec<SocketAddr> {
+        self.silent_peers.active(now)
     }
 
     /// Remove `addr` from the failed cache (e.g., after a successful connection).

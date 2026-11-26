@@ -3784,6 +3784,21 @@ fn first_hop_candidate(
         .filter(|peer| peer.socket_addr() == Some(addr))
 }
 
+/// Whether `candidate` is strictly closer to `key` than this node is. Used to
+/// accept a replacement for a silent peer only when the replacement is itself
+/// a valid keyward hop (no backtracking). An unknown own or candidate location
+/// is not closer: the silent peer is then kept rather than guessing.
+fn is_strictly_closer_than_us(
+    own: Option<crate::ring::Location>,
+    candidate: Option<crate::ring::Location>,
+    key: crate::ring::Location,
+) -> bool {
+    match (own, candidate) {
+        (Some(own), Some(candidate)) => candidate.distance(key) < own.distance(key),
+        _ => false,
+    }
+}
+
 /// Select the next downstream peer for relay forwarding.
 ///
 /// Uses `new_visited` (bloom filter) as the primary skip list for
@@ -3877,7 +3892,33 @@ fn relay_advance_to_next_peer(
             crate::router::dataset::UncapturedReason::PinnedFirstHop,
         );
     }
+    // Route around peers that recently did not answer a GET (see
+    // `ring::silent_peers`). A preference only: it is honoured when another
+    // candidate that is strictly closer to the key than this node exists, so
+    // the sole route to a holder is still taken and the pick never backtracks
+    // to a candidate the normal rules would not accept. A pinned first hop is
+    // the retry driver's deliberate second chance for a peer that timed out,
+    // so it goes before this.
+    let silent = op_manager.ring.silent_get_peers();
+    let avoiding_silent = |also_skip: &[SocketAddr]| {
+        if silent.is_empty() {
+            return None;
+        }
+        let mut skip = new_visited.clone();
+        for addr in also_skip.iter().chain(silent.iter()) {
+            skip.mark_visited(*addr);
+        }
+        closest(skip).filter(|peer| {
+            is_strictly_closer_than_us(
+                op_manager.ring.connection_manager.own_location().location(),
+                peer.location(),
+                crate::ring::Location::from(instance_id),
+            )
+        })
+    };
     let peer = match pinned
+        .or_else(|| avoiding_silent(first_hop_exclusions))
+        .or_else(|| avoiding_silent(&[]))
         .or_else(excluding)
         .or_else(|| closest(new_visited.clone()))
     {
@@ -13320,6 +13361,138 @@ mod route_attempt_driver_tests {
             Some(unrestricted),
             "with every candidate excluded, the relay picks as if none were"
         );
+    }
+
+    /// A GET that got no reply marks its hop silent; the next GET's relay pick
+    /// goes around that peer while another strictly-closer candidate exists,
+    /// never when the silent peer is the last one, and stops doing so once the
+    /// record is cleared (the peer talked) or expires.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_pick_routes_around_a_silent_peer_while_an_alternative_exists() {
+        use crate::operations::route_attempt::AttemptFailure;
+        use crate::router::dataset::RouteSource;
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("get-silent", 4).await;
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let own_loc = op_manager.ring.connection_manager.own_location().location();
+        let pick = |instance_id: &ContractInstanceId, exclusions: &[SocketAddr]| {
+            let tx = Transaction::new::<GetMsg>();
+            let mut visited = VisitedPeers::new(&tx);
+            visited.mark_visited(own);
+            let mut tried = vec![own];
+            let mut retries = 0;
+            relay_advance_to_next_peer(
+                &op_manager,
+                instance_id,
+                &mut tried,
+                &mut retries,
+                &visited,
+                exclusions,
+                None,
+            )
+            .map(|(_, addr)| addr)
+        };
+        let report = |peer: &PeerKeyLocation,
+                      id: &ContractInstanceId,
+                      cause: AttemptFailure,
+                      op: crate::node::network_status::OpType| {
+            op_manager.ring.record_route_failure(
+                crate::router::RouteEvent {
+                    peer: peer.clone(),
+                    contract_location: crate::ring::Location::from(id),
+                    outcome: crate::router::RouteOutcome::Failure,
+                    op_type: Some(op),
+                },
+                cause,
+                RouteSource::Relay,
+            );
+        };
+        let by_addr = |a: SocketAddr| peers.iter().find(|p| addr(p) == a).unwrap().clone();
+
+        // Find a key whose best peer has a strictly-closer runner-up.
+        let mut found = None;
+        for b in 0u8..=255 {
+            let id = ContractInstanceId::new([b; 32]);
+            let key = crate::ring::Location::from(&id);
+            let Some(best) = pick(&id, &[]) else { continue };
+            let Some(alt) = pick(&id, &[best]) else {
+                continue;
+            };
+            if is_strictly_closer_than_us(own_loc, by_addr(alt).location(), key) {
+                found = Some((id, best, alt));
+                break;
+            }
+        }
+        let (id, best, alt) = found.expect("some key has a strictly-closer runner-up");
+        let best_peer = by_addr(best);
+
+        // A NotFound is an answer and a PUT is not a GET: neither marks the peer.
+        report(&best_peer, &id, AttemptFailure::NotFound, crate::node::network_status::OpType::Get);
+        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Put);
+        assert_eq!(pick(&id, &[]), Some(best), "no GET timeout recorded yet");
+
+        // A GET timeout does.
+        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Get);
+        assert_eq!(pick(&id, &[]), Some(alt), "the silent peer is routed around");
+
+        // It also survives alongside the retry loop's own first-hop exclusions.
+        assert_ne!(pick(&id, &[alt]), Some(best), "an exclusion on the alternative does not bring the silent peer back while a third exists or falls back safely");
+
+        // A message from the peer clears it.
+        op_manager.ring.connection_manager.clear_silent_peer(best);
+        assert_eq!(pick(&id, &[]), Some(best), "a peer that talked is alive");
+
+        // The window expires.
+        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Get);
+        assert_eq!(pick(&id, &[]), Some(alt));
+        tokio::time::advance(crate::ring::silent_peers::SILENT_PEER_WINDOW).await;
+        assert_eq!(pick(&id, &[]), Some(best), "the record expired");
+
+        // Connection removal clears it.
+        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Get);
+        op_manager.ring.connection_manager.prune_alive_connection(best);
+        assert!(op_manager.ring.silent_get_peers().is_empty());
+
+        // Never the last candidate: with every peer silent, the pick is the
+        // one the router would have made anyway.
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("get-silent-all", 3).await;
+        let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
+        let tx = Transaction::new::<GetMsg>();
+        let mut visited = VisitedPeers::new(&tx);
+        visited.mark_visited(own);
+        let run = || {
+            let mut tried = vec![own];
+            let mut retries = 0;
+            relay_advance_to_next_peer(
+                &op_manager,
+                &id,
+                &mut tried,
+                &mut retries,
+                &visited,
+                &[],
+                None,
+            )
+            .map(|(_, addr)| addr)
+        };
+        let before = run().expect("candidates");
+        for p in &peers {
+            op_manager
+                .ring
+                .connection_manager
+                .record_silent_peer(addr(p), tokio::time::Instant::now());
+        }
+        assert_eq!(run(), Some(before), "the last candidates are never removed");
+    }
+
+    #[test]
+    fn a_replacement_must_be_strictly_closer_than_this_node() {
+        use crate::ring::Location;
+        let key = Location::new(0.5);
+        let own = Some(Location::new(0.3));
+        assert!(is_strictly_closer_than_us(own, Some(Location::new(0.45)), key));
+        assert!(!is_strictly_closer_than_us(own, Some(Location::new(0.3)), key));
+        assert!(!is_strictly_closer_than_us(own, Some(Location::new(0.1)), key));
+        assert!(!is_strictly_closer_than_us(None, Some(Location::new(0.45)), key));
+        assert!(!is_strictly_closer_than_us(own, None, key));
     }
 
     /// The driver gives up only once every ring peer was actually asked, not
