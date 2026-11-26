@@ -1216,6 +1216,12 @@ pub struct TransportMetrics {
     /// Times this node stopped deciding QUIC-native as acceptor after its
     /// native setups failed with distinct joiners (reset each snapshot).
     connect_native_acceptor_demotions: AtomicU64,
+    /// Times a role's strike streak reached its threshold but the role was
+    /// not demoted, because its rescues were under
+    /// `connect::native::DEMOTION_MIN_RESCUE_SHARE_PERCENT` of its native
+    /// outcomes over the strike window, by role (reset each snapshot).
+    connect_native_demotion_guard_spared_joiner: AtomicU64,
+    connect_native_demotion_guard_spared_acceptor: AtomicU64,
     /// Native setups this node did not admit as acceptor, deciding UDP
     /// instead (`connect::native::NativeSetupAdmission`) (reset each
     /// snapshot).
@@ -1801,6 +1807,8 @@ impl TransportMetrics {
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_demotions: AtomicU64::new(0),
             connect_native_acceptor_demotions: AtomicU64::new(0),
+            connect_native_demotion_guard_spared_joiner: AtomicU64::new(0),
+            connect_native_demotion_guard_spared_acceptor: AtomicU64::new(0),
             connect_native_admission_refused: AtomicU64::new(0),
             connect_native_admission_control_dropped: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
@@ -2504,6 +2512,16 @@ impl TransportMetrics {
             .fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// A role's strike streak reached its threshold and the rescue-share
+    /// guard kept the role from being demoted.
+    pub(crate) fn record_connect_native_demotion_guard_spared(&self, side: NativeConnectSide) {
+        let counter = match side {
+            NativeConnectSide::Joiner => &self.connect_native_demotion_guard_spared_joiner,
+            NativeConnectSide::Acceptor => &self.connect_native_demotion_guard_spared_acceptor,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// This node stopped deciding QUIC-native as acceptor.
@@ -3549,6 +3567,12 @@ impl TransportMetrics {
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_demotions: get64(&self.connect_native_demotions),
             connect_native_acceptor_demotions: get64(&self.connect_native_acceptor_demotions),
+            connect_native_demotion_guard_spared_joiner: get64(
+                &self.connect_native_demotion_guard_spared_joiner,
+            ),
+            connect_native_demotion_guard_spared_acceptor: get64(
+                &self.connect_native_demotion_guard_spared_acceptor,
+            ),
             connect_native_admission_refused: get64(&self.connect_native_admission_refused),
             connect_native_admission_control_dropped: get64(
                 &self.connect_native_admission_control_dropped,
@@ -4300,6 +4324,11 @@ pub struct TransportSnapshot {
     pub connect_native_demotions: u64,
     /// Times the node stopped deciding native as acceptor after failures.
     pub connect_native_acceptor_demotions: u64,
+    /// Strike streaks that reached the threshold without demoting the
+    /// joiner role (rescue share under the guard).
+    pub connect_native_demotion_guard_spared_joiner: u64,
+    /// As above, for the acceptor role.
+    pub connect_native_demotion_guard_spared_acceptor: u64,
     /// Native setups not admitted as acceptor (decided UDP instead).
     pub connect_native_admission_refused: u64,
     /// Control pairs left out of the arms for lack of setup room.
@@ -4781,6 +4810,8 @@ impl TransportSnapshot {
             connect_native_decision_over_cap,
             connect_native_demotions,
             connect_native_acceptor_demotions,
+            connect_native_demotion_guard_spared_joiner,
+            connect_native_demotion_guard_spared_acceptor,
             connect_native_admission_refused,
             connect_native_admission_control_dropped,
             connect_native_rescued_by_udp_joiner,
@@ -4972,6 +5003,10 @@ impl TransportSnapshot {
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
         self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
+        self.connect_native_demotion_guard_spared_joiner =
+            connect_native_demotion_guard_spared_joiner;
+        self.connect_native_demotion_guard_spared_acceptor =
+            connect_native_demotion_guard_spared_acceptor;
         self.connect_native_admission_refused = connect_native_admission_refused;
         self.connect_native_admission_control_dropped = connect_native_admission_control_dropped;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
@@ -5236,6 +5271,11 @@ struct SnapshotExtras {
     pub connect_native_demotions: u64,
     /// Times the node stopped deciding native as acceptor after failures.
     pub connect_native_acceptor_demotions: u64,
+    /// Strike streaks that reached the threshold without demoting the
+    /// joiner role (rescue share under the guard).
+    pub connect_native_demotion_guard_spared_joiner: u64,
+    /// As above, for the acceptor role.
+    pub connect_native_demotion_guard_spared_acceptor: u64,
     /// Native setups not admitted as acceptor (decided UDP instead).
     pub connect_native_admission_refused: u64,
     /// Control pairs left out of the arms for lack of setup room.
@@ -5531,6 +5571,8 @@ impl SnapshotExtras {
             || self.connect_native_decision_over_cap != 0
             || self.connect_native_demotions != 0
             || self.connect_native_acceptor_demotions != 0
+            || self.connect_native_demotion_guard_spared_joiner != 0
+            || self.connect_native_demotion_guard_spared_acceptor != 0
             || self.connect_native_admission_refused != 0
             || self.connect_native_admission_control_dropped != 0
             || self.connect_native_rescued_by_udp_joiner != 0
@@ -6991,6 +7033,18 @@ mod tests {
         let json = serde_json::to_value(&snap).unwrap();
         assert_eq!(json["connect_native_acceptor_demotions"], 2);
         assert!(metrics.take_snapshot().is_none(), "the count resets");
+        metrics.record_connect_native_demotion_guard_spared(NativeConnectSide::Joiner);
+        metrics.record_connect_native_demotion_guard_spared(NativeConnectSide::Acceptor);
+        metrics.record_connect_native_demotion_guard_spared(NativeConnectSide::Acceptor);
+        let snap = metrics
+            .take_snapshot()
+            .expect("a spared streak is activity");
+        assert_eq!(snap.connect_native_demotion_guard_spared_joiner, 1);
+        assert_eq!(snap.connect_native_demotion_guard_spared_acceptor, 2);
+        assert_eq!(snap.connect_native_demotions, 0);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_demotion_guard_spared_acceptor"], 2);
+        assert!(metrics.take_snapshot().is_none(), "the count resets");
     }
 
     #[test]
@@ -8310,6 +8364,8 @@ mod tests {
             "connect_native_decision_over_cap",
             "connect_native_demotions",
             "connect_native_acceptor_demotions",
+            "connect_native_demotion_guard_spared_joiner",
+            "connect_native_demotion_guard_spared_acceptor",
             "connect_native_admission_refused",
             "connect_native_admission_control_dropped",
             "connect_native_rescued_by_udp_joiner",

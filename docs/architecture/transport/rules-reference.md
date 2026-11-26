@@ -430,6 +430,8 @@ dropped unanswered past the per-CONNECT cap on refused acceptors,
 turned its own native connects off,
 `connect_native_acceptor_demotions` for each time it stopped deciding native
 as acceptor,
+`connect_native_demotion_guard_spared_{joiner,acceptor}` for each full strike
+streak the rescue-share guard kept from demoting that role,
 `connect_native_admission_refused` for each native setup it did not admit as
 acceptor (deciding UDP instead),
 `connect_native_admission_control_dropped` for each control pair it left out
@@ -2350,6 +2352,12 @@ Demotion: one principle for both roles: a STRIKE needs evidence that native
   Acceptor (10.2 item 2): the node stops DECIDING Native
   (NativeConnectState::acceptor_readiness, read by RelayEnv::native_readiness;
   connect_native_acceptor_demotions); its own offer as joiner is untouched.
+  Both roles: a full streak demotes only if rescues are at least
+  DEMOTION_MIN_RESCUE_SHARE_PERCENT (30) of the role's native outcomes
+  (rescues and successes, at most DEMOTION_OUTCOME_RING) inside STRIKE_WINDOW;
+  under it the streak is cleared and counted in
+  connect_native_demotion_guard_spared_<role>. At 100% native a busy node
+  completes three distinct-peer rescues by chance more often than at 25%.
   Without it an acceptor whose own native path is broken (a gateway, a node
   at its target that rarely joins) kept deciding Native for every joiner,
   each of which waited out the fallback. Such an acceptor collects a rescue

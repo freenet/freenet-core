@@ -34,6 +34,7 @@ use tokio::time::Instant;
 
 use crate::transport::TransportPublicKey;
 use crate::transport::metrics::ConnectArm;
+use crate::transport::metrics::NativeConnectSide;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
 /// Whether this build can dial a native connection. True since A+ step 1;
@@ -124,6 +125,25 @@ pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 3;
 /// 6 h; and a fault that does not recur
 /// within one cooldown would not have kept native off for long either.
 pub(crate) const STRIKE_WINDOW: Duration = DEMOTION_COOLDOWN;
+
+/// The share of a role's native outcomes, over [`STRIKE_WINDOW`], that must
+/// be rescues for a full strike streak to demote the role. A streak of
+/// [`DEMOTION_FAILURES`] distinct-peer rescues with no success in between
+/// is chance for a busy node whose rescue share is modest: at 25% native an
+/// acceptor made a few setups an hour, at 100% it makes about four times as
+/// many, so the same small share completes a streak more often. Field
+/// data, 0.2.167 (4.5 h after the cut, 1,060 nodes): healthy nodes rescue
+/// about 4% (acceptor) to 8% (joiner) of their native outcomes, joiners that
+/// demoted had a median share of 50%, and acceptors that demoted a median
+/// of 30% (about half under 30%). Replayed on that data, 30% still demotes
+/// 38 of 40 joiner and 33 of 63 acceptor demotions. The value is a
+/// proposal tuned on one read, not a derived constant.
+pub(crate) const DEMOTION_MIN_RESCUE_SHARE_PERCENT: u64 = 30;
+
+/// Most native outcomes (rescues and successes) a role remembers for the
+/// share above; the oldest go first. A node that makes more than this inside
+/// [`STRIKE_WINDOW`] (about 43 an hour) judges its share on the latest ones.
+pub(crate) const DEMOTION_OUTCOME_RING: usize = 256;
 
 /// How long a demoted node offers (or decides) nothing native.
 pub(crate) const DEMOTION_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
@@ -1078,7 +1098,16 @@ impl NativeConnectState {
     /// [`DEMOTION_FAILURES`]). Returns whether it demoted the node, which is
     /// counted.
     pub(crate) fn record_failure(&self, peer: &TransportPublicKey) -> bool {
-        let demoted = self.demotion.lock().record_failure(peer, Instant::now());
+        let (demoted, spared) = {
+            let mut demotion = self.demotion.lock();
+            let before = demotion.spared();
+            let demoted = demotion.record_failure(peer, Instant::now());
+            (demoted, demotion.spared() > before)
+        };
+        if spared {
+            TRANSPORT_METRICS
+                .record_connect_native_demotion_guard_spared(NativeConnectSide::Joiner);
+        }
         if demoted {
             TRANSPORT_METRICS.record_connect_native_demotion();
             tracing::info!(
@@ -1091,7 +1120,7 @@ impl NativeConnectState {
 
     /// A native setup succeeded.
     pub(crate) fn record_success(&self) {
-        self.demotion.lock().record_success();
+        self.demotion.lock().record_success(Instant::now());
     }
 
     /// A strike in the acceptor streak with `joiner`: a rescue (a native
@@ -1100,10 +1129,16 @@ impl NativeConnectState {
     /// the joiner streak, across distinct joiners, so one joiner counts once.
     /// Returns whether it demoted the acceptor role, which is counted.
     pub(crate) fn record_acceptor_failure(&self, joiner: &TransportPublicKey) -> bool {
-        let demoted = self
-            .acceptor_demotion
-            .lock()
-            .record_failure(joiner, Instant::now());
+        let (demoted, spared) = {
+            let mut demotion = self.acceptor_demotion.lock();
+            let before = demotion.spared();
+            let demoted = demotion.record_failure(joiner, Instant::now());
+            (demoted, demotion.spared() > before)
+        };
+        if spared {
+            TRANSPORT_METRICS
+                .record_connect_native_demotion_guard_spared(NativeConnectSide::Acceptor);
+        }
         if demoted {
             TRANSPORT_METRICS.record_connect_native_acceptor_demotion();
             tracing::info!(
@@ -1166,7 +1201,7 @@ impl NativeConnectState {
     /// A native setup this node made as acceptor succeeded: the acceptor
     /// streak starts over.
     pub(crate) fn record_acceptor_success(&self) {
-        self.acceptor_demotion.lock().record_success();
+        self.acceptor_demotion.lock().record_success(Instant::now());
     }
 
     /// How many times this node was demoted.
@@ -1203,7 +1238,9 @@ impl NativeConnectState {
 /// [`ACCEPTOR_DEMOTION_FAILURES`] as acceptor), each with a different peer,
 /// demote the role for [`DEMOTION_COOLDOWN`]; a success in that role resets
 /// the streak. Repeated failures with one peer count once, so one broken peer
-/// cannot demote a node. It only ever lowers: it can make a node offer 0 or
+/// cannot demote a node. A full streak demotes only when rescues are at least
+/// [`DEMOTION_MIN_RESCUE_SHARE_PERCENT`] of the role's outcomes in the window.
+/// It only ever lowers: it can make a node offer 0 or
 /// decide `Udp`, never more.
 #[derive(Debug)]
 pub(crate) struct NativeDemotion {
@@ -1214,6 +1251,13 @@ pub(crate) struct NativeDemotion {
     threshold: usize,
     demoted_until: Option<Instant>,
     demotions: u64,
+    /// This role's recent native outcomes, oldest first: `true` is a rescue
+    /// (every one, not one per peer), `false` a success. At most
+    /// [`DEMOTION_OUTCOME_RING`], and none older than [`STRIKE_WINDOW`] when
+    /// read. Only ever read to judge a full streak.
+    outcomes: std::collections::VecDeque<(Instant, bool)>,
+    /// Full streaks the share guard kept from demoting the role.
+    spared: u64,
 }
 
 impl NativeDemotion {
@@ -1223,15 +1267,49 @@ impl NativeDemotion {
             threshold,
             demoted_until: None,
             demotions: 0,
+            outcomes: std::collections::VecDeque::with_capacity(DEMOTION_OUTCOME_RING),
+            spared: 0,
         }
     }
 
+    /// Remembers one native outcome, dropping those older than
+    /// [`STRIKE_WINDOW`] and the oldest past [`DEMOTION_OUTCOME_RING`].
+    fn note_outcome(&mut self, rescue: bool, now: Instant) {
+        while self
+            .outcomes
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) >= STRIKE_WINDOW)
+        {
+            self.outcomes.pop_front();
+        }
+        if self.outcomes.len() >= DEMOTION_OUTCOME_RING {
+            self.outcomes.pop_front();
+        }
+        self.outcomes.push_back((now, rescue));
+    }
+
+    /// Whether rescues are at least [`DEMOTION_MIN_RESCUE_SHARE_PERCENT`] of
+    /// the outcomes remembered, all within [`STRIKE_WINDOW`] of `now`.
+    fn rescue_share_demotes(&self, now: Instant) -> bool {
+        let (mut rescues, mut all) = (0u64, 0u64);
+        for (at, rescue) in &self.outcomes {
+            if now.saturating_duration_since(*at) < STRIKE_WINDOW {
+                all += 1;
+                rescues += u64::from(*rescue);
+            }
+        }
+        rescues * 100 >= DEMOTION_MIN_RESCUE_SHARE_PERCENT * all
+    }
+
     /// A strike with `peer` (a rescue, see [`DEMOTION_FAILURES`]). Returns
-    /// whether it demoted the role.
+    /// whether it demoted the role. A full streak whose rescues are under
+    /// [`DEMOTION_MIN_RESCUE_SHARE_PERCENT`] of the role's outcomes in the
+    /// window is cleared without demoting (counted in [`Self::spared`]).
     pub(crate) fn record_failure(&mut self, peer: &TransportPublicKey, now: Instant) -> bool {
         if self.is_demoted(now) {
             return false;
         }
+        self.note_outcome(true, now);
         self.streak
             .retain(|(_, at)| now.saturating_duration_since(*at) < STRIKE_WINDOW);
         if !self.streak.iter().any(|(key, _)| key == peer) {
@@ -1239,6 +1317,11 @@ impl NativeDemotion {
         }
         if self.streak.len() >= self.threshold {
             self.streak.clear();
+            if !self.rescue_share_demotes(now) {
+                self.spared += 1;
+                return false;
+            }
+            self.outcomes.clear();
             self.demoted_until = Some(now + DEMOTION_COOLDOWN);
             self.demotions += 1;
             return true;
@@ -1246,9 +1329,16 @@ impl NativeDemotion {
         false
     }
 
-    /// A native attempt succeeded: the streak starts over.
-    pub(crate) fn record_success(&mut self) {
+    /// A native attempt succeeded: the streak starts over. `now` stamps the
+    /// outcome for the rescue share.
+    pub(crate) fn record_success(&mut self, now: Instant) {
+        self.note_outcome(false, now);
         self.streak.clear();
+    }
+
+    /// Full streaks the share guard kept from demoting the role, so far.
+    pub(crate) fn spared(&self) -> u64 {
+        self.spared
     }
 
     pub(crate) fn is_demoted(&self, now: Instant) -> bool {
@@ -2463,12 +2553,151 @@ mod tests {
         let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         demotion.record_failure(&key(1), now);
         demotion.record_failure(&key(2), now);
-        demotion.record_success();
+        demotion.record_success(now);
         demotion.record_failure(&key(3), now);
         demotion.record_failure(&key(4), now);
         assert!(!demotion.is_demoted(now));
         demotion.record_failure(&key(5), now);
         assert!(demotion.is_demoted(now));
+    }
+
+    /// A role with `successes` native successes, then three distinct rescues,
+    /// all at `now`.
+    fn streak_after(successes: usize, now: Instant) -> (NativeDemotion, bool) {
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
+        for _ in 0..successes {
+            demotion.record_success(now);
+        }
+        let mut demoted = false;
+        for i in 1..=DEMOTION_FAILURES as u32 {
+            demoted = demotion.record_failure(&key(i), now);
+        }
+        (demotion, demoted)
+    }
+
+    /// The guard at its edge: 3 rescues of 10 outcomes is exactly 30% and
+    /// demotes; 3 of 11 is under it and does not, and that full streak is
+    /// cleared and counted.
+    #[test]
+    fn a_full_streak_demotes_only_at_the_rescue_share() {
+        let now = Instant::now();
+        let (demotion, demoted) = streak_after(7, now);
+        assert!(demoted, "3 of 10 is 30%");
+        assert!(demotion.is_demoted(now));
+        assert_eq!(demotion.spared(), 0);
+        let (demotion, demoted) = streak_after(8, now);
+        assert!(!demoted, "3 of 11 is under 30%");
+        assert!(!demotion.is_demoted(now));
+        assert_eq!(demotion.demotions(), 0);
+        assert_eq!(demotion.spared(), 1);
+        assert!(demotion.streak.is_empty(), "a spared streak starts over");
+    }
+
+    /// A node with no successes at all (every native setup rescued) demotes
+    /// as before: the guard only ever holds a demotion back.
+    #[test]
+    fn a_node_that_never_succeeds_still_demotes_on_three_rescues() {
+        let now = Instant::now();
+        let (_, demoted) = streak_after(0, now);
+        assert!(demoted);
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
+        for i in 1..DEMOTION_FAILURES as u32 {
+            assert!(!demotion.record_failure(&key(i), now), "R=2 is no streak");
+        }
+        assert_eq!(demotion.spared(), 0, "two strikes is not a full streak");
+    }
+
+    /// After a spared streak, three more distinct rescues are needed and are
+    /// judged on the window's whole share, so a worsening node is demoted.
+    #[test]
+    fn a_node_whose_share_rises_after_a_spared_streak_is_demoted() {
+        let now = Instant::now();
+        let (mut demotion, _) = streak_after(8, now);
+        assert_eq!(demotion.spared(), 1);
+        for i in 10..12u32 {
+            assert!(!demotion.record_failure(&key(i), now));
+        }
+        // 5 rescues, 8 successes: 38%.
+        assert!(demotion.record_failure(&key(12), now));
+        assert!(demotion.is_demoted(now));
+    }
+
+    /// Outcomes older than the strike window are forgotten: 20 old successes
+    /// do not hold back a demotion for rescues a window later.
+    #[test]
+    fn outcomes_older_than_the_window_do_not_count_toward_the_share() {
+        let start = Instant::now();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
+        for _ in 0..20 {
+            demotion.record_success(start);
+        }
+        let later = start + STRIKE_WINDOW;
+        let mut demoted = false;
+        for i in 1..=DEMOTION_FAILURES as u32 {
+            demoted = demotion.record_failure(&key(i), later);
+        }
+        assert!(demoted);
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
+        for _ in 0..20 {
+            demotion.record_success(start);
+        }
+        let inside = start + STRIKE_WINDOW - Duration::from_secs(1);
+        for i in 1..=DEMOTION_FAILURES as u32 {
+            demotion.record_failure(&key(i), inside);
+        }
+        assert!(
+            !demotion.is_demoted(inside),
+            "20 successes one second short of the window still count"
+        );
+    }
+
+    /// The outcome ring is bounded and drops the oldest first.
+    #[test]
+    fn the_outcome_ring_is_bounded_and_drops_the_oldest() {
+        let now = Instant::now();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
+        demotion.record_failure(&key(1), now);
+        for _ in 0..DEMOTION_OUTCOME_RING * 3 {
+            demotion.record_success(now);
+        }
+        assert_eq!(demotion.outcomes.len(), DEMOTION_OUTCOME_RING);
+        assert!(
+            demotion.outcomes.iter().all(|(_, rescue)| !rescue),
+            "the oldest outcome, the rescue, was evicted"
+        );
+    }
+
+    /// Through the node state, both roles: a busy node whose rescues are a
+    /// small share is not demoted by a streak, and one whose rescues are most
+    /// of its outcomes still is. Counted per role.
+    #[test]
+    fn the_share_guard_applies_to_each_role_through_the_node_state() {
+        let on = up_state(100);
+        for _ in 0..12 {
+            on.record_success();
+            on.record_acceptor_success();
+        }
+        for i in 1..=DEMOTION_FAILURES as u32 {
+            assert!(!on.record_failure(&key(i)), "joiner share 3 of 15");
+        }
+        for i in 1..=ACCEPTOR_DEMOTION_FAILURES as u32 {
+            assert!(
+                !on.record_acceptor_failure(&key(i)),
+                "acceptor share 3 of 15"
+            );
+        }
+        assert_eq!(on.demotions(), 0);
+        assert_eq!(on.acceptor_demotions(), 0);
+        assert!(on.readiness().ready && on.acceptor_readiness().ready);
+        for i in 20..24u32 {
+            on.record_failure(&key(i));
+        }
+        assert_eq!(
+            on.demotions(),
+            1,
+            "6 of 18 outcomes are rescues: the joiner role demotes"
+        );
+        assert_eq!(on.acceptor_demotions(), 0, "the roles do not share a share");
     }
 
     /// After the cooldown a fresh streak is needed; failures during it are not
