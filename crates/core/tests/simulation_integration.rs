@@ -23839,8 +23839,10 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
 /// UDP-decided connects coexist in one mesh, and every node joins. The treated
 /// share is read from the sim: each native pair is two native dials
 /// (`established + failed`, one per side), against `joiner_decisions` decided
-/// joins. It is compared with the 100% bucket share loosely, since a pair that
-/// already holds a transport is decided UDP whatever its bucket.
+/// joins, which differs from the decision share: seeded, 33 of 45 decisions
+/// are native and the 12 UDP ones are pairs that already held a transport
+/// (`decision_causes`), while failed native dials each add to `treated`, so
+/// the read share is about 0.68 rather than 1.
 #[test_log::test]
 fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     const SEED: u64 = 0x0059_40A5_0010;
@@ -23853,6 +23855,34 @@ fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     println!("SHIPPED decided={decided} native_dials={native_dials} treated={treated}");
     assert!(decided >= 20, "premise: enough decisions to read a share");
     assert!(native_dials > 0, "some pairs decided native");
+    // Every acceptor decision has a counted cause. At 100 percent the slice
+    // is the whole bucket range, so a UDP decision is a pair that already
+    // held a transport (not in the slice), a refused setup, a demotion, or an
+    // endpoint not up; none may be unexplained.
+    let causes = t.decision_causes();
+    println!("SHIPPED decision causes: {causes:?}");
+    assert_eq!(
+        causes.get("unexplained").copied().unwrap_or(0),
+        0,
+        "every UDP decision has a counted cause: {causes:?}"
+    );
+    assert_eq!(
+        causes.get("outside_slice").copied().unwrap_or(0),
+        0,
+        "at 100 percent no bucket is outside the slice: {causes:?}"
+    );
+    let all = t.decisions();
+    assert_eq!(all.len() as u64, causes.values().sum::<u64>());
+    let held = causes.get("held").copied().unwrap_or(0);
+    assert_eq!(
+        all.iter().filter(|(_, _, _, in_slice)| !in_slice).count() as u64,
+        held,
+        "the only decisions outside the slice are pairs that held a transport: {causes:?}"
+    );
+    assert_eq!(
+        all.iter().filter(|(_, _, native, _)| *native).count() as u64,
+        causes.get("native").copied().unwrap_or(0)
+    );
     let share = treated / decided as f64;
     assert!(
         (0.5..=1.0).contains(&share),

@@ -529,7 +529,7 @@ Current wire-gated floors:
   A+ step 1 (0.2.164) sets `NATIVE_DIAL_READY` true and
   `QUIC_NATIVE_PERCENT` 25 and does not touch the floor. The floor release sets
   `QUIC_NATIVE_PERCENT` 100, `GATEWAY_NATIVE_JOIN_PERCENT` 100 and
-  `GATEWAY_NATIVE_ADMISSION` true, also without touching the wire floor. The
+  `GATEWAY_NATIVE_ADMISSION` true, also without touching the wire floor. Every gateway admits unknown-source native joins from release day, marked in the index or not. The operator emergency lever for a quinn or rustls advisory is `transport-quic = "off"` in that gateway's config (no QUIC endpoint is built; the gateway serves UDP as before); reversing the constants for everyone takes a release. The
   acceptor decides on `min(offered, own)`, so a reversal takes effect for a
   pair once either the acceptor or the joiner has updated; there is no
   runtime kill switch. Do not raise the floor again unless the V2 layout

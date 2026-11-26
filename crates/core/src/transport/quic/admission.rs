@@ -1,7 +1,12 @@
 //! Gateway admission of native joins from sources nobody named (#5940,
 //! phase B; A7b). **On** since the floor release: [`GATEWAY_NATIVE_ADMISSION`]
-//! is true, so a gateway admits native joins from unknown sources. There is no
-//! runtime kill switch; reversing it takes a release. Tests also turn it on
+//! is true, so every node that is a gateway (published in the index or not)
+//! admits native joins from unknown sources from release day. The index
+//! mark (`GatewayConfig::native`) only steers which gateways default joiners
+//! dial natively; no gateway reads its own mark. There is no switch in the
+//! binary; an operator turns it off on one gateway with `transport-quic =
+//! "off"`, which builds no QUIC endpoint, and reversing it for everyone takes
+//! a release. Tests also turn it on
 //! per endpoint ([`super::QuicEndpoint::enable_gateway_admission`]) or per
 //! listener ([`force_on_for_test`]).
 //!
@@ -69,8 +74,12 @@ use crate::transport::normalize_mapped_addr;
 ///   handshake failure and before a fatal exit, the `ProvenClientKey`
 ///   property tests, and the RustSec watch.
 ///
-/// A gateway still takes no native joiner until the gateway index marks it
-/// native; that mark is an operations step after the gateway runs this build.
+/// Every gateway admits from release day, whether or not the index marks it
+/// native: `enabled_at` reads only `is_gateway` and this constant. The mark
+/// (an operations step after a gateway runs this build) only steers which
+/// gateways default joiners dial natively. Accepted ordering: the unknown-source
+/// lane is exposed while UDP fallback still exists, rather than at the
+/// UDP-removal release, where it is mandatory.
 pub(crate) const GATEWAY_NATIVE_ADMISSION: bool = true;
 
 /// Whether a node in this role admits native joins from unknown sources: a
@@ -97,6 +106,10 @@ pub(crate) fn enabled_at(is_gateway: bool, bind_addr: SocketAddr) -> bool {
     }
     #[cfg(any(test, feature = "testing"))]
     if crate::transport::in_memory_socket::gateway_native_admission_forced_off(bind_addr) {
+        assert!(
+            !crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr),
+            "a simulation turned admission both on and off for {bind_addr}"
+        );
         return false;
     }
     let _ = bind_addr;

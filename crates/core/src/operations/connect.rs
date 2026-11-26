@@ -683,10 +683,16 @@ impl RelayState {
         // other than the slice, and a control pair at an acceptor with no room
         // leaves the control arm the same way.
         let mut admission = None;
+        #[cfg(any(test, feature = "testing"))]
+        let mut setup_refused = false;
         if decision == native::NativeDecision::Native {
             match ctx.admit_native_setup(&self.request.joiner) {
                 Ok(ticket) => admission = Some(ticket),
                 Err(_) => {
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        setup_refused = true;
+                    }
                     decision = native::NativeDecision::Udp;
                     arm = None;
                 }
@@ -706,6 +712,21 @@ impl RelayState {
                     own,
                     native: decision == native::NativeDecision::Native,
                     in_slice: !holds && bucket < offer.effective_percent(),
+                    cause: if decision == native::NativeDecision::Native {
+                        "native"
+                    } else if holds {
+                        "held"
+                    } else if readiness.demoted {
+                        "demoted"
+                    } else if !readiness.ready {
+                        "not_ready"
+                    } else if setup_refused {
+                        "setup_refused"
+                    } else if bucket >= offer.effective_percent().min(readiness.percent) {
+                        "outside_slice"
+                    } else {
+                        "unexplained"
+                    },
                 },
             );
         }

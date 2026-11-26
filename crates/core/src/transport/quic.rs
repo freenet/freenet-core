@@ -251,8 +251,8 @@ pub(crate) struct EndpointCore {
     /// (`budget`).
     buffer_budget: Arc<budget::QuicBudget>,
     /// Admission of native joins from sources nobody named, set on a gateway
-    /// by [`QuicEndpoint::enable_gateway_admission`] (dark: see
-    /// [`admission::GATEWAY_NATIVE_ADMISSION`]).
+    /// by [`QuicEndpoint::enable_gateway_admission`] (on for gateways since the
+    /// floor release: see [`admission::GATEWAY_NATIVE_ADMISSION`]).
     admission: Arc<OnceLock<GatewayAdmission>>,
     /// The node's QUIC path permits, which admitted joiners are charged
     /// against ([`QuicEndpoint::attach_joiner_cap`]). Until it is set, no

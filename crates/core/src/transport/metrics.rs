@@ -704,8 +704,9 @@ labelled_counters! {
     /// phase B), counted by the handshake driver. Kept apart from
     /// [`NativeSetupOutcome`]'s `connect_native_setup_<label>`, which the
     /// peer-to-peer comparison reads. Exported per period as
-    /// `gateway_native_join_<label>`. Zero until
-    /// `connect::native::GATEWAY_NATIVE_JOIN_PERCENT` is above 0.
+    /// `gateway_native_join_<label>`. Counts only joins to a gateway the
+    /// index marks native (`connect::native::GATEWAY_NATIVE_JOIN_PERCENT` is
+    /// 100); zero while no gateway is marked.
     pub(crate) enum GatewayNativeJoin {
         /// The native attempt gave a connection, after the Hello exchange.
         Established => "established",
@@ -767,8 +768,9 @@ labelled_counters! {
     /// What a gateway's admission of native joins from sources it was not
     /// told about did (`quic::admission`, #5940 A7b): per datagram from such
     /// a source, then per connection attempt, then per admitted connection.
-    /// Exported per period as `quic_gateway_admission_<label>`. Zero on every
-    /// node until admission is switched on (`admission::GATEWAY_NATIVE_ADMISSION`).
+    /// Exported per period as `quic_gateway_admission_<label>`. Zero on a
+    /// node that is not a gateway; on a gateway (admission is on, `admission::GATEWAY_NATIVE_ADMISSION`)
+    /// it counts every unknown source that sends QUIC datagrams, scanners included.
     pub(crate) enum GatewayAdmission {
         /// A datagram was queued for the endpoint.
         Queued => "queued",

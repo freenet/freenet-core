@@ -493,6 +493,7 @@ pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
     QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
     GATEWAY_NATIVE_ADMISSION.retain(|(owner, _)| owner != network);
+    GATEWAY_NATIVE_ADMISSION_OFF.retain(|(owner, _)| owner != network);
     GATEWAY_CLOSES_NATIVE_JOINS.retain(|(owner, _)| owner != network);
     #[cfg(test)]
     EGRESS_CAP_PROBES.retain(|(owner, _), _| owner != network);
@@ -1332,6 +1333,26 @@ impl Socket for SimulationSocket {
 mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
+
+    /// A simulation's forced-admission marks (on and off) are forgotten when
+    /// its network is torn down, so a later simulation of the same name and
+    /// address does not inherit them.
+    #[test]
+    fn admission_marks_do_not_outlive_their_network() {
+        let network = "admission-marks-teardown";
+        let addr: SocketAddr = "127.0.0.1:10201".parse().unwrap();
+        force_gateway_native_admission(network, addr);
+        force_gateway_native_admission_off(network, addr);
+        let key = (network.to_string(), addr);
+        assert!(GATEWAY_NATIVE_ADMISSION.contains(&key), "premise");
+        assert!(GATEWAY_NATIVE_ADMISSION_OFF.contains(&key), "premise");
+        clear_quic_endpoint_clocks(network);
+        assert!(!GATEWAY_NATIVE_ADMISSION.contains(&key));
+        assert!(
+            !GATEWAY_NATIVE_ADMISSION_OFF.contains(&key),
+            "a recreated simulation of the same name inherited the off mark"
+        );
+    }
 
     /// Delivery callbacks are scoped per network (#5673): installing one
     /// network's callback does not replace another's, and removing one (as

@@ -485,11 +485,11 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     }
 
     // Gateway admission of native joins from sources nobody named (#5940
-    // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
-    // every node until phase B (a test can turn it on for one listener), and
-    // with it off the only additions are an idle queue and its poll, one
-    // atomic load per datagram from a source not on the allow-set, and
-    // counters that stay 0.
+    // A7b), on the endpoint's clock. On for every gateway since the floor
+    // release (`admission::enabled_at`; a test can turn it off or on for one
+    // listener). On a non-gateway, or with admission off, the only additions
+    // are an idle queue and its poll, one atomic load per datagram from a
+    // source not on the allow-set, and counters that stay 0.
     admit_native_joins_if_on(
         quic_endpoint.as_ref(),
         is_gateway,
