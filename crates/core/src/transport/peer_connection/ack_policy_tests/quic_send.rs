@@ -363,6 +363,83 @@ fn a_full_queue_overflows_to_udp_and_nothing_is_lost() {
     );
 }
 
+/// [`a_full_queue_overflows_to_udp_and_nothing_is_lost`] with the build constant
+/// false (a child process, `breaker::run_with_no_udp_fallback`): an existing route
+/// has no UDP fallback, so what the queue cannot take is dropped and counted, and
+/// nothing goes on UDP and no overflow is counted.
+#[test]
+fn with_no_udp_fallback_a_full_queue_drops_what_it_cannot_take() {
+    if !crate::transport::quic::breaker::run_with_no_udp_fallback(
+        module_path!(),
+        "with_no_udp_fallback_a_full_queue_drops_what_it_cannot_take",
+    ) {
+        return;
+    }
+    run(
+        "quic-send-overflow-no-udp",
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let over = 5;
+            let total = SHORT_QUEUE_CAPACITY as u32 + over;
+            for i in 0..total {
+                rig.e.conn.send_serialized(message(i)).await.unwrap();
+            }
+            assert_eq!(rig.stats().send_event_count(E::ShortOverflowUdp), 0);
+            assert_eq!(
+                rig.stats().send_count(SendKind::Short, R::Dropped),
+                u64::from(over),
+                "each short past the queue is counted dropped"
+            );
+            let udp = rig.udp_data();
+            assert!(
+                udp.shorts.is_empty(),
+                "nothing went on UDP: {:?}",
+                udp.shorts
+            );
+            rig.path.settle(Duration::from_secs(2)).await;
+            assert_eq!(
+                sorted(rig.delivered_shorts()),
+                sorted(
+                    (0..SHORT_QUEUE_CAPACITY as u32)
+                        .map(message)
+                        .collect::<Vec<_>>()
+                ),
+                "the queue reached the peer, each once"
+            );
+        },
+    );
+}
+
+/// A message sent after the route's path ended finds the queue closed: with the
+/// build constant false it is dropped and counted, not sent on UDP (a child
+/// process, `breaker::run_with_no_udp_fallback`).
+#[test]
+fn with_no_udp_fallback_a_short_after_the_path_ended_is_dropped() {
+    if !crate::transport::quic::breaker::run_with_no_udp_fallback(
+        module_path!(),
+        "with_no_udp_fallback_a_short_after_the_path_ended_is_dropped",
+    ) {
+        return;
+    }
+    run(
+        "quic-send-closed-no-udp",
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            rig.route
+                .path()
+                .close(crate::transport::metrics::QuicCloseCode::Downgrade);
+            rig.path.settle(Duration::from_millis(50)).await;
+            assert!(
+                rig.worker.is_finished(),
+                "the worker ends once the path has"
+            );
+            rig.e.conn.send_serialized(message(1)).await.unwrap();
+            assert!(rig.udp_data().shorts.is_empty(), "nothing went on UDP");
+            assert_eq!(rig.stats().send_count(SendKind::Short, R::Dropped), 1);
+        },
+    );
+}
+
 /// A send on a route never waits in the connection's task, however stuck the path
 /// is: with every stream credit held, nothing of the queue can leave, so each
 /// message past its capacity would wait if the queue were awaited. The first poll

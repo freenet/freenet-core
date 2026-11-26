@@ -2145,7 +2145,11 @@ Path: QuicPathLimits::NATIVE (DEFAULT with udp_fallback off) and data
   ends by the stall close or the acknowledgement watch's dark rule. A peer
   refusing data (NOT_ACCEPTING_DATA) closes the native path at once
   (QuicPath::stop_sending_data); left open it would drop every later send.
-  Upgrade paths keep udp_fallback on and are unchanged.
+  Upgrade paths keep udp_fallback on and are unchanged, unless
+  breaker::UDP_FALLBACK is false (not yet: D-3, dark): QuicPathLimits::
+  effective_udp_fallback then turns it off for every path, which removes the
+  PATH-level fallback only. The connection still sends on its UDP session
+  when it has no route.
 Shorts: DataRoute::native, no UDP sender. queue_native_short refuses a full
   queue with TransportError::SendQueueFull (Transient: the connection
   survives, the message is counted quic_data_event_native_short_queue_full,

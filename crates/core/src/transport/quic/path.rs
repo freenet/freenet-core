@@ -409,6 +409,14 @@ impl QuicPathLimits {
         short_ack_wait: None,
     };
 
+    /// Whether a path built on these limits has a UDP session to fall back
+    /// to: the path's own flag ([`Self::udp_fallback`]) and the build constant
+    /// ([`super::breaker::UDP_FALLBACK`]). The only place a path reads the
+    /// constant, so the UDP-removal release flips every path with it (D-3).
+    pub(crate) fn effective_udp_fallback(&self) -> bool {
+        self.udp_fallback && super::breaker::udp_fallback()
+    }
+
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const SHADOW: Self = Self {
@@ -1141,7 +1149,7 @@ impl QuicPath {
                     rtt: receiver_rtt,
                     heard: heard.clone(),
                     carries_data: carries_data.clone(),
-                    udp_fallback: limits.udp_fallback,
+                    udp_fallback: limits.effective_udp_fallback(),
                     late_ends_close_native: limits.late_ends_close_native,
                     dark: dark.clone(),
                     long_dark_at: long_dark_at.clone(),
@@ -1171,7 +1179,7 @@ impl QuicPath {
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path,
                 ended_as_data_path,
-                udp_fallback: limits.udp_fallback,
+                udp_fallback: limits.effective_udp_fallback(),
                 stall: parking_lot::Mutex::new(stall),
                 dark,
                 long_dark_at,
@@ -1679,6 +1687,12 @@ impl QuicPath {
             }
             None => false,
         }
+    }
+
+    /// Whether a send this path cannot carry may go on a UDP session
+    /// ([`QuicPathLimits::effective_udp_fallback`], fixed when the path is built).
+    pub(in crate::transport) fn udp_fallback(&self) -> bool {
+        self.udp_fallback
     }
 
     /// Whether a new data send may start on this path.

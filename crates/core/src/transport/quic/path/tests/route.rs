@@ -864,3 +864,132 @@ fn retry_not_opened_decides_by_path_outcome_and_attempt() {
         );
     })
 }
+
+/// Every outcome that can end on UDP for some kind of send, with the step a
+/// path WITH a UDP session takes for a Short (also a LargeShort) and for a
+/// Stream (also a Pipe). Written out, not computed from `next_step`, so a change
+/// to the table or to what `settle` does with it shows here.
+fn udp_rows() -> Vec<(BoundedSend, NextStep, NextStep)> {
+    use NextStep::{GiveUp, SendOnUdp};
+    let not_opened = |n| BoundedSend::Failed(SendFailure::NotOpened(n));
+    vec![
+        (not_opened(NotOpened::TimedOut), SendOnUdp, SendOnUdp),
+        (not_opened(NotOpened::Paced), SendOnUdp, SendOnUdp),
+        (not_opened(NotOpened::NoCredit), SendOnUdp, SendOnUdp),
+        (
+            not_opened(NotOpened::ConnectionLost(lost())),
+            SendOnUdp,
+            SendOnUdp,
+        ),
+        (
+            error(QuicSendError::InvalidFrame(framing_error_for_tests())),
+            SendOnUdp,
+            SendOnUdp,
+        ),
+        (stopped(stop_code::NOT_ACCEPTING_DATA), SendOnUdp, SendOnUdp),
+        (
+            BoundedSend::Failed(SendFailure::TimedOut),
+            SendOnUdp,
+            GiveUp,
+        ),
+        (BoundedSend::Failed(SendFailure::Paced), SendOnUdp, GiveUp),
+        (
+            error(QuicSendError::ConnectionLost(lost())),
+            SendOnUdp,
+            GiveUp,
+        ),
+        (error(QuicSendError::Closed), SendOnUdp, GiveUp),
+        (stopped(stop_code::BUDGET_REFUSED), SendOnUdp, GiveUp),
+    ]
+}
+
+/// With the build constant at its shipped value an upgraded path is what it was
+/// before the constant: its sends go on UDP (the steps are written out in
+/// [`udp_rows`]), a quiet timeout makes it suspect, and nothing is retried on it
+/// (D-3, dark).
+#[test]
+fn an_upgraded_path_keeps_its_udp_fallback_while_the_constant_is_true() {
+    const { assert!(super::super::super::breaker::UDP_FALLBACK) };
+    assert!(QuicPathLimits::DEFAULT.effective_udp_fallback());
+    assert!(!QuicPathLimits::NATIVE.effective_udp_fallback());
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-route-constant-true", QuicPathLimits::DEFAULT).await;
+        let a = &p.a;
+        assert!(a.udp_fallback());
+        for (outcome, short, stream) in udp_rows() {
+            let path = paths("quic-route-constant-true-row", QuicPathLimits::DEFAULT).await;
+            for (kind, expected) in [
+                (SendKind::Short, short),
+                (SendKind::LargeShort, short),
+                (SendKind::Stream, stream),
+                (SendKind::Pipe, stream),
+            ] {
+                assert_eq!(
+                    path.a.settle(kind, &outcome, false, 0),
+                    expected,
+                    "{kind:?} {outcome:?}"
+                );
+            }
+        }
+        let no_credit = BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit));
+        assert!(!a.retry_not_opened(&no_credit, 0));
+        let built = p.time().now_nanos();
+        a.settle(SendKind::Short, &timeouts()[0], false, built + SECOND);
+        a.settle(SendKind::Short, &timeouts()[0], false, built + QUIET);
+        assert!(a.is_suspect());
+    });
+}
+
+/// With the build constant at `false` a path built on the default limits has no
+/// UDP fallback (the path level only; the connection keeps its UDP session):
+/// what would go on UDP is given up (the operation layer retries), counted
+/// dropped, a send that found no stream credit is tried again on the path, and a
+/// quiet timeout never makes it suspect, since there is nowhere to divert to.
+/// The test runs in a child process with the constant off
+/// (`breaker::run_with_no_udp_fallback`).
+#[test]
+fn with_no_udp_fallback_an_upgraded_path_gives_up_instead_of_going_on_udp() {
+    if !super::super::super::breaker::run_with_no_udp_fallback(
+        module_path!(),
+        "with_no_udp_fallback_an_upgraded_path_gives_up_instead_of_going_on_udp",
+    ) {
+        return;
+    }
+    assert!(!QuicPathLimits::DEFAULT.effective_udp_fallback());
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-route-constant-false", QuicPathLimits::DEFAULT).await;
+        let a = &p.a;
+        assert!(!a.udp_fallback());
+        for (outcome, _, _) in udp_rows() {
+            let path = paths("quic-route-constant-false-row", QuicPathLimits::DEFAULT).await;
+            for kind in [
+                SendKind::Short,
+                SendKind::LargeShort,
+                SendKind::Stream,
+                SendKind::Pipe,
+            ] {
+                assert_eq!(
+                    path.a.settle(kind, &outcome, false, 0),
+                    NextStep::GiveUp,
+                    "{kind:?} {outcome:?}"
+                );
+                assert_eq!(
+                    path.a.stats().send_count(kind, QuicSendResult::Dropped),
+                    1,
+                    "{kind:?} {outcome:?} is counted dropped"
+                );
+            }
+        }
+        let no_credit = BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit));
+        assert!(a.retry_not_opened(&no_credit, 0));
+        let built = p.time().now_nanos();
+        a.settle(SendKind::Short, &timeouts()[0], false, built + SECOND);
+        for i in 1..4 {
+            a.settle(SendKind::Short, &timeouts()[0], false, built + QUIET * i);
+        }
+        assert!(!a.is_suspect());
+        assert_eq!(a.stats().send_event_count(QuicSendEvent::SuspectEntered), 0);
+    });
+}

@@ -928,6 +928,62 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
     });
 }
 
+/// With the build constant at `false` the route of an upgraded path has no UDP
+/// to hand what it holds to: after the path ends, what is queued is dropped and
+/// counted, not sent on the session's UDP (`a_route_ends_with_its_path_and_what_it_holds_goes_on_udp`
+/// is the same run with the constant true).
+#[test]
+fn with_no_udp_fallback_what_a_route_holds_when_its_path_ends_is_dropped() {
+    use crate::transport::quic::control::caps;
+    use crate::transport::quic::path::{QuicSendResult, SendKind};
+    if !crate::transport::quic::breaker::run_with_no_udp_fallback(
+        module_path!(),
+        "with_no_udp_fallback_what_a_route_holds_when_its_path_ends_is_dropped",
+    ) {
+        return;
+    }
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server_with("quic-driver-route-no-udp", "prefer", Some("100")).await;
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let (_peer_path, _peer_inbound, inbox) =
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                let up = up.await;
+                time.sleep(Duration::from_secs(1)).await;
+                up
+            })
+            .await;
+        ready_ack(&session, attempt, caps::DATA);
+        let route = session.data_route().expect("both bits");
+        assert!(!route.path().udp_fallback());
+        let path = route.path_handle();
+        for i in 0..10u8 {
+            route.queue_short(vec![i]).expect("the queue has room");
+        }
+        session.end();
+        let time = h.pair.time.clone();
+        let udp = Arc::clone(&h.udp);
+        drive(&h.pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(1)).await;
+            drop(inbox);
+            assert!(
+                udp.shorts.lock().unwrap().is_empty(),
+                "nothing goes on UDP when there is no UDP fallback"
+            );
+            assert_eq!(
+                path.stats()
+                    .send_count(SendKind::Short, QuicSendResult::Dropped),
+                10,
+                "each held short is counted dropped"
+            );
+        })
+        .await;
+    });
+}
+
 /// A path with both data bits counts once in `quic_enabled_data_paths` and in the
 /// `quic_live_data_paths` gauge while its route lives, and a session that ends under it
 /// counts by the path's age. A shadow path counts none of them.
