@@ -4040,11 +4040,12 @@ impl SimNetwork {
             }
             config.connect_backoff_base = self.connect_backoff_base_override;
             // Pinned, like the QUIC mode and data share above: a default
-            // simulation decides no connect native, whatever this release's
+            // simulation connects every pair native, as a release does after
+            // D-8 (there is no UDP dial), whatever this release's
             // `QUIC_NATIVE_PERCENT` and `GATEWAY_NATIVE_JOIN_PERCENT` are. A test
-            // turns native on with `with_native_connect` / `with_native_gateway_join`.
-            config.native_connect_override = Some(0);
-            config.native_gateway_join_override = Some(0);
+            // changes it with `with_native_connect` / `with_native_gateway_join`.
+            config.native_connect_override = Some(100);
+            config.native_gateway_join_override = Some(100);
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -4158,9 +4159,9 @@ impl SimNetwork {
                 config.transient_budget = budget;
             }
             config.connect_backoff_base = self.connect_backoff_base_override;
-            // Pinned like the gateway site above: no native connect by default.
-            config.native_connect_override = Some(0);
-            config.native_gateway_join_override = Some(0);
+            // Pinned like the gateway site above: native everywhere by default.
+            config.native_connect_override = Some(100);
+            config.native_gateway_join_override = Some(100);
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -4168,6 +4169,10 @@ impl SimNetwork {
             } in &gateways
             {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
+            }
+            // The published index marks every gateway native (D-8).
+            for gateway in &mut config.gateways {
+                gateway.native = true;
             }
             // Use an explicit per-node port when the test requested specific
             // ring locations (see `new_with_node_locations`); otherwise the

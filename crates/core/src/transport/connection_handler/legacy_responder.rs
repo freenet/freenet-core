@@ -87,8 +87,9 @@ pub(super) fn build<T: TimeSource>(
 ) -> Option<LegacyResponder<T>> {
     match test_override {
         Some(version) => Some(LegacyResponder::with_reply_version(time_source, &version)),
-        None => (LEGACY_RESPONDER_ENABLED && !cfg!(any(test, feature = "testing")))
-            .then(|| LegacyResponder::new(time_source)),
+        None => {
+            (LEGACY_RESPONDER_ENABLED && !cfg!(test)).then(|| LegacyResponder::new(time_source))
+        }
     }
 }
 

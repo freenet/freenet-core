@@ -100,7 +100,7 @@ pub(crate) const UDP_DIAL: bool = false;
 /// [`UDP_DIAL`], or `true` in a test build (`cfg(test)` or the `testing`
 /// feature).
 pub(crate) fn udp_dial_enabled() -> bool {
-    UDP_DIAL || cfg!(any(test, feature = "testing"))
+    UDP_DIAL || cfg!(test)
 }
 
 /// Offer level: the joiner can set up a native connection, and also UDP.

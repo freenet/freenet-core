@@ -168,7 +168,7 @@ impl QuicMode {
     /// an error: a value a later release added must not stop an older binary
     /// (a crash-loop rollback reinstalls one) from starting.
     pub fn from_config_value(value: Option<&str>) -> Self {
-        Self::from_config_value_with(value, cfg!(any(test, feature = "testing")))
+        Self::from_config_value_with(value, cfg!(test))
     }
 
     /// [`Self::from_config_value`] with `honor_off` given. Since D-8 a release

@@ -79,12 +79,12 @@ pub(crate) const UPGRADE_NEGOTIATION: bool = false;
 
 /// [`UPGRADE_NEGOTIATION`], or `true` in a test build (`cfg(test)` or the `testing` feature).
 pub(crate) fn upgrade_negotiation_enabled() -> bool {
-    UPGRADE_NEGOTIATION || cfg!(any(test, feature = "testing"))
+    UPGRADE_NEGOTIATION || cfg!(test)
 }
 
 /// [`UPGRADE_DIAL`], or `true` in a test build (`cfg(test)` or the `testing` feature).
 pub(crate) fn upgrade_dial_enabled() -> bool {
-    UPGRADE_DIAL || cfg!(any(test, feature = "testing"))
+    UPGRADE_DIAL || cfg!(test)
 }
 
 /// The ALPN protocol of a native connection (#5940): one set up without a UDP
