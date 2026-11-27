@@ -215,6 +215,9 @@ pub(crate) mod quic;
 #[cfg(test)]
 pub(crate) mod test_net;
 
+#[cfg(test)]
+pub(crate) mod native_pair_testing;
+
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
 /// without real network I/O.

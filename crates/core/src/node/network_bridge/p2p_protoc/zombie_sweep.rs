@@ -904,7 +904,15 @@ impl P2pConnManager {
     /// it.
     ///
     /// Per-slice logging is at debug; the info-level summary is emitted once per
-    /// stats tick by [`ZombieSweepState::report`].
+    /// stats tick by [`ZombieSweepState::report`]. Each cap eviction also logs
+    /// one info line with the address, age and idle time.
+    ///
+    /// What the remote sees: dropping a QUIC-native transport ends its task,
+    /// which drops the connection and sends CONNECTION_CLOSE
+    /// (`NODE_DROPPED_PEER`), so the remote learns at once (pinned by
+    /// `zombie_sweep_reap_of_a_native_transport_closes_it_for_the_remote`). A
+    /// legacy UDP transport has no close message, so its remote learns only
+    /// from its own idle timeout; that path is being removed and gets none.
     ///
     /// Uses `drop_zombie_connection` (non-blocking `try_send`) rather than
     /// `drop_connection_by_addr` to avoid a circular deadlock with the handshake
