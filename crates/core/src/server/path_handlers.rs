@@ -2424,7 +2424,7 @@ fn shell_page(
     // __freenet_shell__ postMessage bridge (type: 'favicon').
     let favicon = format!(
         "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 640 471'>\
-         <path d='{}' fill='%23007FFF' fill-rule='evenodd'/></svg>",
+         <path d='{}' fill='%233a7bcb' fill-rule='evenodd'/></svg>",
         super::home_page::RABBIT_SVG_PATH,
     );
     // Per-user durable token plumbing (P2-frontend of #4381). In hosted mode
