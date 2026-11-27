@@ -17539,11 +17539,16 @@ fn test_summary_first_put_holder_found_ships_delta() {
     // gateway carries no gateway version, so `supports_summary_first_put` fails
     // closed and the whole summary-first block is skipped for node1's PUT —
     // only the gateway's PUT can move them.
+    // Exactly one no-holder send, node1's own seed PUT: connections are native
+    // (D-8, as in a release), and a native handshake always carries the peer's
+    // version, so node1 knows the gateway's version, `supports_summary_first_put`
+    // passes for its PUT, and nobody holds the contract yet. The gateway's PUT
+    // must take the holder-found branch: still no further no-holder send.
     assert_eq!(
-        new_contract_sends, 0,
-        "no-holder path must NOT fire: the gateway's PUT found a fresh \
-         holder (node1), so the summary-first probe must take the \
-         holder-found branch, never the no-holder fallback"
+        new_contract_sends, 1,
+        "only node1's own seed PUT may take the no-holder path: the gateway's \
+         PUT found a fresh holder (node1), so its summary-first probe must \
+         take the holder-found branch, never the no-holder fallback"
     );
     assert_eq!(
         delta_sends, 1,
@@ -17810,10 +17815,13 @@ fn test_summary_first_put_reverse_delta_converges_originator() {
     // The gateway's PUT found the fresh holder (node1), so it took the
     // holder-found branch (where the reverse leg lives), not the no-holder
     // fallback.
+    // One no-holder send is node1's own seed PUT (see the same assertion in
+    // `test_summary_first_put_holder_found_ships_delta`: native handshakes
+    // always carry the version).
     assert_eq!(
-        new_contract_sends, 0,
-        "no-holder path must NOT fire: the gateway's PUT found a fresh holder \
-         (node1)"
+        new_contract_sends, 1,
+        "only node1's seed PUT may take the no-holder path: the gateway's PUT \
+         found a fresh holder (node1)"
     );
     assert_eq!(
         delta_sends, 1,
