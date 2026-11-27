@@ -28,8 +28,9 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
 /// builder's cargo config, can exceed the node's compile size limit (a hosted
 /// node refuses delegate code over `MAX_MODULE_BYTES`: ~22 MB in CI against
 /// ~2 MB on a machine whose global config trims debug info). Tests that run a
-/// delegate on a HOSTED node, where that limit applies, use this so they do not
-/// depend on the builder's config.
+/// delegate on a HOSTED node, or any contract through the always-on coarse
+/// acceptance check, where that limit applies, use this so they do not depend
+/// on the builder's config.
 pub(crate) fn get_test_module_release(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     build_test_module(name, true)
 }
@@ -56,11 +57,26 @@ fn build_test_module(name: &str, release: bool) -> Result<Vec<u8>, Box<dyn std::
         .chain([WASM_TARGET])
         .chain(release.then_some("--release"))
         .collect::<Vec<_>>();
-    let mut child = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args(&cmd_args)
         .current_dir(&module_path)
-        .env("CARGO_TARGET_DIR", &target)
-        .spawn()?;
+        .env("CARGO_TARGET_DIR", &target);
+    if !release {
+        // A dev-profile module must not depend on the builder's debug-info
+        // setting: full debug info makes it ~20 MB, over the node's compile
+        // size limit, where a config that trims it gives ~2 MB. Tests that
+        // need unoptimised code (the metering loops) still get it; only the
+        // debug info is dropped. `--config` outranks every config file and
+        // env var, including a per-package `[profile.dev.package."*"]` entry.
+        command.args([
+            "--config",
+            "profile.dev.debug=0",
+            "--config",
+            "profile.dev.package.\"*\".debug=0",
+        ]);
+    }
+    let mut child = command.spawn()?;
     let status = child.wait()?;
     if !status.success() {
         return Err(format!(

@@ -1611,7 +1611,7 @@ pub(crate) async fn probe_fixture_contract(
 
     use crate::conformance::capture::{Observation, SamplingScope, TrackedContract, record};
 
-    let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+    let wasm = crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
     let code_hash = *blake3::hash(&wasm).as_bytes();
     let store_dir = crate::util::tests::get_temp_dir();
     std::fs::create_dir_all(store_dir.path())?;
@@ -3582,7 +3582,8 @@ mod tests {
         };
         use std::sync::Arc;
 
-        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let wasm =
+            crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
         let code_hash = *blake3::hash(&wasm).as_bytes();
         let store_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(store_dir.path())?;
@@ -3638,7 +3639,8 @@ mod tests {
         };
         use std::sync::Arc;
 
-        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let wasm =
+            crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
         let code_hash = *blake3::hash(&wasm).as_bytes();
         let store_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(store_dir.path())?;
@@ -3837,7 +3839,8 @@ mod tests {
         };
         use std::sync::Arc;
 
-        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let wasm =
+            crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
         let code_hash = *blake3::hash(&wasm).as_bytes();
         let store_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(store_dir.path())?;
@@ -3959,7 +3962,8 @@ mod tests {
         const LAST_WRITE_WINS: u8 = 1;
         const CONFORMING: u8 = 0;
 
-        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let wasm =
+            crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
         let code_hash = *blake3::hash(&wasm).as_bytes();
 
         // A real store, written the way the node writes it. Reading it back is the
@@ -4068,7 +4072,8 @@ mod tests {
         // Keep in sync with `tests/test-contract-conformance/src/lib.rs`.
         const PATH_DISAGREEMENT: u8 = 8;
 
-        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let wasm =
+            crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
         let code_hash = *blake3::hash(&wasm).as_bytes();
         let store_dir = crate::util::tests::get_temp_dir();
         std::fs::create_dir_all(store_dir.path())?;
@@ -4147,7 +4152,8 @@ mod tests {
         const CONFORMING: u8 = 0;
         const REQUIRES_RELATED: u8 = 7;
 
-        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let wasm =
+            crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
         let code_hash = *blake3::hash(&wasm).as_bytes();
 
         let store_dir = crate::util::tests::get_temp_dir();
