@@ -3111,13 +3111,9 @@ where
                 "PUT relay: overridden next hop returned PutMsg::Error; stored here, \
                  reporting success upstream"
             );
-            crate::operations::record_relay_route_event(
-                op_manager,
-                next_peer.clone(),
-                crate::ring::Location::from(&key),
-                crate::router::RouteOutcome::Failure,
-                crate::node::network_status::OpType::Put,
-            );
+            // No router label here: a downstream PutMsg::Error was never
+            // labelled before this arm existed (it propagated unlabelled), and
+            // adding one would bypass FREENET_ROUTING_LEGACY_LABELS.
             relay_put_finalize_local(
                 op_manager,
                 incoming_tx,
