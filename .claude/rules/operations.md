@@ -749,9 +749,10 @@ module doc.
 Do not hook it anywhere but `update_contract`'s `ClientLocal` +
 `state_changed` branch, and keep the escalation decision in the `Summaries`
 arm BEFORE `emit_stale_peer_syncs`: the force mark must exist when that heal's
-leg is built. In simulations the forced leg is spawned rather than awaited
-(`spawn_forced_leg`): the simulation sends heals inline on the event loop,
-and a stream leg awaits a completion signal that loop has to drive.
+leg is built. In simulations every full-state leg, a heal's or a forced one, is spawned
+rather than awaited (`spawn_leg`): a stream leg awaits a completion signal
+that the event loop has to drive, so awaiting it on the loop stalls the node
+until `STREAM_COMPLETION_TIMEOUT`.
 
 The INFO summary's per-contract lines are the top 8 by update activity, so a
 contract can fall into the "...and N others" rollup behind busier ones; the

@@ -1090,7 +1090,7 @@ pub mod test_switch {
 
 /// Whether this node holds or is sending a leg for (`key`, `peer`). Production
 /// asks the broadcast queue; the simulation, which has no queue, asks the
-/// spacing claim its inline sends hold.
+/// spacing claim its spawned sends hold.
 fn pair_busy(op_manager: &crate::node::OpManager, key: &ContractKey, peer: &PeerKey) -> bool {
     #[cfg(feature = "simulation_tests")]
     if op_manager.broadcast_spacing.is_in_flight(key.id(), peer) {

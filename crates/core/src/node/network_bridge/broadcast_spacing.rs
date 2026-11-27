@@ -263,6 +263,26 @@ mod tests {
     const SIM_SRC: &str = include_str!("p2p_protoc/broadcast.rs");
     const HANDLER_SRC: &str = include_str!("../../contract.rs");
 
+    /// The body of the block that `opener` (ending in its `{`) starts in `src`,
+    /// by brace matching, so a line moved out of the block is not in it.
+    fn spawned_block<'a>(src: &'a str, opener: &str) -> Option<&'a str> {
+        let start = src.find(opener)? + opener.len();
+        let mut depth = 1usize;
+        for (i, byte) in src.bytes().enumerate().skip(start) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[start..i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// #5842: BOTH fan-out paths apply the per-pair spacing. The simulation
     /// runs only its inline copy and the production binary only the queue, so
     /// a behavioural test of one says nothing about the other.
@@ -299,6 +319,16 @@ mod tests {
             );
         }
 
+        // The fan-out runs on the event loop too, so it must not await a send
+        // that waits for its stream's completion: it enqueues streams without
+        // a completion (`send_stream`) and hands forced legs to `spawn_leg`.
+        for awaited in ["broadcast_to_single_peer(", "send_stream_with_completion("] {
+            assert!(
+                !sim.contains(awaited),
+                "the simulation fan-out must not await `{awaited}` on the event loop"
+            );
+        }
+
         // The targeted heal shares the queue in production; the simulation
         // calls the send directly, so it must take the same claim.
         let heal = region(
@@ -308,9 +338,31 @@ mod tests {
         );
         assert!(
             heal.contains("op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)")
-                && heal.contains("Ok(_claim) =>"),
-            "the simulation heal path must apply the spacing and hold the claim \
-             across its send"
+                && heal.contains("Ok(claim) =>"),
+            "the simulation heal path must apply the spacing"
+        );
+        // The send runs in a spawned task, not on the event loop: it waits for
+        // its stream's completion, which only the event loop dispatches. So the
+        // heal hands its claim to `spawn_leg` and never calls the send itself
+        // (the production arm enqueues instead)...
+        assert!(
+            heal.contains("Self::spawn_leg("),
+            "the simulation heal must send through `spawn_leg`"
+        );
+        assert!(
+            !heal.contains("broadcast_to_single_peer("),
+            "the simulation heal must not await the send on the event loop"
+        );
+        // ...and the claim moves into that task and is bound there before the
+        // send, so it stays held until the send ends.
+        let leg = region(SIM_SRC, "    fn spawn_leg(", "\n    }\n");
+        let task = spawned_block(&leg, "GlobalExecutor::spawn(async move {")
+            .expect("`spawn_leg` sends from a spawned task");
+        let held = task.find("let _claim = claim;");
+        let sent = task.find("broadcast_to_single_peer(");
+        assert!(
+            matches!((held, sent), (Some(held), Some(sent)) if held < sent),
+            "the spawned leg must hold the claim across its send, both inside the task"
         );
     }
 

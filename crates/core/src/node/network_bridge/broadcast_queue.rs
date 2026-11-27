@@ -7625,7 +7625,7 @@ mod tests {
         let at = body
             .find(call)
             .expect("the heal handler resolves its peer here");
-        let first_send = [".enqueue(", "broadcast_to_single_peer("]
+        let first_send = [".enqueue(", "Self::spawn_leg(", "broadcast_to_single_peer("]
             .iter()
             .filter_map(|send| body.find(send))
             .min()
