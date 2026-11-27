@@ -1136,6 +1136,21 @@ impl P2pConnManager {
                 return Ok(());
             }
             if state.native_pending.contains(&peer_addr) {
+                // D-8: with no UDP there is no dial to start beside the native
+                // one. The requester waits for the native result instead: its
+                // success answers it (`OutboundEstablished`, native) and its
+                // failure fails it (`OutboundFailed`, native).
+                if !crate::transport::quic::breaker::udp_fallback() {
+                    tracing::info!(
+                        tx = %tx,
+                        remote = %peer_addr,
+                        "connect_peer: native dial pending and no UDP; waiting for its result"
+                    );
+                    state
+                        .udp_beside_native
+                        .insert(peer_addr, vec![(tx, callback)]);
+                    return Ok(());
+                }
                 tracing::info!(
                     tx = %tx,
                     remote = %peer_addr,
@@ -1825,6 +1840,12 @@ impl P2pConnManager {
                     ?error,
                     "Outbound connection failed"
                 );
+
+                // D-8: no UDP dial runs beside a native one, so its waiting
+                // requesters (queued in `connect_peer`) are failed with it.
+                if native && !crate::transport::quic::breaker::udp_fallback() {
+                    fail_udp_beside_native(state, peer_addr).await;
+                }
 
                 // A UDP dial beside this native one still holds the in-transit
                 // slot; it releases it when it ends.

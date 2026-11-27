@@ -651,6 +651,53 @@ impl ConnectForwardEstimator {
     }
 }
 impl RelayState {
+    /// D-8: with no UDP to fall back to, an acceptor with no native setup room
+    /// must not accept a joiner it would then have to decide `Udp` for (the
+    /// joiner's UDP dial cannot happen, so its connect would fail and the
+    /// joiner would report this acceptor as failed). It declines instead, so
+    /// the request goes on to another acceptor like any other refusal
+    /// (`should_accept` false). Only when the offer would be decided `Native`
+    /// and the setup would be refused; counted as an admission refusal.
+    /// Always `false` while UDP exists (`breaker::udp_fallback`), so the
+    /// current network sees today's behaviour.
+    fn native_setup_refuses_accept<C: RelayContext>(
+        &self,
+        ctx: &C,
+        own_key: &crate::transport::TransportPublicKey,
+    ) -> bool {
+        self.native_setup_refuses_accept_with(
+            !crate::transport::quic::breaker::udp_fallback(),
+            ctx,
+            own_key,
+        )
+    }
+
+    fn native_setup_refuses_accept_with<C: RelayContext>(
+        &self,
+        no_udp: bool,
+        ctx: &C,
+        own_key: &crate::transport::TransportPublicKey,
+    ) -> bool {
+        if !no_udp {
+            return false;
+        }
+        let Some(offer) = self.request.native_offer else {
+            return false;
+        };
+        let bucket = native::native_bucket(own_key, self.request.joiner.pub_key());
+        let holds = ctx.holds_transport_to(&self.request.joiner);
+        if native::decide_native(Some(offer), ctx.native_readiness(), bucket, holds)
+            != native::NativeDecision::Native
+        {
+            return false;
+        }
+        if ctx.native_setup_room(&self.request.joiner).is_ok() {
+            return false;
+        }
+        crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_admission_refused();
+        true
+    }
+
     /// The QUIC-native decision for the response this node is about to send
     /// as acceptor: `None` when the request carried no offer, else the
     /// acceptor's decision (`native::decide_native`), counted. Whether this
@@ -870,7 +917,12 @@ impl RelayState {
                             if let Ok(joiner_known) =
                                 KnownPeerKeyLocation::try_from(&self.request.joiner)
                             {
-                                if ctx.should_accept(&joiner_known) {
+                                if ctx.should_accept(&joiner_known)
+                                    && !self.native_setup_refuses_accept(
+                                        ctx,
+                                        ctx.self_location().pub_key(),
+                                    )
+                                {
                                     self.accepted_locally = true;
                                     let self_loc = ctx.self_location();
                                     let acceptor = PeerKeyLocation::with_unknown_addr(
@@ -928,6 +980,7 @@ impl RelayState {
             && !self.accepted_locally
             && self.forwarded_to.is_none()
             && joiner_known.as_ref().is_some_and(|j| ctx.should_accept(j))
+            && !self.native_setup_refuses_accept(ctx, ctx.self_location().pub_key())
         {
             self.accepted_locally = true;
             // Use unknown address for the acceptor - the acceptor doesn't know their own
@@ -4487,6 +4540,49 @@ mod tests {
             dropped_before + 1,
             "the drop is counted"
         );
+    }
+
+    /// D-8: with no UDP fallback (a child process: the value is process-wide),
+    /// an acceptor with no native setup room does not accept a joiner it would
+    /// have to decide `Udp` for; the request goes uphill to another acceptor,
+    /// exactly as when `should_accept` is false. With UDP (this process) it
+    /// still accepts and decides `Udp`, as before.
+    #[test]
+    fn with_no_udp_an_acceptor_without_setup_room_goes_uphill_instead_of_deciding_udp() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let other = make_peer(6000);
+        let offer = Some(native::NativeOffer::capable(100));
+        let ready = native::NativeReadiness {
+            ready: true,
+            percent: 100,
+        };
+        let full = TestRelayContext::new(self_loc)
+            .native(ready)
+            .admission(Err(native::SetupAdmissionRefusal::Full))
+            .uphill_hop(Some(other));
+        let mut state = native_relay_state(&joiner, offer);
+        let actions = state.handle_request(
+            &full,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        );
+        if !crate::transport::quic::breaker::run_with_no_udp_fallback(
+            module_path!(),
+            "with_no_udp_an_acceptor_without_setup_room_goes_uphill_instead_of_deciding_udp",
+        ) {
+            // UDP exists here: unchanged, accepted with a `Udp` decision.
+            let accept = actions.accept.expect("accepts while UDP exists");
+            assert_eq!(
+                accept.response.native_decision,
+                Some(native::NativeDecision::Udp)
+            );
+            return;
+        }
+        assert!(actions.accept.is_none(), "no accept without setup room");
+        assert!(actions.forward.is_some(), "the request goes on uphill");
     }
 
     /// The "already connected" input is read when this node accepts, not
