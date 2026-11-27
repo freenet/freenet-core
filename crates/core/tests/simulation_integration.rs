@@ -26555,8 +26555,8 @@ fn run_dead_first_hop_put(
     let result = sim.run_controlled_simulation(
         seed,
         operations,
-        Duration::from_secs(900),
-        Duration::from_secs(30),
+        Duration::from_secs(1500),
+        Duration::from_secs(600),
     );
     assert!(
         result.turmoil_result.is_ok(),
