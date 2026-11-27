@@ -8563,4 +8563,41 @@ pub(crate) mod tests {
         );
         assert!(!state.pending_op_results[&tx].is_closed());
     }
+
+    /// D-8: the dial for a message to an address with no transport is not a
+    /// UDP dial. A source scan (the arm cannot be driven on its own), failing
+    /// loudly if a landmark moves: the no-UDP branch for a non-gateway comes
+    /// before any dial, counts, prunes the ring entry and ends the arm; a
+    /// gateway is dialled natively; and the `ConnectPeer` it sends takes the
+    /// chosen transport, never a literal `DialTransport::Udp`.
+    #[test]
+    fn a_message_for_an_address_with_no_transport_never_dials_udp_at_d() {
+        let src = include_str!("p2p_protoc.rs");
+        let arm = src
+            .split("// No existing connection - need to establish one first.")
+            .nth(1)
+            .expect("the no-connection arm moved");
+        let arm = arm
+            .split("ConnEvent::Barrier")
+            .next()
+            .expect("the arm's end moved");
+        let guard = arm
+            .find("if no_udp && !is_gw {")
+            .expect("no-UDP guard moved");
+        let counted = arm
+            .find("record_ring_peer_no_transport_dropped()")
+            .expect("the drop is no longer counted");
+        let pruned = arm.find(".prune_connection(").expect("no ring prune");
+        let cont = arm[guard..]
+            .find("continue;")
+            .expect("guard does not end the arm")
+            + guard;
+        let dial = arm.find("NodeEvent::ConnectPeer {").expect("dial moved");
+        assert!(guard < counted && counted < pruned && pruned < cont && cont < dial);
+        assert!(arm.contains("DialTransport::native_now()"));
+        let connect_peer = &arm[dial..];
+        let connect_peer = &connect_peer[..connect_peer.find("})").expect("event end")];
+        assert!(connect_peer.contains("transport: dial_transport"));
+        assert!(!arm.contains("transport: crate::operations::connect::native::DialTransport::Udp"));
+    }
 }
