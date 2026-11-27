@@ -1591,22 +1591,6 @@ impl P2pConnManager {
                 if transport.is_native() {
                     state.native_pending.remove(&peer_addr);
                     let after_beside_udp = state.beside_udp_connected.remove(&peer_addr);
-                    let native_connect = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .native_connect();
-                    match origin {
-                        crate::transport::NatAttemptOrigin::ConnectJoiner => {
-                            native_connect.record_success();
-                        }
-                        crate::transport::NatAttemptOrigin::ConnectAcceptor => {
-                            native_connect.record_acceptor_success();
-                        }
-                        crate::transport::NatAttemptOrigin::Gateway
-                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => {}
-                    }
                     #[cfg(any(test, feature = "testing"))]
                     {
                         use crate::operations::connect::native_wire_trace::{
@@ -1722,31 +1706,6 @@ impl P2pConnManager {
                         &peer,
                         native_outcome.map_or("unknown", |outcome| outcome.label()),
                         origin,
-                    );
-                }
-                // A strike needs evidence that native specifically failed
-                // where UDP worked (a rescue, `native::DEMOTION_FAILURES`).
-                // Here: the setup failed on the path while a UDP connection to
-                // the same peer already exists (its UDP fallback, or the
-                // other side's, connected first; the setup then ends
-                // superseded below). The other rescue, the fallback
-                // connecting after this failure, is counted where that dial
-                // ends (`connect::record_native_rescue_strike` callers). A
-                // failure with no UDP connection is no strike: UDP may fail
-                // for the same reason (an incompatible pair, a peer that never
-                // dialled), which says nothing against native.
-                if native_outcome.is_some_and(|o| o.counts_toward_demotion())
-                    && peer
-                        .socket_addr()
-                        .and_then(|addr| self.connections.get(&addr))
-                        .is_some_and(|entry| {
-                            !entry.native && entry.pub_key().is_none_or(|key| key == peer.pub_key())
-                        })
-                {
-                    crate::operations::connect::record_native_rescue_strike(
-                        &self.bridge.op_manager,
-                        origin,
-                        &peer,
                     );
                 }
                 // Outbound peers must have known addresses - extract once for reuse
