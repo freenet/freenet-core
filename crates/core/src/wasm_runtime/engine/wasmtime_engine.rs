@@ -253,6 +253,63 @@ pub(crate) fn compile_module_in_pool(engine: &Engine, code: &[u8]) -> wasmtime::
     run_in_compile_pool(|| Module::new(engine, code))
 }
 
+/// The engine the compile worker process uses (see
+/// [`WasmtimeEngine::create_worker_engine`]). Named here so code outside this
+/// file does not name the backend crate.
+#[cfg(target_os = "linux")]
+pub(crate) type WorkerEngine = Engine;
+
+/// How compiling one module on a [`WorkerEngine`] ended. The texts are bounded.
+#[cfg(target_os = "linux")]
+pub(crate) enum WorkerCompile {
+    /// The module compiled.
+    Compiled,
+    /// The system ran out of memory while compiling.
+    OutOfMemory(String),
+    /// The module is not valid WebAssembly.
+    Invalid(String),
+    /// Compiling failed although the module validates.
+    Internal(String),
+}
+
+/// Whether `error` (or anything in its chain) says the system ran out of memory.
+#[cfg(target_os = "linux")]
+fn is_out_of_memory(error: &wasmtime::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io.raw_os_error() == Some(12) {
+                return true;
+            }
+        }
+        let text = cause.to_string();
+        text.contains("Cannot allocate memory")
+            || text.contains("out of memory")
+            || text.contains("memory allocation of")
+    })
+}
+
+/// Compile `code` on the shared compile pool and classify how it ended; the
+/// compiled module is dropped.
+#[cfg(target_os = "linux")]
+pub(crate) fn compile_and_classify(engine: &WorkerEngine, code: &[u8]) -> WorkerCompile {
+    use super::compile_limits::bounded_text;
+    match compile_module_in_pool(engine, code) {
+        Ok(module) => {
+            drop(module);
+            WorkerCompile::Compiled
+        }
+        Err(error) => {
+            if is_out_of_memory(&error) {
+                return WorkerCompile::OutOfMemory(bounded_text(&error));
+            }
+            match Module::validate(engine, code) {
+                Err(invalid) => WorkerCompile::Invalid(bounded_text(&invalid)),
+                Ok(()) => WorkerCompile::Internal(bounded_text(&error)),
+            }
+        }
+    }
+}
+
 /// Run `f` so that wasmtime's parallel compilation uses [`compile_pool`].
 fn run_in_compile_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     compile_pool().install(f)

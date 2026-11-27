@@ -8,14 +8,12 @@
 
 use std::io::{Read, Write};
 
-use wasmtime::Engine;
-
 use super::protocol::{
     self, Caps, FLAG_CONSUME_FUEL, Identity, PROTOCOL_VERSION, Response, Status,
 };
 use crate::wasm_runtime::engine::compile_limits::{self, CompileRefusal};
 use crate::wasm_runtime::engine::wasmtime_engine::{
-    WasmtimeEngine, compile_module_in_pool, engine_compat_id,
+    WasmtimeEngine, WorkerCompile, WorkerEngine, compile_and_classify, engine_compat_id,
 };
 
 /// First argument of the node binary that selects worker mode.
@@ -48,47 +46,22 @@ fn outcome(status: Status, reason: impl Into<String>) -> JobOutcome {
     }
 }
 
-/// Whether `error` (or anything in its chain) says the system ran out of memory.
-fn is_out_of_memory(error: &wasmtime::Error) -> bool {
-    error.chain().any(|cause| {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if io.raw_os_error() == Some(12) {
-                return true;
-            }
-        }
-        let text = cause.to_string();
-        text.contains("Cannot allocate memory")
-            || text.contains("out of memory")
-            || text.contains("memory allocation of")
-    })
-}
-
 /// The worker body: the node's scan, then the node's compile, on `engine`.
 /// Runs under whatever limits the process has; it applies none itself.
-pub(crate) fn judge_module(engine: &Engine, code: &[u8]) -> JobOutcome {
+pub(crate) fn judge_module(engine: &WorkerEngine, code: &[u8]) -> JobOutcome {
     if let Err(refusal) = compile_limits::check_input_size(code) {
         return outcome(Status::RefusedScan, refusal.to_string());
     }
     if let Err(refusal) = compile_limits::check_module(code) {
         return outcome(Status::RefusedScan, refusal.to_string());
     }
-    match compile_module_in_pool(engine, code) {
-        Ok(module) => {
-            drop(module);
-            outcome(Status::Ok, "")
+    match compile_and_classify(engine, code) {
+        WorkerCompile::Compiled => outcome(Status::Ok, ""),
+        WorkerCompile::OutOfMemory(text) => outcome(Status::OutOfMemory, text),
+        WorkerCompile::Invalid(text) => {
+            outcome(Status::Invalid, CompileRefusal::Malformed(text).to_string())
         }
-        Err(error) => {
-            if is_out_of_memory(&error) {
-                return outcome(Status::OutOfMemory, compile_limits::bounded_text(&error));
-            }
-            match wasmtime::Module::validate(engine, code) {
-                Err(invalid) => outcome(
-                    Status::Invalid,
-                    CompileRefusal::Malformed(compile_limits::bounded_text(&invalid)).to_string(),
-                ),
-                Ok(()) => outcome(Status::InternalError, compile_limits::bounded_text(&error)),
-            }
-        }
+        WorkerCompile::Internal(text) => outcome(Status::InternalError, text),
     }
 }
 

@@ -11,6 +11,10 @@
 //! is never shrunk when the node grows; new ones get less, or wait.
 
 use std::sync::{Arc, Condvar, Mutex};
+// The system clock is deliberate here, not `TimeSource`: `acquire` blocks a real
+// thread on a real `Condvar` with a real timeout, so its deadline must be the
+// clock that wait runs on. The reservation-wait cost is recorded by the caller
+// in `isolation.rs` through the node's `TimeSource`.
 use std::time::{Duration, Instant};
 
 use super::caps::{self, Policy};

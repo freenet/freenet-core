@@ -1,11 +1,12 @@
 //! The worker machinery of one node (Linux): the decision layer between the
 //! node's compile path and the worker process.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use super::CodeKind;
 use super::accepted::{AcceptedModules, Stamp};
@@ -17,6 +18,8 @@ use super::protocol::{self, Caps, FLAG_CONSUME_FUEL, Identity};
 use super::supervisor::{self, BusyReason, Launcher, Verdict};
 use super::worker;
 use crate::config::CompileIsolationMode;
+use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
 use crate::wasm_runtime::engine::WasmError;
 use crate::wasm_runtime::engine::compile_limits::{self, CompileRefusal};
 use crate::wasm_runtime::engine::compile_verdicts::CompileVerdictCache;
@@ -118,17 +121,6 @@ const DRY_RUN_MAX_INFLIGHT: usize = 1;
 /// How often the degraded state is logged at error level.
 const DEGRADED_LOG_EVERY: Duration = Duration::from_secs(60);
 
-struct Backoff {
-    failures: u32,
-    until: Instant,
-}
-
-#[derive(Default)]
-struct Breaker {
-    failures: u32,
-    until: Option<Instant>,
-}
-
 /// The worker machinery of one node.
 #[derive(Clone)]
 pub(crate) struct Isolation(Arc<Inner>);
@@ -145,8 +137,17 @@ struct Inner {
     identity: Identity,
     caps_digest: [u8; 16],
     metrics: Arc<CompileMetrics>,
-    backoff: Mutex<HashMap<[u8; 32], Backoff>>,
-    breaker: Mutex<Breaker>,
+    /// Every deadline below (back-off, breaker, log throttles, reservation and
+    /// stall timings) reads this clock, not the system clock directly. Only the
+    /// worker's wall limit and the memory wait, which time a real child process
+    /// and a real condition variable, use the system clock (see `supervisor.rs`
+    /// and `budget.rs`).
+    time: DynTimeSource,
+    /// Per-module back-off (60 s doubling to 30 min, with the jitter
+    /// `TrackedBackoff` applies), bounded to `BACKOFF_CAPACITY` modules.
+    backoff: Mutex<TrackedBackoff<[u8; 32]>>,
+    /// The global breaker: one unit key, 1 s doubling to 60 s with jitter.
+    breaker: Mutex<TrackedBackoff<()>>,
     dry_run_inflight: AtomicUsize,
     degraded_logged: Mutex<Option<Instant>>,
     headroom_logged: Mutex<Option<Instant>>,
@@ -164,7 +165,7 @@ pub(crate) struct Ticket {
     /// Set when the worker accepted the module: remembered once the node's own
     /// compile has also succeeded.
     worker_accepted: Option<([u8; 32], u32)>,
-    started: Instant,
+    started: Option<Instant>,
 }
 
 impl Ticket {
@@ -173,16 +174,18 @@ impl Ticket {
             iso: None,
             _reservation: None,
             worker_accepted: None,
-            started: Instant::now(),
+            started: None,
         }
     }
 
     /// The node's own compile has finished.
     pub(crate) fn finish(self, compiled: bool) {
         let Some(iso) = &self.iso else { return };
-        iso.metrics
-            .stall_ms
-            .record(self.started.elapsed().as_millis() as u64);
+        if let Some(started) = self.started {
+            iso.metrics
+                .stall_ms
+                .record(iso.time.now().duration_since(started).as_millis() as u64);
+        }
         if compiled {
             if let Some((hash, mib)) = self.worker_accepted {
                 if iso.accepted.insert(hash, mib) {
@@ -294,8 +297,15 @@ impl Isolation {
             },
             caps_digest: digest,
             metrics,
-            backoff: Mutex::new(HashMap::new()),
-            breaker: Mutex::new(Breaker::default()),
+            time: Arc::new(InstantTimeSrc::new()),
+            backoff: Mutex::new(TrackedBackoff::new(
+                ExponentialBackoff::new(BACKOFF_FIRST, BACKOFF_MAX),
+                BACKOFF_CAPACITY,
+            )),
+            breaker: Mutex::new(TrackedBackoff::new(
+                ExponentialBackoff::new(BREAKER_FIRST, BREAKER_MAX),
+                1,
+            )),
             dry_run_inflight: AtomicUsize::new(0),
             degraded_logged: Mutex::new(None),
             headroom_logged: Mutex::new(None),
@@ -371,8 +381,9 @@ impl Isolation {
             .degraded_logged
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if last.is_none_or(|t| t.elapsed() >= DEGRADED_LOG_EVERY) {
-            *last = Some(Instant::now());
+        let now = inner.time.now();
+        if last.is_none_or(|t| now.duration_since(t) >= DEGRADED_LOG_EVERY) {
+            *last = Some(now);
             tracing::error!(
                 mode = ?inner.mode,
                 "compile isolation is requested but cannot run on this node (the startup \
@@ -435,7 +446,7 @@ impl Isolation {
             self.note_degraded();
             return Ok(Ticket::none());
         }
-        let started = Instant::now();
+        let started = inner.time.now();
         inner.metrics.module_bytes.record(code.len() as u64);
         if inner.accepted.contains(input_hash) {
             inner.metrics.accepted_set_lookup(true);
@@ -479,7 +490,7 @@ impl Isolation {
             ));
         }
 
-        let wait_from = Instant::now();
+        let wait_from = inner.time.now();
         let reservation = match inner.budget.acquire_worker(self.max_wait()) {
             Ok(r) => r,
             Err(denied) => return Err(self.not_enough_memory(denied)),
@@ -497,7 +508,7 @@ impl Isolation {
         inner
             .metrics
             .gate_wait_ms
-            .record(wait_from.elapsed().as_millis() as u64);
+            .record(inner.time.now().duration_since(wait_from).as_millis() as u64);
 
         let caps = self.caps_for(&reservation);
         let memory_key = self.worker_key(input_hash, Some(caps.data_bytes));
@@ -511,7 +522,7 @@ impl Isolation {
                 iso: Some(inner.clone()),
                 _reservation: Some(reservation),
                 worker_accepted: Some((*input_hash, requirement_mib)),
-                started,
+                started: Some(started),
             }),
             Judged::Refused(refusal) => {
                 // Local log only: the module identity never goes to telemetry.
@@ -587,8 +598,9 @@ impl Isolation {
             .headroom_logged
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if last.is_none_or(|t| t.elapsed() >= DEGRADED_LOG_EVERY) {
-            *last = Some(Instant::now());
+        let now = inner.time.now();
+        if last.is_none_or(|t| now.duration_since(t) >= DEGRADED_LOG_EVERY) {
+            *last = Some(now);
             tracing::error!(
                 available,
                 floor = inner.policy.data_floor,
@@ -625,28 +637,23 @@ impl Isolation {
 
     fn breaker_open(&self) -> bool {
         let b = self.0.breaker.lock().unwrap_or_else(|e| e.into_inner());
-        b.until.is_some_and(|t| t > Instant::now())
+        b.is_in_backoff(&())
     }
 
     /// An environmental failure: no worker could give an answer about any module.
     /// Failures that arrive while the breaker is already open are the same event.
     fn breaker_trip(&self) {
-        let now = Instant::now();
         let mut b = self.0.breaker.lock().unwrap_or_else(|e| e.into_inner());
-        if b.until.is_some_and(|t| t > now) {
+        if b.is_in_backoff(&()) {
             return;
         }
-        b.failures = b.failures.saturating_add(1);
-        let delay = BREAKER_FIRST
-            .saturating_mul(1u32 << (b.failures - 1).min(10))
-            .min(BREAKER_MAX);
-        b.until = Some(now + delay);
+        b.record_failure(());
     }
 
     /// A worker answered about a module: the machinery works.
     fn breaker_close(&self) {
         let mut b = self.0.breaker.lock().unwrap_or_else(|e| e.into_inner());
-        *b = Breaker::default();
+        b.record_success(&());
     }
 
     /// The memory an in-process compile of an accepted module reserves: what was
@@ -677,7 +684,7 @@ impl Isolation {
                     iso: Some(inner.clone()),
                     _reservation: Some(r),
                     worker_accepted: None,
-                    started,
+                    started: Some(started),
                 })
             }
             Err(denied) => Err(self.not_enough_memory(denied)),
@@ -823,7 +830,7 @@ impl Isolation {
             .name("compile-worker-dry-run".into())
             .spawn(move || {
                 let caps = this.caps_for(&reservation);
-                let started = Instant::now();
+                let started = this.0.time.now();
                 let judged = this.judge(&input_hash, &code, &caps);
                 let inner = &this.0;
                 match judged {
@@ -852,7 +859,7 @@ impl Isolation {
                 inner
                     .metrics
                     .stall_ms
-                    .record(started.elapsed().as_millis() as u64);
+                    .record(inner.time.now().duration_since(started).as_millis() as u64);
                 drop(reservation);
                 inner.dry_run_inflight.fetch_sub(1, Ordering::AcqRel);
             });
@@ -864,35 +871,15 @@ impl Isolation {
     }
 
     fn note_backoff(&self, hash: [u8; 32]) {
-        let now = Instant::now();
         let mut map = self.0.backoff.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= BACKOFF_CAPACITY && !map.contains_key(&hash) {
-            map.retain(|_, b| b.until > now);
-            if map.len() >= BACKOFF_CAPACITY {
-                // Still full of live entries: drop the one that ends soonest.
-                if let Some(oldest) = map.iter().min_by_key(|(_, b)| b.until).map(|(k, _)| *k) {
-                    map.remove(&oldest);
-                }
-            }
-        }
-        let entry = map.entry(hash).or_insert(Backoff {
-            failures: 0,
-            until: now,
-        });
         // A module that has been quiet for a whole maximum back-off starts over.
-        if now > entry.until + BACKOFF_MAX {
-            entry.failures = 0;
-        }
-        entry.failures = entry.failures.saturating_add(1);
-        let delay = BACKOFF_FIRST
-            .saturating_mul(1u32 << (entry.failures - 1).min(10))
-            .min(BACKOFF_MAX);
-        entry.until = now + delay;
+        map.cleanup_expired();
+        map.record_failure(hash);
     }
 
     fn in_backoff(&self, hash: &[u8; 32]) -> bool {
         let map = self.0.backoff.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(hash).is_some_and(|b| b.until > Instant::now())
+        map.is_in_backoff(hash)
     }
 
     fn clear_backoff(&self, hash: &[u8; 32]) {
@@ -900,7 +887,7 @@ impl Isolation {
             .backoff
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(hash);
+            .record_success(hash);
     }
 
     #[cfg(test)]
@@ -949,8 +936,7 @@ impl Isolation {
     #[cfg(test)]
     pub(crate) fn backoff_left_for_tests(&self, hash: &[u8; 32]) -> Option<Duration> {
         let map = self.0.backoff.lock().unwrap_or_else(|e| e.into_inner());
-        map.get(hash)
-            .map(|b| b.until.saturating_duration_since(Instant::now()))
+        map.remaining_backoff(hash)
     }
 
     #[cfg(test)]
@@ -1048,13 +1034,20 @@ mod breaker_tests {
 
     fn left(i: &Isolation) -> Duration {
         let b = i.0.breaker.lock().unwrap();
-        b.until.map_or(Duration::ZERO, |t| {
-            t.saturating_duration_since(Instant::now())
-        })
+        b.remaining_backoff(&()).unwrap_or(Duration::ZERO)
     }
 
     fn expire(i: &Isolation) {
-        i.0.breaker.lock().unwrap().until = Some(Instant::now());
+        i.0.breaker
+            .lock()
+            .unwrap()
+            .set_retry_after(&(), Instant::now());
+    }
+
+    /// `left` is within the +-20% jitter of `nominal` (less a little for the
+    /// time the test itself took).
+    fn within_jitter(left: Duration, nominal: Duration) -> bool {
+        left <= nominal.mul_f64(1.2) && left + Duration::from_millis(500) >= nominal.mul_f64(0.8)
     }
 
     #[test]
@@ -1063,28 +1056,25 @@ mod breaker_tests {
         assert!(!i.breaker_open());
         i.breaker_trip();
         assert!(i.breaker_open());
-        assert!(left(&i) <= Duration::from_secs(1));
+        assert!(within_jitter(left(&i), Duration::from_secs(1)));
         // The same event reported by a second in-flight worker does not double it.
         i.breaker_trip();
-        assert_eq!(i.0.breaker.lock().unwrap().failures, 1);
+        assert_eq!(i.0.breaker.lock().unwrap().failure_count(&()), 1);
         let mut want = 2;
         for _ in 0..9 {
             expire(&i);
             i.breaker_trip();
             let l = left(&i);
             let want_d = Duration::from_secs(want.min(60));
-            assert!(
-                l <= want_d && l + Duration::from_millis(500) >= want_d,
-                "{l:?} {want_d:?}"
-            );
+            assert!(within_jitter(l, want_d), "{l:?} {want_d:?}");
             want *= 2;
         }
-        assert!(left(&i) > Duration::from_secs(59));
+        assert!(left(&i) > Duration::from_secs(47), "capped near a minute");
         i.breaker_close();
         assert!(!i.breaker_open());
         i.breaker_trip();
         assert!(
-            left(&i) <= Duration::from_secs(1),
+            within_jitter(left(&i), Duration::from_secs(1)),
             "starts again at one second"
         );
     }

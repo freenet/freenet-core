@@ -470,16 +470,20 @@ mod process {
         let (i, _) = iso(CompileIsolationMode::Enforce, false, None);
         let h = [7u8; 32];
         let mut last = Duration::ZERO;
-        for _ in 0..12 {
+        for n in 1..=12u32 {
             i.note_failure_for_tests(h);
             let left = i.backoff_left_for_tests(&h).expect("in back-off");
+            // 60 s doubling to 30 min, with the +-20% jitter of the shared tracker.
+            let nominal = Duration::from_secs(60 * (1u64 << (n - 1).min(10)))
+                .min(Duration::from_secs(30 * 60));
             assert!(
-                left >= last.min(Duration::from_secs(29 * 60)),
-                "{left:?} {last:?}"
+                left <= nominal.mul_f64(1.2)
+                    && left + Duration::from_secs(5) >= nominal.mul_f64(0.8),
+                "failure {n}: {left:?} vs {nominal:?}"
             );
             last = left;
         }
-        assert!(last > Duration::from_secs(29 * 60) && last <= Duration::from_secs(30 * 60));
+        assert!(last > Duration::from_secs(23 * 60) && last <= Duration::from_secs(36 * 60));
         for n in 0..2_000u32 {
             let mut k = [0u8; 32];
             k[..4].copy_from_slice(&n.to_le_bytes());
@@ -804,7 +808,7 @@ mod process {
         assert!(matches!(again, WasmError::Compile(_)));
         // The node's memory falls and the breaker's first second passes.
         rss.store(0, std::sync::atomic::Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(1_200));
+        std::thread::sleep(Duration::from_millis(1_500));
         i.admit(&hash(&code), &code, CodeKind::Contract, &v)
             .expect("granted once there is headroom")
             .finish(true);

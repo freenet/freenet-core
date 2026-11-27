@@ -155,6 +155,9 @@ pub(crate) fn read_request_header(r: &mut impl Read) -> Result<RequestHeader, Pr
     if b[0..4] != MAGIC {
         return Err(ProtocolError::BadMagic);
     }
+    // The `try_into().expect(..)` calls below convert a slice with constant
+    // bounds into an array of that same width, from a buffer whose length is the
+    // fixed header size read just above, so they cannot fail.
     let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
     let version = u16::from_le_bytes([b[4], b[5]]);
     let mut build_id = [0u8; 16];
@@ -225,6 +228,8 @@ pub(crate) fn read_response(r: &mut impl Read) -> Result<Response, ProtocolError
         return Err(ProtocolError::BadVersion(version));
     }
     let status = Status::from_u8(h[6]).ok_or(ProtocolError::BadStatus(h[6]))?;
+    // Fixed-width slices of the fixed-size response header read above: the
+    // conversions to arrays cannot fail.
     let vm_hwm_kib = u64::from_le_bytes(h[7..15].try_into().expect("8 bytes"));
     let cpu_ms = u64::from_le_bytes(h[15..23].try_into().expect("8 bytes"));
     let reason_len = u16::from_le_bytes([h[23], h[24]]) as usize;

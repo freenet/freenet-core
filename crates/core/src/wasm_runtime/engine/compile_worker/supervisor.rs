@@ -6,6 +6,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
+// The system clock is deliberate here, not `TimeSource`: these instants time a
+// real child process (its wall limit and exit grace), which no simulated clock
+// can advance. The breaker and back-off deadlines use the node's `TimeSource`
+// (see `isolation.rs`).
 use std::time::{Duration, Instant};
 
 use super::protocol::{self, Caps, Identity, Response, Status};
@@ -208,7 +212,14 @@ struct SpawnRequest {
 }
 
 /// Every worker is started from this one thread, which lives as long as the
-/// process. The worker's parent-death signal (`PR_SET_PDEATHSIG`) fires when the
+/// process. This thread is deliberately not registered with a task monitor:
+/// nothing restarts it, and nothing observes it dying. If it ever dies, the next
+/// `spawn_child` call returns `SpawnFailed("the spawner thread is gone")`; the
+/// caller counts a spawn failure and opens the global breaker (1 s doubling to
+/// 60 s), so modules not yet accepted are refused with a transient error while
+/// enforcing (and skipped in dry-run), and no code is accepted unchecked. Modules
+/// already accepted keep compiling in the node's process. The failure is visible
+/// in the spawn-failure counter and in an error log on every attempt. The worker's parent-death signal (`PR_SET_PDEATHSIG`) fires when the
 /// THREAD that started it exits, not the process, so a worker started from a
 /// compile thread (a blocking-pool thread that the runtime retires) would be
 /// killed mid-module the moment that thread went away.
@@ -291,6 +302,9 @@ pub(crate) fn run_worker_once(
     let mut reaper = Reaper { pid, reaped: false };
 
     let header = protocol::encode_request_header(identity, caps, code.len());
+    // Infallible: `Launcher::command` sets all three stdio handles to
+    // `Stdio::piped()` before the child is spawned, so each `take()` returns
+    // `Some` the first (and only) time.
     let mut stdin = child.stdin.take().expect("piped");
     let mut stdout = child.stdout.take().expect("piped");
     let mut stderr = child.stderr.take().expect("piped");
