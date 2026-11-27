@@ -177,6 +177,34 @@ pub fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         }
     };
 
+    // Contract-compile isolation was requested but is not running: the node
+    // compiles contract code without its hard limits. Said on the page so it is
+    // not found only in a log.
+    let health_banner = if snap.compile_isolation_degraded {
+        format!(
+            r#"{health_banner}<div class="health-banner health-degraded">
+                    <span class="health-icon">&#x26A0;</span>
+                    <span>Compile isolation is requested but not running on this node (see the log); contract code is compiled without its CPU and memory limits</span>
+                </div>"#,
+        )
+    } else {
+        health_banner
+    };
+
+    // Isolation is running, but too little memory is left under the service limit
+    // to start a checking worker: new contract code is refused for now (nothing is
+    // compiled unchecked) and the next compile with headroom clears this.
+    let health_banner = if snap.compile_isolation_refusing_for_memory {
+        format!(
+            r#"{health_banner}<div class="health-banner health-degraded">
+                    <span class="health-icon">&#x26A0;</span>
+                    <span>Compile isolation is running, but this node is short of memory under its service limit: new contract code is being refused for now and can be retried later</span>
+                </div>"#,
+        )
+    } else {
+        health_banner
+    };
+
     let get_success = build_get_success_line(snap);
 
     // External address info (shown once discovered via NAT traversal)

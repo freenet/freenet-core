@@ -6,6 +6,7 @@ pub(crate) mod delegate_interest;
 mod delegate_store;
 pub(crate) mod delegate_subscriptions;
 pub(crate) mod engine;
+pub use engine::compile_worker::metrics::CompileTelemetry;
 mod error;
 mod guest_mem;
 pub(crate) mod mock_state_storage;
@@ -30,7 +31,8 @@ mod state_store;
 pub(crate) mod tests;
 
 pub(crate) use contract::{
-    ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_result,
+    ContractRuntimeBridge, ContractRuntimeInterface, ContractStoreBridge, classify_compile_result,
+    classify_result,
 };
 pub use contract_store::{ContractStore, SharedCodeCache, SharedContractIndex};
 #[cfg(test)]

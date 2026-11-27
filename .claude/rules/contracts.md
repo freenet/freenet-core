@@ -21,6 +21,69 @@ Engine type alias    → engine.rs          (selected by feature flag)
 **All `wasmtime::` imports MUST stay in `engine/wasmtime_engine.rs`.**
 Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
+### Compiling code (`engine/compile_limits.rs`, `engine/compile_verdicts.rs`)
+
+An acceptance rule applies before any compile of contract code, and of delegate
+code on hosted nodes only (`Isolation::coarse_check_applies`; other delegates are
+installed by the node's own client and are not checked). `compile_coalesced` takes binary
+input only (text format is refused as not binary before any conversion), then
+`compile_limits::check_module` validates the module with a `wasmparser` walk that
+also counts size, functions, locals, control frames and their nesting (an
+operator that splits code-generation blocks, such as `table.get` or
+`call_indirect`, counts as a frame), branch edges, `br_table` targets,
+block-type arity, operand stack height, types, element entries, table entries,
+data segments, and operators, and refuses the module as soon as one counter
+passes its limit.
+
+Operators are weighted by class: a short list of simple operators (constants,
+locals, integer and float arithmetic, comparisons, conversions that cannot trap)
+weighs 1; loads, stores, calls, globals, division, trapping float-to-integer
+conversion and every SIMD operator weigh 96; every other operator, including any
+a later `wasmparser` adds, weighs 2048. The default is the heavy weight, so do
+not "fix" a refusal by adding an operator to a lighter list without measuring it
+(see `operators_have_the_weight_of_their_class`, and `OPERATOR_MODEL_VERSION`,
+which is part of the limits fingerprint). The weighted count is bounded per
+function and per module, and so are its products with frames and with locals.
+
+The scan's `wasmparser` is pinned to the version wasmtime compiles with
+(`scan_and_engine_use_one_wasmparser`). Compiles run on a pool of at most 4
+threads (`compile_threads`), and at most `compile_concurrency()` compiles (a
+quarter of the cores, 1 to 4) run at once.
+
+The limits are a network-wide acceptance rule, not a tuning knob: each sits at
+least 2x above the largest value over deployed modules
+(`engine/reference_shapes.json`, checked by
+`reference_module_shapes_stay_inside_every_limit`), and most at 4x. The numeric
+value of every limit is pinned by `every_limit_has_its_recorded_value`, so a
+node on a build with other limits accepts other code, and a contract already
+hosted can become refused after an upgrade. Raising or lowering one is a
+rolling-upgrade event.
+
+A refusal is remembered per shared backend engine by `CompileVerdictCache` (keyed
+by the code hash, 24 h, time from the node's `TimeSource`, text cut to
+`MAX_DIAGNOSTIC_BYTES`), so repeated requests for the same bytes are answered
+without scanning. Only refusals are remembered: a compile failure that is not a
+property of the bytes is reported (`WasmError::Compile`), never cached, and never
+classified as a bad module. Compile sites call `classify_compile_result`, which
+maps a refusal to the permanent `ContractExecError::InvalidModule`. Nothing yet
+acts on that class: a hosted contract that is refused after an upgrade keeps
+failing its operations (answered from the cache) until demand-ordered eviction
+drops it; a code-validity eviction trigger would be a new hosting mechanism and
+needs its own design against `hosting-invariants.md`.
+
+Compilation is a separate path from the guest calls below: it runs on the
+contract-handling path (a cache miss in `prepare_contract_call` or
+`prepare_delegate_call`; the offload to a blocking thread does not free that
+path, which waits for the result) and is not covered by the guest wall-clock
+backstop. The limits above apply to contract code on every node and to delegate
+code on hosted nodes only (other delegates are not checked). They are a coarse pre-filter and not a cost bound. With
+`compile-isolation` on, a hard-capped worker process (CPU time, memory and wall
+time limits) judges each module before the node compiles it, and that is what
+bounds a module the pre-filter lets through (`compile_worker/caps.rs`).
+
+Adding a limit means adding its field to `ModuleShape`, a case to `limit_cases()`
+and a new entry in `engine/reference_shapes.json` for each reference module.
+
 ### Delegate contract access (`wasm_runtime/native_api.rs`, `delegate_api.rs`)
 
 ```

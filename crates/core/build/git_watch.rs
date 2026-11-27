@@ -456,6 +456,10 @@ mod tests {
             // netcheck's getter spawn, read only by the `tracing::tracer`
             // tests that pin the log env var names it sets.
             "crates/netcheck/src/ephemeral.rs",
+            // A real built contract, read only by the
+            // `wasm_runtime::engine::{compile_limits, wasmtime_engine}` tests that
+            // check the compile limits do not refuse modules shipped in this tree.
+            "crates/fdev/resources/website_contract.wasm",
         ];
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = manifest_dir.join("src").canonicalize().unwrap();

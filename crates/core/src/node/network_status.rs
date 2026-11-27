@@ -354,6 +354,36 @@ pub(crate) fn auto_update_state() -> Option<serde_json::Value> {
     AUTO_UPDATE_STATE.read().clone()
 }
 
+/// Set when the node was asked to bound contract compiles with a worker process
+/// but cannot (the startup probe failed): it compiles unchecked, and the status
+/// page and telemetry say so.
+static COMPILE_ISOLATION_DEGRADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn set_compile_isolation_degraded(degraded: bool) {
+    COMPILE_ISOLATION_DEGRADED.store(degraded, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn compile_isolation_degraded() -> bool {
+    COMPILE_ISOLATION_DEGRADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set while compile isolation is running but compiles are being refused
+/// transiently for want of memory headroom under the service limit. Distinct from
+/// [`COMPILE_ISOLATION_DEGRADED`]: nothing is compiled unchecked.
+static COMPILE_ISOLATION_REFUSING_FOR_MEMORY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+pub(crate) fn set_compile_isolation_refusing_for_memory(refusing: bool) {
+    COMPILE_ISOLATION_REFUSING_FOR_MEMORY.store(refusing, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn compile_isolation_refusing_for_memory() -> bool {
+    COMPILE_ISOLATION_REFUSING_FOR_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static RING_STATS_PROVIDER: parking_lot::RwLock<Option<RingStatsProvider>> =
     parking_lot::RwLock::new(None);
 
@@ -2198,6 +2228,12 @@ pub struct NetworkStatusSnapshot {
     /// orders. Drives the "Demand-driven eviction" card. Read from the
     /// canonical hosting cache via the provider closure — no mirrored counter.
     pub hosting: HostingSnapshot,
+    /// Contract-compile isolation was requested but is not running (the startup
+    /// probe failed); contract code is compiled without the worker's limits.
+    pub compile_isolation_degraded: bool,
+    /// Compile isolation is running, but compiles are being refused transiently
+    /// because too little memory is left under the service limit.
+    pub compile_isolation_refusing_for_memory: bool,
 }
 
 /// Snapshot of the contract ban list for the dashboard (#4302).
@@ -2841,6 +2877,8 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         governance,
         ban_list,
         hosting,
+        compile_isolation_degraded: compile_isolation_degraded(),
+        compile_isolation_refusing_for_memory: compile_isolation_refusing_for_memory(),
         // Read straight from the queue's gauge — no provider registration and
         // no mirrored counter to keep in sync (#4917).
         fair_queue: crate::contract::fair_queue_stats(),

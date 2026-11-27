@@ -117,6 +117,11 @@ pub fn mark_process_start() {
     node::network_status::mark_process_start();
 }
 
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use wasm_runtime::engine::compile_worker::production_worker_accepts_for_tests;
+pub use wasm_runtime::engine::compile_worker::run_compile_worker_if_requested;
+
 /// Exports to build a running local node.
 pub mod local_node {
     use super::*;

@@ -2187,6 +2187,7 @@ impl Ring {
             snapshot.delegate_module_cache_total_bytes = Some(mc.delegate_total_bytes);
             snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
             snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
+            snapshot.compile = Some(ring.module_cache_metrics.compile().snapshot().telemetry());
 
             // Capability-relative hosting-budget gauges (#4642 A2): the
             // RAM-scaled budget, its current occupancy (occupancy/utilization

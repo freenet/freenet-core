@@ -475,7 +475,7 @@ mod tests {
         "#;
 
         let engine = Engine::default();
-        let module = Module::new(&engine, wat).unwrap();
+        let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
         let mut store = Store::new(&engine, ());
         let mut linker = Linker::new(&engine);
 
@@ -515,7 +515,7 @@ mod tests {
         "#;
 
         let engine = Engine::default();
-        let module = Module::new(&engine, wat).unwrap();
+        let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
         let mut store = Store::new(&engine, ());
         let mut linker = Linker::new(&engine);
 
@@ -554,7 +554,7 @@ mod tests {
         "#;
 
         let engine = Engine::default();
-        let module = Module::new(&engine, wat).unwrap();
+        let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
         let mut store = Store::new(&engine, ());
         let mut linker = Linker::new(&engine);
 

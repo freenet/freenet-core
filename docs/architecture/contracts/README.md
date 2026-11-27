@@ -49,9 +49,10 @@ The backend is designed for executing untrusted WASM code:
 Cranelift is explicitly hardened for compiling untrusted WASM modules:
 
 1. **No undefined behavior in IR** (by design)
-2. **Guards against JIT bombs** – pathological compilation times
+2. **Designed to avoid pathological compilation times**
    - Avoids input-length-bounded recursion
-   - No quadratic or higher algorithmic complexity
+   - The node does not rely on this alone: a module is checked against an
+     acceptance rule before any compile (see "Acceptance rule" below)
 3. **Security-first optimizations**
    - Consciously avoids riskier optimization techniques
    - Abstractions prevent bugs and enforce invariants
@@ -86,12 +87,24 @@ wasmtime_config.cranelift_opt_level(OptLevel::None);
 - Cranelift's optimizations are security-hardened, so this is also safe
 - We chose `None` to minimize risk for untrusted contracts
 
-**Future option: Winch**
+### Acceptance rule
 
-Wasmtime's baseline compiler "Winch":
-- Single-pass, no optimizations
-- Even simpler than Cranelift with `OptLevel::None`
-- Could be added as a configuration option for maximum security
+Before any compile of contract code (and of delegate code on a hosted node;
+other delegates are installed by the node's own client and are not checked),
+`engine/compile_limits.rs` validates the module with a
+`wasmparser` walk that counts its size, functions, locals, control frames,
+branch edges and other quantities, and refuses it as soon as a counter passes
+its limit. The same walk accepts only the WebAssembly 2.0 feature set, and the
+engine is configured with that set. A refusal is permanent for those bytes and
+is remembered (`engine/compile_verdicts.rs`). Each limit sits well above the
+largest value measured over the contracts and delegates on the network, so the
+limits are a network-wide acceptance rule: a change to one is a rolling-upgrade
+event. The walk is a coarse pre-filter and not a cost bound: it keeps out
+modules whose shape is far outside anything real, and is loose enough never to
+refuse a real artifact. A single compile still runs on the contract-handling
+path. With `compile-isolation` on, a hard-capped worker process (CPU time,
+memory and wall time limits) judges each module first, and that is what bounds
+the cost of a module the walk lets through.
 
 ## Memory Management
 
@@ -427,24 +440,8 @@ pub(crate) trait WasmEngine: Send {
 
 ### Security
 
-1. **Add Winch compiler support**
-   - Wasmtime's baseline compiler
-   - Even simpler than Cranelift with `OptLevel::None`
-   - Configuration option for maximum security
-
-2. **Compiler strategy configuration**
-   ```rust
-   pub enum CompilerStrategy {
-       Baseline,           // Winch (when available)
-       CraneliftNoOpt,     // Cranelift + OptLevel::None (current)
-       CraneliftOptimized, // Cranelift + optimizations
-   }
-   ```
-
-3. **Per-contract security profiles**
-   - Trusted contracts: enable optimizations
-   - Untrusted contracts: baseline compiler
-   - Gateway-provided contracts: middle ground
+1. **Move compiles off the contract-handling path**
+   - A compile of an accepted module still blocks that path while it runs
 
 ### Memory
 
@@ -465,7 +462,6 @@ pub(crate) trait WasmEngine: Send {
 
 **Wasmtime Documentation:**
 - [Security](https://docs.wasmtime.dev/security.html)
-- [Fast Compilation (Winch)](https://docs.wasmtime.dev/examples-fast-compilation.html)
 - [API Docs](https://docs.rs/wasmtime/27.0.0/wasmtime/)
 
 **Bytecode Alliance:**

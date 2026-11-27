@@ -98,7 +98,8 @@ async fn a_module_that_is_not_a_contract_fails_to_load_rather_than_reading_incon
     // the contract entry points, which is what leaves `missing_contract_exports_for`
     // something to find. A bare eight-byte header would be rejected earlier, for
     // lacking the memory export, and would never reach the ABI check at all.
-    let not_a_contract = br#"(module (memory (export "memory") 1))"#.to_vec();
+    // The runtime takes binary modules only, so the text is assembled first.
+    let not_a_contract = wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap();
 
     let err = RuntimeOracle::standalone(not_a_contract, vec![])
         .await
@@ -119,7 +120,7 @@ async fn a_module_that_is_not_a_contract_fails_to_load_rather_than_reading_incon
 #[tokio::test(flavor = "multi_thread")]
 async fn verifier_matches_real_wasm_for_every_planted_defect()
 -> Result<(), Box<dyn std::error::Error>> {
-    let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+    let wasm = crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
 
     // ------------------------------------------------------- mode 0: conforming
     //
@@ -522,7 +523,7 @@ async fn a_contract_sees_the_overridden_clock_through_real_wasm()
     use crate::util::time_source::{DynTimeSource, SharedMockTimeSource};
     use crate::wasm_runtime::override_contract_clock;
 
-    let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+    let wasm = crate::wasm_runtime::tests::get_test_module_release("test_contract_conformance")?;
     let mut oracle = RuntimeOracle::standalone(wasm, vec![NONDETERMINISTIC_SUMMARY]).await?;
     let state = [1u8, 2, 3];
 
