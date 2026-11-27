@@ -20,6 +20,21 @@ mod time;
 mod update_validates;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    build_test_module(name, false)
+}
+
+/// [`get_test_module`] built with `--release`, the profile a real delegate ships
+/// in. A dev-profile test module carries debug info and, depending on the
+/// builder's cargo config, can exceed the node's compile size limit (a hosted
+/// node refuses delegate code over `MAX_MODULE_BYTES`: ~22 MB in CI against
+/// ~2 MB on a machine whose global config trims debug info). Tests that run a
+/// delegate on a HOSTED node, where that limit applies, use this so they do not
+/// depend on the builder's config.
+pub(crate) fn get_test_module_release(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    build_test_module(name, true)
+}
+
+fn build_test_module(name: &str, release: bool) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let module_path = {
         const CONTRACTS_DIR: &str = env!("CARGO_MANIFEST_DIR");
         let contracts = PathBuf::from(CONTRACTS_DIR);
@@ -39,6 +54,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
         .iter()
         .copied()
         .chain([WASM_TARGET])
+        .chain(release.then_some("--release"))
         .collect::<Vec<_>>();
     let mut child = Command::new("cargo")
         .args(&cmd_args)
@@ -55,7 +71,7 @@ pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error:
     }
     let output_file = target
         .join(WASM_TARGET)
-        .join("debug")
+        .join(if release { "release" } else { "debug" })
         .join(name)
         .with_extension("wasm");
     info!("output file: {output_file:?}");

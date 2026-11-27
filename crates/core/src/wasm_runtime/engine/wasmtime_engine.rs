@@ -456,9 +456,15 @@ fn compile_coalesced_with(
         }
     }
     let input_hash = *blake3::hash(code).as_bytes();
-    if let Some(refusal) = verdicts.get(&input_hash) {
-        isolation.metrics().count_cached_refusal(&refusal);
-        return Err(WasmError::CompileRefused(refusal));
+    // Refusals are remembered by code hash alone, and are recorded only for code
+    // the acceptance check covers. Code it does not cover (a delegate on a
+    // non-hosted node) must not be refused by a verdict a contract compile of
+    // the same bytes left behind.
+    if checked {
+        if let Some(refusal) = verdicts.get(&input_hash) {
+            isolation.metrics().count_cached_refusal(&refusal);
+            return Err(WasmError::CompileRefused(refusal));
+        }
     }
     // Refuse modules outside the acceptance rule before any compile work (see
     // `compile_limits`). Only the binary format is accepted from here on: the
@@ -4060,6 +4066,41 @@ mod tests {
             }))
         ));
         assert_eq!(module_new_calls(), before);
+    }
+
+    /// A refusal recorded for a contract compile of some bytes does not refuse
+    /// the same bytes compiled as a delegate on a node that is not hosted, which
+    /// does not check delegate code. On a hosted node the delegate is checked,
+    /// so the remembered refusal applies to it.
+    #[test]
+    fn a_contract_refusal_does_not_block_the_same_bytes_as_an_unchecked_delegate() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, MAX_NESTING_DEPTH, test_support::nested_blocks,
+        };
+        let over = nested_blocks(MAX_NESTING_DEPTH as usize + 1);
+        let mut plain = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        assert!(matches!(
+            plain.compile_contract(&over),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        plain.compile(&over).expect(
+            "a delegate on a node that is not hosted is not checked, cached refusal or not",
+        );
+        let hosted_config = RuntimeConfig {
+            compile_isolation_delegates: true,
+            ..RuntimeConfig::default()
+        };
+        let mut hosted = WasmtimeEngine::new(&hosted_config, false).unwrap();
+        assert!(matches!(
+            hosted.compile_contract(&over),
+            Err(WasmError::CompileRefused(_))
+        ));
+        assert!(matches!(
+            hosted.compile(&over),
+            Err(WasmError::CompileRefused(_))
+        ));
     }
 
     /// A module that passes the scan but is past half of some limit is reported

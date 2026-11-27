@@ -160,7 +160,10 @@ async fn register_delegate_and_app_as(
     user: Option<&UserSecretContext>,
 ) -> Registered {
     let code = tokio::task::spawn_blocking(|| {
-        crate::wasm_runtime::tests::get_test_module("test_delegate_echo_params")
+        // Release build: hosted-mode tests below run this delegate on a node
+        // that refuses delegate code over the compile size limit, as a real
+        // hosted node does. See `get_test_module_release`.
+        crate::wasm_runtime::tests::get_test_module_release("test_delegate_echo_params")
             .expect("build the fixture delegate")
     })
     .await
