@@ -23917,15 +23917,13 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     );
     assert!(t.native_failed() > 0, "premise: native setups failed");
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
-    // Nothing lowers a node's native offer or decisions: every acceptor
-    // decision where the pair held no transport is `native`, however many
-    // setups failed before it.
-    assert!(
-        t.decisions()
-            .iter()
-            .filter(|(_, _, _, in_slice)| *in_slice)
-            .all(|(_, _, native, _)| *native),
-        "an in-slice decision was UDP after native failures"
+    // Nothing lowers a node's native offer or decisions: no decision is UDP
+    // because an acceptor was `not_ready`, however many setups failed. (An
+    // in-slice UDP decision can still be an admission refusal.)
+    assert_eq!(
+        t.decision_causes().get("not_ready").copied().unwrap_or(0),
+        0,
+        "a node stopped deciding native after native failures"
     );
     // Each side falls back: a joiner and an acceptor whose setup failed each
     // ask for a UDP dial to the same peer in the same CONNECT. With no NAT in
@@ -24191,20 +24189,21 @@ fn test_quic_native_broken_acceptor_keeps_deciding_native() {
     let broken = broken.expect("premise: the broken node was chosen");
     let t = &run.wire.trace;
     let decisions = t.decisions();
-    let in_slice: Vec<(u64, bool)> = decisions
+    let natives = decisions
         .iter()
-        .filter(|(own, _, _, in_slice)| *own == broken && *in_slice)
-        .map(|(_, seq, native, _)| (*seq, *native))
-        .collect();
-    tracing::info!(%broken, decisions = in_slice.len(), "broken acceptor run");
+        .filter(|(own, _, native, _)| *own == broken && *native)
+        .count();
+    tracing::info!(%broken, natives, "broken acceptor run");
+    // More native decisions than the three rescues the old rule demoted on:
+    // the broken node kept deciding native past that point.
     assert!(
-        in_slice.len() >= THRESHOLD,
-        "premise: the broken node decided at least {THRESHOLD} in-slice requests ({})",
-        in_slice.len()
+        natives > THRESHOLD,
+        "the broken node decided native only {natives} times"
     );
-    assert!(
-        in_slice.iter().all(|(_, native)| *native),
-        "the broken node decided UDP for an in-slice request: {in_slice:?}"
+    assert_eq!(
+        t.decision_causes().get("not_ready").copied().unwrap_or(0),
+        0,
+        "a node stopped deciding native"
     );
     assert!(
         t.native_established() > 0,
@@ -24761,19 +24760,20 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
     log_native_connect(name, &run);
     // No port-restricted node (nor a gateway) stops deciding native, though
     // half the regular nodes are symmetric and every native setup with one
-    // fails: every in-slice decision of a non-symmetric acceptor is native.
+    // fails: no acceptor decides UDP for being not ready.
     assert!(
         run.wire.trace.native_failed() > 0,
         "premise: native setups failed"
     );
-    assert!(
+    assert_eq!(
         run.wire
             .trace
-            .decisions()
-            .iter()
-            .filter(|(own, _, _, in_slice)| *in_slice && !symmetric_ips.contains(&own.ip()))
-            .all(|(_, _, native, _)| *native),
-        "a port-restricted acceptor decided UDP for an in-slice request"
+            .decision_causes()
+            .get("not_ready")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "an acceptor stopped deciding native"
     );
     // Premise: some port-restricted node failed native setups with three
     // distinct symmetric peers, so the node had many native failures.
