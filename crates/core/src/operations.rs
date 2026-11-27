@@ -2383,22 +2383,30 @@ mod routing_dataset_call_site_pins {
         let production = production(PUT);
         // (driver, HTL check, where the selection is invoked). `drive_relay_put`
         // defines the selection as a closure and calls it under the HTL check.
-        for (driver, htl_guard, invoked) in [
-            ("drive_relay_put", "letnext_hop=ifhtl>0{", "pick(&"),
+        for (driver, htl_guard, invoked, forwards_peer) in [
+            (
+                "drive_relay_put",
+                "letnext_hop=ifhtl>0{",
+                "pick(&",
+                "(peer,addr,hop_overridden)",
+            ),
             (
                 "drive_relay_put_streaming",
                 "letnext_hop=ifhtl>0{",
                 "descended_closest_potentially_hosting(",
+                "else{Some(peer)}",
             ),
             (
                 "drive_relay_probe",
                 "letnext_hop=ifhtl>0{",
                 "descended_closest_potentially_hosting(",
+                "matchpeer.socket_addr()",
             ),
             (
                 "drive_relay_probe_reconcile",
                 "ifhtl==0{",
                 "descended_closest_potentially_hosting(",
+                "matchpeer.socket_addr()",
             ),
         ] {
             let body = fn_body(&production, driver);
@@ -2424,9 +2432,12 @@ mod routing_dataset_call_site_pins {
                 body[select..resolve].contains("hop_ctx.descended_own"),
                 "{driver}: the selection must be given the descended location"
             );
+            let peer_bound = body[resolve..]
+                .find("letpeer=hop.peer;")
+                .unwrap_or_else(|| panic!("{driver}: the resolved peer is not bound"));
             assert!(
-                body[resolve..].contains("hop.peer"),
-                "{driver}: the forward target must be the resolved peer"
+                body[resolve + peer_bound..].contains(forwards_peer),
+                "{driver}: the resolved peer must be the one forwarded to (`{forwards_peer}`)"
             );
             for forbidden in [
                 "put_routing_should_terminate(",
@@ -2460,8 +2471,9 @@ mod routing_dataset_call_site_pins {
             relay
                 .matches("put_forward_failure_finalizes_locally(hop_overridden)")
                 .count(),
-            4,
-            "each forward-failure arm of drive_relay_put must consult the override flag"
+            5,
+            "each forward-failure arm and the downstream-error arm of drive_relay_put \
+             must consult the override flag"
         );
     }
 

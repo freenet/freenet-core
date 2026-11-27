@@ -53,7 +53,8 @@ filter = "test(lattice_probe_does_not_grow_degree_with_uptime)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
 # PUT stop rule: two 24-node simulations that each move a 1.2 MB streamed state
-# (about 3 minutes each on a busy machine), which is over the default 240s cap.
+# (about 4 minutes in total locally, so close to the default 240s cap and over it
+# on a slower runner).
 # retries = 0: a deterministic simulation, and three attempts would use most of
 # the Simulation job.
 [[profile.ci.overrides]]

@@ -4394,7 +4394,7 @@ impl Ring {
                 let narrowed: Vec<PeerKeyLocation>;
                 let mut candidates: &[PeerKeyLocation] = candidates;
                 if let Some(own) = descended_own {
-                    let (probe, _, _) = pick_among(candidates, false, false);
+                    let probe = hop_probe(&router, target, candidates, is_put);
                     let probe_is_closer = probe
                         .first()
                         .is_some_and(|p| is_strictly_closer(p.location(), own, target));
@@ -7797,8 +7797,26 @@ fn read_fd_soft_limit() -> Option<u64> {
     None
 }
 
+/// Under test builds a PUT selection can be forced by `put_cost_pick_hook`:
+/// the candidates the router sees are then just the forced pick.
+fn hook_candidates(
+    candidates: &[PeerKeyLocation],
+    target: Location,
+    is_put: bool,
+) -> &[PeerKeyLocation] {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(pick) = is_put
+        .then(|| put_cost_pick_hook::forced_pick(candidates, target))
+        .flatten()
+    {
+        return std::slice::from_ref(pick);
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = (is_put, target);
+    candidates
+}
+
 /// One router selection of the single best peer among `candidates`.
-/// Under test builds a PUT selection can be forced by `put_cost_pick_hook`.
 fn hop_select<'a>(
     router: &crate::router::Router,
     target: Location,
@@ -7811,17 +7829,20 @@ fn hop_select<'a>(
     crate::router::RoutingDecisionInfo,
     Option<crate::router::dataset::DecisionCapture<'a>>,
 ) {
-    #[cfg(any(test, feature = "testing"))]
-    let candidates = match is_put
-        .then(|| put_cost_pick_hook::forced_pick(candidates, target))
-        .flatten()
-    {
-        Some(pick) => std::slice::from_ref(pick),
-        None => candidates,
-    };
-    #[cfg(not(any(test, feature = "testing")))]
-    let _ = is_put;
+    let candidates = hook_candidates(candidates, target, is_put);
     router.select_k_best_peers_capturing(candidates.iter(), target, 1, capture, routes)
+}
+
+/// The router's pick among `candidates` without touching any router
+/// statistics (see `Router::select_k_best_peers_unrecorded`).
+fn hop_probe<'a>(
+    router: &crate::router::Router,
+    target: Location,
+    candidates: &'a [PeerKeyLocation],
+    is_put: bool,
+) -> Vec<&'a PeerKeyLocation> {
+    let candidates = hook_candidates(candidates, target, is_put);
+    router.select_k_best_peers_unrecorded(candidates.iter(), target, 1)
 }
 
 /// A PUT hop's next-hop selection: the peer, and whether the PUT stop rule
@@ -13099,6 +13120,8 @@ pub(crate) mod candidate_log_wiring_tests {
 
         let (recorder, _dir, path) = recorder();
         let put_log = DecisionLog::Joinable(OpType::Put);
+        let rank_total = || ring.router.read().snapshot().selection_ranks.total;
+        let ranks_before = rank_total();
         let overridden = {
             let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
             ring.descended_closest_potentially_hosting(put_log, &key, none.as_slice(), Some(own))
@@ -13117,6 +13140,11 @@ pub(crate) mod candidate_log_wiring_tests {
             selected_at(decisions[0], 0),
             dataset::peer_hash(&s1),
             "the dataset records the peer used"
+        );
+        assert_eq!(
+            rank_total(),
+            ranks_before + 1,
+            "one decision: the preliminary probe of the discarded pick records no selection rank"
         );
         assert_eq!(chosen_count(&s1), 1.0, "the peer used is counted as chosen");
         assert_eq!(chosen_count(&s4), 0.0, "the discarded pick is not credited");

@@ -3096,6 +3096,38 @@ where
             )
             .await
         }
+        // A forward to an overridden hop (a peer the router ranked worse) that
+        // comes back as any error: this node stored the contract, so it is the
+        // storer, as when the forward itself fails.
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            cause: downstream_cause,
+            ..
+        })) if put_forward_failure_finalizes_locally(hop_overridden) => {
+            tracing::warn!(
+                tx = %incoming_tx,
+                contract = %key,
+                cause = %bound_cause(downstream_cause),
+                phase = "relay_put_overridden_hop_error",
+                "PUT relay: overridden next hop returned PutMsg::Error; stored here, \
+                 reporting success upstream"
+            );
+            crate::operations::record_relay_route_event(
+                op_manager,
+                next_peer.clone(),
+                crate::ring::Location::from(&key),
+                crate::router::RouteOutcome::Failure,
+                crate::node::network_status::OpType::Put,
+            );
+            relay_put_finalize_local(
+                op_manager,
+                incoming_tx,
+                key,
+                merged_value,
+                upstream_addr,
+                local_finalize_hop_count,
+            )
+            .await
+        }
         NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
             cause: downstream_cause,
             ..
@@ -8118,6 +8150,32 @@ mod tests {
             "streaming terminus path MUST still replicate the contract onward \
              via relay_put_replicate_forward (#4509)"
         );
+    }
+
+    /// A downstream `PutMsg::Error` from an OVERRIDDEN next hop (the router
+    /// ranked it worse) must not be propagated upstream: this relay stored the
+    /// contract, so it finalizes locally. The arm must be guarded by the
+    /// override flag and sit BEFORE the generic propagate-the-error arm
+    /// (match arms are tried in order), and must finalize rather than send an
+    /// error.
+    #[test]
+    fn overridden_hop_error_reply_finalizes_locally_before_the_propagating_arm() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = drive_relay_put_body(src);
+        let overridden = body
+            .find("phase = \"relay_put_overridden_hop_error\"")
+            .expect("overridden-hop error arm");
+        let propagate = body
+            .find("phase = \"relay_put_bubble_error_upstream\"")
+            .expect("generic error arm");
+        assert!(overridden < propagate);
+        let arm_start = body[..overridden]
+            .rfind("})) if put_forward_failure_finalizes_locally(hop_overridden) =>")
+            .expect("the arm is guarded by the override flag");
+        assert!(arm_start < overridden);
+        let arm = &body[overridden..propagate];
+        assert!(arm.contains("relay_put_finalize_local("));
+        assert!(!arm.contains("relay_put_send_error("));
     }
 
     // ── Upgrade-on-forward error paths (PR #4063) ─────────────────────
