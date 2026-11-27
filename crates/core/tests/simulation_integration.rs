@@ -24279,12 +24279,19 @@ fn test_quic_native_connections_form_behind_each_nat_class() {
                 "{filtering:?}: premise: the NATs dropped unsolicited datagrams"
             );
         }
-        assert_eq!(
-            t.native_failures_without_fallback(),
-            Vec::<String>::new(),
-            "{filtering:?}: every failed native setup was followed by a UDP dial"
-        );
+        // D-8: there is no UDP dial after a failed native setup, so the
+        // measure is what the nodes reach without it: how many setups failed,
+        // and whether every node still joined through other acceptors.
         let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+        println!(
+            "NAT-CLASS {filtering:?}: native established {} failed {} (of which not followed by a UDP dial {}), nodes joined {}/{}, connected {}",
+            t.native_established(),
+            t.native_failed(),
+            t.native_failures_without_fallback().len(),
+            peers.len(),
+            run.wire.nodes,
+            connected
+        );
         assert_eq!(
             peers.len(),
             run.wire.nodes,
