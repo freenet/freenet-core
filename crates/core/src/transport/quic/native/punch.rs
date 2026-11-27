@@ -133,10 +133,24 @@ pub(crate) enum PunchRefusal {
 enum Destination {
     V4([u8; 4]),
     V6([u8; 8]),
+    /// Test builds only: a loopback or unspecified address, counted per
+    /// socket address, since a simulation or local test network runs every
+    /// node on one such address and one shared budget would refuse most
+    /// native setups there. A release counts it as one host, like any other
+    /// address (the same rule as `connect::native::SetupSource`).
+    #[cfg(any(test, feature = "testing"))]
+    Exact(SocketAddr),
 }
 
 impl Destination {
     fn of(to: SocketAddr) -> Self {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let ip = normalize_mapped_addr(to).ip().to_canonical();
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Destination::Exact(normalize_mapped_addr(to));
+            }
+        }
         match normalize_mapped_addr(to).ip() {
             IpAddr::V4(ip) => Destination::V4(ip.octets()),
             IpAddr::V6(ip) => {
