@@ -1121,50 +1121,151 @@ fn a_path_with_a_udp_session_counts_only_what_it_gives_up() {
     });
 }
 
-/// Nothing counts a Short as dropped except `record_short_dropped`, which counts
-/// its cause with it, so the causes cannot drift from `short_dropped`. The pin
-/// reads the source: a new caller of the uncaused counter fails here. The one
-/// `stats.record_send(` is `settle`'s, which sends a dropped Short to
-/// `record_short_dropped` first (and `record_send` asserts that in debug).
-#[test]
-fn only_record_short_dropped_counts_a_dropped_short() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport");
-    let mut dirs = vec![root];
-    let (mut plain, mut files_scanned) = (Vec::new(), 0);
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).expect("transport source dir") {
-            let path = entry.expect("entry").path();
-            let name = path.to_string_lossy().to_string();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if name.ends_with(".rs") && !name.contains("test") {
-                files_scanned += 1;
-                let text = std::fs::read_to_string(&path).expect("source");
-                for (n, line) in text.lines().enumerate() {
-                    let code = line.trim_start();
-                    if code.starts_with("//") {
-                        continue;
-                    }
-                    assert!(
-                        !code.contains("record_send_dropped("),
-                        "{name}:{}: a dropped Short has a cause",
-                        n + 1
-                    );
-                    if code.contains("record_send_unchecked(") && !name.ends_with("quic/path.rs") {
-                        panic!(
-                            "{name}:{}: the uncaused counter is private to path.rs",
-                            n + 1
-                        );
-                    }
-                    if code.contains("stats.record_send(") || code.contains("stats().record_send(")
-                    {
-                        plain.push(format!("{name}:{}", n + 1));
+/// Every call that counts a data send, in the production source of the
+/// transport (comments stripped, test modules cut at their `#[cfg(test)]`), as
+/// `file: callee(arguments)` with whitespace removed.
+fn send_counting_calls(files: &[(String, String)]) -> Vec<String> {
+    let mut calls = Vec::new();
+    for (name, src) in files {
+        let src = src
+            .split("#[cfg(test)]\nmod ")
+            .next()
+            .expect("split yields one piece");
+        let src = crate::contract::source_pin_util::strip_comments(src);
+        for callee in [
+            "record_send(",
+            "record_send_unchecked(",
+            "record_short_drop_cause(",
+        ] {
+            for (at, _) in src.match_indices(callee) {
+                // A definition is not a call.
+                if src[..at].trim_end().ends_with("fn") {
+                    continue;
+                }
+                let open = at + callee.len();
+                let mut depth = 1usize;
+                let mut end = open;
+                for (i, byte) in src.bytes().enumerate().skip(open) {
+                    match byte {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = i;
+                                break;
+                            }
+                        }
+                        _ => {}
                     }
                 }
+                assert!(end > open, "{name}: unbalanced `{callee}`");
+                let args: String = src[open..end]
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                // The receiver's text before the callee, to its statement start.
+                let recv_start = src[..at]
+                    .rfind(|c: char| c.is_whitespace() || c == '{' || c == ';')
+                    .map_or(0, |i| i + 1);
+                let recv = &src[recv_start..at];
+                calls.push(format!("{name}: {recv}{callee}{args})"));
             }
         }
     }
-    assert!(files_scanned > 20, "the scan found {files_scanned} files");
-    assert_eq!(plain.len(), 1, "{plain:#?}");
-    assert!(plain[0].contains("quic/path/route.rs"), "{plain:#?}");
+    calls.sort();
+    calls
+}
+
+fn transport_production_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport");
+    let mut dirs = vec![root.clone()];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("transport source dir") {
+            let path = entry.expect("entry").path();
+            let rel = path
+                .strip_prefix(&root)
+                .expect("under root")
+                .to_string_lossy();
+            let is_test_file = rel.split('/').any(|part| {
+                part == "tests" || part.ends_with("tests.rs") || part.ends_with("_tests")
+            });
+            if path.is_dir() {
+                if !is_test_file {
+                    dirs.push(path);
+                }
+            } else if rel.ends_with(".rs") && !is_test_file {
+                let text = std::fs::read_to_string(&path).expect("source");
+                files.push((rel.to_string(), text));
+            }
+        }
+    }
+    files
+}
+
+/// What the production transport source may call to count a data send. A Short
+/// is counted dropped only by `record_short_dropped`, which counts its cause with
+/// it, so the causes cannot drift from `short_dropped`. This list is every
+/// counting call, so a new site, a renamed receiver, or a direct call on the
+/// node's counters fails here and has to be read: it is either a Short drop
+/// (route it through `record_short_dropped`) or another kind of send.
+const EXPECTED_SEND_COUNTING_CALLS: [&str; 6] = [
+    "quic/path.rs: self.node.record_send(kind,result)",
+    "quic/path.rs: self.node.record_short_drop_cause(cause)",
+    "quic/path.rs: self.record_send_unchecked(SendKind::Short,QuicSendResult::Dropped)",
+    "quic/path.rs: self.record_send_unchecked(kind,result)",
+    "quic/path/route.rs: self.stats.record_send(kind,result)",
+    // Not a data send: the loss gate's own round-trip sample.
+    "quic/recycle/loss_gate.rs: self.record_send(sent,sample)",
+];
+
+#[test]
+fn only_record_short_dropped_counts_a_dropped_short() {
+    let files = transport_production_sources();
+    assert!(files.len() > 20, "the scan found {} files", files.len());
+    for (name, _) in [("quic/path.rs", ()), ("quic/path/route.rs", ())] {
+        assert!(files.iter().any(|(n, _)| n == name), "{name} not scanned");
+    }
+    assert_eq!(
+        send_counting_calls(&files),
+        EXPECTED_SEND_COUNTING_CALLS,
+        "a call that counts a data send was added, moved or renamed"
+    );
+    // `settle` is the one caller that passes a variable kind and result: it must
+    // send a dropped Short to `record_short_dropped` before it counts anything.
+    let route = &files
+        .iter()
+        .find(|(n, _)| n == "quic/path/route.rs")
+        .expect("scanned")
+        .1;
+    let route = crate::contract::source_pin_util::strip_comments(route);
+    let branch = route
+        .find("kind == SendKind::Short && result == QuicSendResult::Dropped")
+        .expect("settle's Short drop branch moved");
+    let short = route[branch..]
+        .find("record_short_dropped(short_drop_cause(outcome))")
+        .expect("the Short drop branch does not call record_short_dropped");
+    let plain = route[branch..]
+        .find("self.stats.record_send(kind, result)")
+        .expect("settle's plain count moved");
+    assert!(short < plain, "the Short drop branch must come first");
+}
+
+/// The scan sees a second site planted in production code, and one on a
+/// differently named receiver.
+#[test]
+fn the_send_counting_scan_sees_a_planted_site() {
+    let planted =
+        |body: &str| send_counting_calls(&[("quic/path/route.rs".to_string(), body.to_string())]);
+    assert!(planted("fn f() { /* x.record_send(a, b) */ }").is_empty());
+    assert_eq!(
+        planted("fn f(s: &S) { s.node().record_send(SendKind::Short, QuicSendResult::Dropped); }"),
+        ["quic/path/route.rs: s.node().record_send(SendKind::Short,QuicSendResult::Dropped)"]
+    );
+    assert!(
+        planted(
+            "fn record_send(&self) {}\n#[cfg(test)]\nmod tests { fn t() { a.record_send(1) } }"
+        )
+        .is_empty()
+    );
 }

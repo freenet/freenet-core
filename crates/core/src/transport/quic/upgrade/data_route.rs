@@ -281,20 +281,27 @@ async fn run_worker(
                         in_flight.push(send_on_path(&path, &clock, payload, 0));
                     }
                     Some(payload) => {
-                        // Not sent on the path: it has ended, or the peer
-                        // refused data. (Suspect is entered only on a path
-                        // with a UDP session, which takes the message.)
-                        let why = if connected {
-                            ShortDropCause::PeerRefusedData
-                        } else {
-                            ShortDropCause::PathEnded
-                        };
+                        let why = unsent_cause(connected, path.sends_data());
                         send_elsewhere(&path, udp.as_deref(), &note, payload, why).await;
                     }
                     None => queue_open = false,
                 }
             },
         }
+    }
+}
+
+/// Why the worker did not send a queued Short on the path, from what its test
+/// for sending read (`connected && sends_data() && !is_suspect()`): the path
+/// ended, the peer refused data, or the path is suspect with no UDP session to
+/// take the message (suspect is entered only where UDP is the fallback).
+fn unsent_cause(connected: bool, sends_data: bool) -> ShortDropCause {
+    if !connected {
+        ShortDropCause::PathEnded
+    } else if !sends_data {
+        ShortDropCause::PeerRefusedData
+    } else {
+        ShortDropCause::NoUdpSession
     }
 }
 
@@ -355,5 +362,21 @@ async fn send_on_udp(
             path.stats().record_send_event(QuicSendEvent::UdpSendFailed);
             tracing::debug!(%error, "A short message from a QUIC path was not sent on UDP");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each reason the worker's test for sending on the path can fail has its own
+    /// cause, in the test's own order: a suspect path (connected, sending data)
+    /// is not labelled as the peer having refused data.
+    #[test]
+    fn an_unsent_short_is_labelled_by_the_reason_it_was_not_sent() {
+        assert_eq!(unsent_cause(false, true), ShortDropCause::PathEnded);
+        assert_eq!(unsent_cause(false, false), ShortDropCause::PathEnded);
+        assert_eq!(unsent_cause(true, false), ShortDropCause::PeerRefusedData);
+        assert_eq!(unsent_cause(true, true), ShortDropCause::NoUdpSession);
     }
 }

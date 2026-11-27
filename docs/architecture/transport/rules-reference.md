@@ -1458,7 +1458,9 @@ a test passes its own; tests read their own, never the global).
   dropped. The cause is chosen where the drop is decided (route::
   short_drop_cause in QuicPath::settle, DataRoute::queue_short, and the route
   worker's send_elsewhere). Causes seen only on a native path (no UDP session):
-  not_opened_exhausted, timed_out, paced, connection_lost, peer_refused_data,
+  not_opened_exhausted (no stream opened: the peer's credit after the native
+  retries, or a wait on this side's own resources, which is not retried),
+  timed_out, paced, connection_lost, peer_refused_data,
   budget_refused, queue_full, path_ended, no_udp_session, since a path with a
   UDP session sends those on UDP; stopped_other, invalid_frame and source_error
   can occur on either. A full native queue is native_short_queue_full, not a
