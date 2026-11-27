@@ -24553,7 +24553,7 @@ fn check_native_survivor_run(
             assert!(
                 offset < SURVIVOR_SEED_SEARCH_WARN,
                 "{name}: the rule first chose {order:?} at seed {seed:#x} (offset {offset}); \
-                     start the search there so the run stays one simulation"
+                     trajectories shifted; re-seed the run to that seed, do not raise the timeout"
             );
             found = Some(run);
             break;
