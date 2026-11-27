@@ -84,12 +84,9 @@ const LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR: usize = 2;
 /// A transport whose remote sent a ConnectRequest within this long is not
 /// evicted by the global cap (see [`plan_zombie_sweep`]): it is mid-join, and
 /// an eviction would end the join. Twice the 60s pending-reservation window.
+/// The protection is bounded to half the global cap, so links in use always
+/// keep the other half.
 pub(super) const CONNECT_REQUEST_PROTECTION: Duration = Duration::from_secs(120);
-
-/// Transports protected by [`CONNECT_REQUEST_PROTECTION`] may exceed the
-/// global cap, up to this multiple of it. The bound exists because a remote
-/// can send a ConnectRequest over every transport it opens.
-const CONNECT_PROTECTED_CAP_MULTIPLE: usize = 2;
 
 /// Most zombie transports dropped in one sweep slice. Each drop involves
 /// topology pruning and orphaned-transaction handling, and its final send to
@@ -598,38 +595,61 @@ pub(super) fn plan_zombie_sweep(
         }
     }
 
-    // Transports mid-join (a ConnectRequest within
-    // [`CONNECT_REQUEST_PROTECTION`]) first, then most recently used, then
-    // youngest; the address breaks remaining ties so the plan is
-    // deterministic.
+    // Most recently used first, then youngest; the address breaks remaining
+    // ties so the plan is deterministic.
     exempt.sort_by(|a, b| {
-        b.connect_protected()
-            .cmp(&a.connect_protected())
-            .then_with(|| a.idle.cmp(&b.idle))
+        a.idle
+            .cmp(&b.idle)
             .then_with(|| a.age.cmp(&b.age))
             .then_with(|| a.addr.cmp(&b.addr))
     });
 
+    // Mid-join transports (a ConnectRequest within
+    // [`CONNECT_REQUEST_PROTECTION`]) are admitted first, but only into
+    // `protected_slots`: half the global cap. A remote that refreshes a
+    // ConnectRequest over many transports can therefore take at most half the
+    // cap, and links that are in use always keep the other half. A protected
+    // transport beyond the slots queues behind the others (below).
+    let protected_slots = (global_cap / 2).max(1).min(global_cap);
+    let mut first = Vec::new();
+    let mut rest = Vec::new();
+    for c in exempt {
+        if c.connect_protected() && first.len() < protected_slots {
+            first.push(c);
+        } else {
+            rest.push(c);
+        }
+    }
+
+    // A protected transport beyond the slots takes only what recency leaves:
+    // it queues behind every other transport (stable sort, recency order kept
+    // within each group), so it cannot displace a link in use.
+    rest.sort_by_key(SweepCandidate::connect_protected);
+
     let mut per_key: HashMap<(IpAddr, u16), usize> = HashMap::new();
     let mut over_cap: Vec<SweepCandidate> = Vec::new();
-    for candidate in exempt {
+    // The per-IP cap applies to every transport, protected or not. A protected
+    // one the per-IP cap refuses is evicted like any other.
+    let mut admit = |plan: &mut ZombieSweepPlan, candidate: SweepCandidate, global_limit: usize| {
         let held = per_key
             .entry(link_use_exemption_key(candidate.addr))
             .or_insert(0);
         if *held >= per_ip_cap {
             plan.over_per_ip_cap += 1;
             over_cap.push(candidate);
-        } else if plan.kept_for_link_use.len() >= global_cap
-            && !(candidate.connect_protected()
-                && plan.kept_for_link_use.len()
-                    < global_cap.saturating_mul(CONNECT_PROTECTED_CAP_MULTIPLE))
-        {
+        } else if plan.kept_for_link_use.len() >= global_limit {
             plan.over_global_cap += 1;
             over_cap.push(candidate);
         } else {
             *held += 1;
             plan.kept_for_link_use.push(candidate.addr);
         }
+    };
+    for candidate in first {
+        admit(&mut plan, candidate, global_cap);
+    }
+    for candidate in rest {
+        admit(&mut plan, candidate, global_cap);
     }
 
     // Least recently used first, then oldest.
@@ -1228,19 +1248,40 @@ mod tests {
         assert_eq!(plan.over_cap.len(), 2);
     }
 
-    /// The protection is bounded: a remote cannot pin unlimited transports by
-    /// sending a ConnectRequest on each.
+    /// The protection is bounded to half the cap: an attacker-shaped input of
+    /// 40 transports from distinct IPs, each refreshing a ConnectRequest and
+    /// each more recently used than any real link, cannot displace more than
+    /// half the cap; in-use links keep the other half.
     #[test]
-    fn mid_join_protection_is_bounded_by_a_multiple_of_the_cap() {
-        let candidates: Vec<_> = (1..=10)
-            .map(|i| mid_join(&format!("198.51.100.{i}:1"), 5, 5))
+    fn mid_join_protection_leaves_half_the_cap_to_links_in_use() {
+        let cap = 10;
+        let mut candidates: Vec<_> = (1..=40)
+            .map(|i| mid_join(&format!("203.0.113.{i}:1"), 1, 1))
             .collect();
-        let plan = plan_zombie_sweep(candidates, 2, 2);
-        assert_eq!(
-            plan.kept_for_link_use.len(),
-            2 * CONNECT_PROTECTED_CAP_MULTIPLE
-        );
-        assert_eq!(plan.over_cap.len(), 10 - 2 * CONNECT_PROTECTED_CAP_MULTIPLE);
+        candidates.extend((1..=10).map(|i| exempt(&format!("198.51.100.{i}:1"), 30 + i)));
+        let plan = plan_zombie_sweep(candidates, 2, cap);
+        assert_eq!(plan.kept_for_link_use.len(), cap);
+        let legit_kept = plan
+            .kept_for_link_use
+            .iter()
+            .filter(|a| a.ip().to_string().starts_with("198.51.100."))
+            .count();
+        assert_eq!(legit_kept, cap / 2, "kept: {:?}", plan.kept_for_link_use);
+    }
+
+    /// The sweep's cap never exceeds the QUIC connection cap at the node's own
+    /// connection limit, so neither does the protected set (at most half of it).
+    #[test]
+    fn global_cap_stays_within_the_quic_connection_cap() {
+        for gib in [1usize, 2, 4, 8] {
+            let memory = gib << 30;
+            let limit = crate::config::connection_limit_for(200, 10, true, memory);
+            let cap = link_use_exempt_global_cap(limit.max);
+            assert!(
+                cap <= crate::transport::quic::config::quic_connection_cap(memory),
+                "{gib} GiB: sweep cap {cap} over the QUIC cap"
+            );
+        }
     }
 
     /// `plan_sweep` fills `connect_idle` from the stamp the listener writes.
