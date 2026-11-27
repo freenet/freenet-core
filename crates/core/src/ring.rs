@@ -4343,42 +4343,35 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
-        self.closest_potentially_hosting_inner(log_as, contract_key, skip_list, None)
+        self.descended_closest_potentially_hosting(log_as, contract_key, skip_list, None)
+            .map(|selection| selection.peer)
     }
 
-    /// Like [`Self::closest_potentially_hosting`], but the router ranks only
-    /// the connected peers strictly closer to the key than `closer_than`
-    /// (this node's own location). Returns `None` when no such peer exists.
+    /// [`Self::closest_potentially_hosting`] for a PUT relay hop, with the PUT
+    /// stop rule applied inside the selection.
     ///
-    /// The PUT relay uses this to keep routing toward the key when the
-    /// router's unrestricted cost pick is not closer than this node: the cost
-    /// ranking still chooses, but only among peers that make progress. Always
-    /// `Unlogged`: the unrestricted selection that preceded it is the logged
-    /// routing decision.
-    pub(crate) fn closest_potentially_hosting_strictly_closer(
-        &self,
-        contract_key: &ContractKey,
-        skip_list: impl Contains<std::net::SocketAddr>,
-        closer_than: Location,
-    ) -> Option<PeerKeyLocation> {
-        self.closest_potentially_hosting_inner(
-            crate::router::dataset::DecisionLog::Unlogged,
-            contract_key,
-            skip_list,
-            Some(closer_than),
-        )
-    }
-
-    fn closest_potentially_hosting_inner(
+    /// `descended_own` is this node's location when the PUT chain descended to
+    /// it (see `put_descended_own_loc`), `None` otherwise. When it is set and
+    /// the router's cost-ranked pick over all candidates is not strictly closer
+    /// to the key than this node, the router ranks only the ready,
+    /// non-transient, non-skipped connected peers that are strictly closer, and
+    /// the selection returns its pick (`overridden`). With no such peer the
+    /// unrestricted pick is returned unchanged, and the caller stops the PUT.
+    ///
+    /// The selection the router records (the routing dataset's decision and the
+    /// peer-selection counts) is the one returned, so the outcome of the
+    /// forward joins the peer that was actually used. The probe that decides
+    /// whether to narrow records nothing.
+    pub(crate) fn descended_closest_potentially_hosting(
         &self,
         log_as: crate::router::dataset::DecisionLog,
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
-        closer_than: Option<Location>,
-    ) -> Option<PeerKeyLocation> {
+        descended_own: Option<Location>,
+    ) -> Option<HopSelection> {
         let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
-        #[cfg(any(test, feature = "testing"))]
-        let is_put = closer_than.is_some()
+        // Test-only hook scope: PUT selections.
+        let is_put = descended_own.is_some()
             || matches!(
                 log_as,
                 crate::router::dataset::DecisionLog::Joinable(
@@ -4393,31 +4386,27 @@ impl Ring {
         let target = Location::from(contract_key);
         self.connection_manager
             .routing_with(target, None, skip_list, move |candidates| {
+                let capture = log.as_ref().is_some_and(|(log, _)| log.capture);
+                let pick_among = |candidates, capture, routes| {
+                    hop_select(&router, target, candidates, capture, routes, is_put)
+                };
+                let mut overridden = false;
                 let narrowed: Vec<PeerKeyLocation>;
                 let mut candidates: &[PeerKeyLocation] = candidates;
-                if let Some(own) = closer_than {
-                    narrowed = strictly_closer_candidates(candidates, own, target);
-                    if narrowed.is_empty() {
-                        return None;
-                    }
-                    candidates = &narrowed;
-                }
-                #[cfg(any(test, feature = "testing"))]
-                let forced: Vec<PeerKeyLocation>;
-                #[cfg(any(test, feature = "testing"))]
-                if is_put {
-                    if let Some(pick) = put_cost_pick_hook::forced_pick(candidates, target) {
-                        forced = vec![pick];
-                        candidates = &forced;
+                if let Some(own) = descended_own {
+                    let (probe, _, _) = pick_among(candidates, false, false);
+                    let probe_is_closer = probe
+                        .first()
+                        .is_some_and(|p| is_strictly_closer(p.location(), own, target));
+                    if !probe_is_closer {
+                        narrowed = strictly_closer_candidates(candidates, own, target);
+                        if !narrowed.is_empty() {
+                            overridden = true;
+                            candidates = &narrowed;
+                        }
                     }
                 }
-                let (selected, decision, capture) = router.select_k_best_peers_capturing(
-                    candidates.iter(),
-                    target,
-                    1,
-                    log.as_ref().is_some_and(|(log, _)| log.capture),
-                    routes,
-                );
+                let (selected, decision, capture) = pick_among(candidates, capture, routes);
                 drop(router);
                 if let Some((log, op)) = log {
                     log.record(
@@ -4438,9 +4427,10 @@ impl Ring {
                     num_candidates = decision.candidates.len(),
                     total_routing_events = decision.total_routing_events,
                     selected = peer.is_some(),
+                    overridden,
                     "routing_decision"
                 );
-                peer
+                peer.map(|peer| HopSelection { peer, overridden })
             })
             .flatten()
     }
@@ -7807,6 +7797,41 @@ fn read_fd_soft_limit() -> Option<u64> {
     None
 }
 
+/// One router selection of the single best peer among `candidates`.
+/// Under test builds a PUT selection can be forced by `put_cost_pick_hook`.
+fn hop_select<'a>(
+    router: &crate::router::Router,
+    target: Location,
+    candidates: &'a [PeerKeyLocation],
+    capture: bool,
+    routes: bool,
+    is_put: bool,
+) -> (
+    Vec<&'a PeerKeyLocation>,
+    crate::router::RoutingDecisionInfo,
+    Option<crate::router::dataset::DecisionCapture<'a>>,
+) {
+    #[cfg(any(test, feature = "testing"))]
+    let candidates = match is_put
+        .then(|| put_cost_pick_hook::forced_pick(candidates, target))
+        .flatten()
+    {
+        Some(pick) => std::slice::from_ref(pick),
+        None => candidates,
+    };
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = is_put;
+    router.select_k_best_peers_capturing(candidates.iter(), target, 1, capture, routes)
+}
+
+/// A PUT hop's next-hop selection: the peer, and whether the PUT stop rule
+/// replaced the router's unrestricted pick with a strictly-closer peer.
+#[derive(Debug, Clone)]
+pub(crate) struct HopSelection {
+    pub peer: PeerKeyLocation,
+    pub overridden: bool,
+}
+
 /// Whether `candidate` is strictly closer to `target` than `own` is. A
 /// candidate with no known location, or at exactly `own`'s distance, is not.
 pub(crate) fn is_strictly_closer(
@@ -7867,7 +7892,7 @@ pub mod put_cost_pick_hook {
     pub(crate) fn forced_pick(
         candidates: &[PeerKeyLocation],
         target: Location,
-    ) -> Option<PeerKeyLocation> {
+    ) -> Option<&PeerKeyLocation> {
         let window = WINDOW.with(Cell::get)?;
         let dist = |p: &PeerKeyLocation| {
             p.location()
@@ -7877,7 +7902,7 @@ pub mod put_cost_pick_hook {
         by_dist.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
         by_dist
             .get(window.min(by_dist.len()).checked_sub(1)?)
-            .map(|p| (*p).clone())
+            .copied()
     }
 }
 
@@ -13032,6 +13057,99 @@ pub(crate) mod candidate_log_wiring_tests {
         assert_eq!(
             chosen, 2.0,
             "one first choice per decision, even with k = 2"
+        );
+    }
+
+    /// The PUT stop rule is applied INSIDE the recorded selection: when the
+    /// cost pick is not closer than this hop, the router ranks only the
+    /// strictly-closer peers and the routing dataset and the per-peer selection
+    /// counts record that narrowed selection (the peer actually used), not the
+    /// discarded pick. A hook forces the cost pick to the farthest candidate.
+    #[tokio::test]
+    async fn descended_put_override_records_the_narrowed_selection() {
+        let (op_manager, _rx, peers, _guards) = op_manager_with_peers("put-stop-record", 5).await;
+        let ring = &op_manager.ring;
+        let key = contract_key();
+        let target = Location::from(&key);
+        warm_router(ring, &peers, target);
+        let mut by_dist: Vec<PeerKeyLocation> = peers.clone();
+        by_dist.sort_by(|a, b| {
+            let d = |p: &PeerKeyLocation| p.location().unwrap().distance(target).as_f64();
+            d(a).total_cmp(&d(b))
+        });
+        let (s0, s1, s2, s4) = (
+            by_dist[0].clone(),
+            by_dist[1].clone(),
+            by_dist[2].clone(),
+            by_dist[4].clone(),
+        );
+        // `own` sits at the third-closest peer's distance: s0 and s1 are
+        // strictly closer; s2 is at EXACTLY own's distance (not closer).
+        let own = s2.location().unwrap();
+        let _hook = super::put_cost_pick_hook::PutCostPickGuard::farthest_of_closest(5);
+        let none: Vec<SocketAddr> = Vec::new();
+        let chosen_count = |peer: &PeerKeyLocation| {
+            ring.router
+                .read()
+                .peer_snapshot(peer)
+                .selection
+                .unwrap_or_default()
+                .chosen
+        };
+
+        let (recorder, _dir, path) = recorder();
+        let put_log = DecisionLog::Joinable(OpType::Put);
+        let overridden = {
+            let _log = dataset::force_candidate_log(recorder.clone(), 1.0);
+            ring.descended_closest_potentially_hosting(put_log, &key, none.as_slice(), Some(own))
+                .expect("a selection")
+        };
+        assert!(overridden.overridden, "the cost pick was not closer");
+        assert_eq!(
+            overridden.peer, s1,
+            "the router ranks only the strictly closer peers (the hook forces the farthest of them)"
+        );
+        let lines = lines_through_sentinel(&recorder, &path);
+        let decisions: Vec<&serde_json::Value> =
+            lines.iter().filter(|l| l["kind"] == "decision").collect();
+        assert_eq!(decisions.len(), 1, "one recorded decision: {lines:?}");
+        assert_eq!(
+            selected_at(decisions[0], 0),
+            dataset::peer_hash(&s1),
+            "the dataset records the peer used"
+        );
+        assert_eq!(chosen_count(&s1), 1.0, "the peer used is counted as chosen");
+        assert_eq!(chosen_count(&s4), 0.0, "the discarded pick is not credited");
+
+        // Not descended: the cost pick is used as it is.
+        let plain = ring
+            .descended_closest_potentially_hosting(put_log, &key, none.as_slice(), None)
+            .expect("a selection");
+        assert!(!plain.overridden);
+        assert_eq!(plain.peer, s4);
+
+        // Descended with no strictly closer peer: the unrestricted pick comes
+        // back unchanged (the caller stops and replicates to it).
+        let nearest_own = s0.location().unwrap();
+        let stop = ring
+            .descended_closest_potentially_hosting(
+                put_log,
+                &key,
+                none.as_slice(),
+                Some(nearest_own),
+            )
+            .expect("a selection");
+        assert!(!stop.overridden);
+        assert_eq!(stop.peer, s4);
+
+        // A skipped peer is not a candidate for the override.
+        let skip: Vec<SocketAddr> = [s0.socket_addr().unwrap(), s1.socket_addr().unwrap()].to_vec();
+        let skipped = ring
+            .descended_closest_potentially_hosting(put_log, &key, skip.as_slice(), Some(own))
+            .expect("a selection");
+        assert!(
+            !skipped.overridden,
+            "every strictly closer peer is in the skip list"
         );
     }
 
