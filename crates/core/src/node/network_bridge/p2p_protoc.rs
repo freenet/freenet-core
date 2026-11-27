@@ -1853,10 +1853,52 @@ impl P2pConnManager {
 
                 let process_start = Instant::now();
 
+                // BPS instrumentation (investigation only): say what the handler is
+                // doing if it has not returned after 5 s.
+                let bps_desc: String = match &result {
+                    priority_select::SelectResult::Notification(Some(either::Either::Left(m))) => {
+                        format!(
+                            "notification NetMessage tx={}",
+                            crate::message::MessageStats::id(m)
+                        )
+                    }
+                    priority_select::SelectResult::Notification(Some(either::Either::Right(
+                        ev,
+                    ))) => {
+                        let d = format!("{ev:?}");
+                        format!("notification NodeEvent {}", &d[..d.len().min(160)])
+                    }
+                    priority_select::SelectResult::OpExecution(Some(p)) => {
+                        format!("op_execution tx={}", crate::message::MessageStats::id(&p.1))
+                    }
+                    priority_select::SelectResult::PeerConnection(Some(ev)) => {
+                        let d = format!("{ev:?}");
+                        format!("peer_connection {}", &d[..d.len().min(160)])
+                    }
+                    _ => event_type.to_string(),
+                };
+                let bps_own = ctx.bridge.op_manager.ring.connection_manager.get_own_addr();
+                if let Some(a) = bps_own {
+                    crate::operations::op_ctx::BPS_ITER
+                        .lock()
+                        .unwrap()
+                        .insert(a, (loop_iteration_count, bps_desc.clone()));
+                }
                 // Process the result using the existing handler
-                let event = ctx
-                    .process_select_result(result, &mut state, &handshake_cmd_sender)
-                    .await?;
+                let event = {
+                    let fut = ctx.process_select_result(result, &mut state, &handshake_cmd_sender);
+                    tokio::pin!(fut);
+                    let mut bps_waited = 0u32;
+                    loop {
+                        tokio::select! {
+                            r = &mut fut => break r?,
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                bps_waited += 5;
+                                tracing::warn!(?bps_own, waited_s = bps_waited, what = %bps_desc, "BPS event loop handler still running");
+                            }
+                        }
+                    }
+                };
 
                 let elapsed = process_start.elapsed();
                 if elapsed > SLOW_EVENT_THRESHOLD {

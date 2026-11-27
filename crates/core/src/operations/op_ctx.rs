@@ -353,10 +353,31 @@ impl OpCtx {
 
         let (response_sender, mut response_receiver) = mpsc::channel::<WaiterReply>(1);
 
+        let bps_put = msg.id().transaction_type() == crate::message::TransactionType::Put;
+        if bps_put {
+            tracing::info!(tx = %self.tx, free = self.op_execution_sender.capacity(), "BPS send_and_await: before op_execution send");
+            let tx = self.tx;
+            let sender = self.op_execution_sender.clone();
+            tokio::spawn(async move {
+                for secs in [5u64, 10, 15] {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let snap: Vec<String> = BPS_ITER
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(a, (n, d))| format!("{a}:{n}:{}", &d[..d.len().min(60)]))
+                        .collect();
+                    tracing::info!(%tx, secs, queued = 2048usize.saturating_sub(sender.capacity()), loops = ?snap, "BPS watchdog");
+                }
+            });
+        }
         self.op_execution_sender
             .send((response_sender, msg, target_addr))
             .await
             .map_err(|_| OpError::NotificationError)?;
+        if bps_put {
+            tracing::info!(tx = %self.tx, "BPS send_and_await: after op_execution send");
+        }
 
         self.recv_waiter_reply(&mut response_receiver).await
     }
@@ -3088,3 +3109,8 @@ mod tests {
         );
     }
 }
+
+/// BPS investigation only: last event-loop iteration (count, description) per node address.
+pub(crate) static BPS_ITER: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, (u64, String)>>,
+> = std::sync::LazyLock::new(Default::default);

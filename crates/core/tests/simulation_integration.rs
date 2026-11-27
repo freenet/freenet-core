@@ -26261,3 +26261,215 @@ fn run_get_at_htl_zero_sim(ring_max_htl: usize, demandless: bool) -> GetAtHtlZer
             as usize,
     }
 }
+
+/// INVESTIGATION (not for merge): a node issues two 1.2 MB PUTs back to back
+/// and the harness reports, per PUT, which Put events appeared and whether the
+/// origin saw a PutSuccess. Env: BP_GAP_MS (op spacing, default 50), BP_ORIGIN
+/// (gw|node, default node), BP_BIGCODE=1 (put the 1.2 MB in the contract code
+/// instead of the state, as a River room does), BP_NODES (default 8),
+/// BP_N (PUTs, default 2), BP_SAMEORIGIN (default 1).
+#[test_log::test]
+fn test_second_big_put_stall_probe() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+    };
+    let env = |k: &str, d: usize| -> usize {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let gap = Duration::from_millis(env("BP_GAP_MS", 50) as u64);
+    let nodes = env("BP_NODES", 8);
+    let n_puts = env("BP_N", 2);
+    let bigcode = env("BP_BIGCODE", 0) == 1;
+    let gw_origin = std::env::var("BP_ORIGIN").as_deref() == Ok("gw");
+    let same_origin = env("BP_SAMEORIGIN", 1) == 1;
+    const SEED: u64 = 0xB16_9071;
+    const NETWORK: &str = "big-put-stall";
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, nodes, 7, 3, 10, 2, SEED).await;
+        sim.with_streaming_threshold(64 * 1024);
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(300));
+        sim.with_controlled_op_interval(gap);
+        let h = sim.event_logs_handle();
+        (sim, h)
+    });
+    let _ = &mut sim;
+    let mk = |i: usize| -> (ContractContainer, Vec<u8>) {
+        if bigcode {
+            let code: Vec<u8> = (0..1_180_000usize)
+                .map(|j| ((j * 31 + i * 7919) % 251) as u8)
+                .collect();
+            let params = vec![i as u8; 16];
+            let c: ContractContainer = ContractWasmAPIVersion::V1(WrappedContract::new(
+                Arc::new(ContractCode::from(code)),
+                Parameters::from(params),
+            ))
+            .into();
+            (c, vec![i as u8; 200])
+        } else {
+            let c = SimOperation::create_test_contract(0x70 + i as u8);
+            let mut s = vec![(i % 251) as u8; 1_200_000];
+            s[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            (c, s)
+        }
+    };
+    let mut ops = Vec::new();
+    let mut keys = Vec::new();
+    let mut origins = Vec::new();
+    for i in 0..n_puts {
+        let (c, s) = mk(i);
+        keys.push(*c.key().id());
+        let o = if gw_origin {
+            NodeLabel::gateway(NETWORK, 0)
+        } else if same_origin {
+            NodeLabel::node(NETWORK, 1)
+        } else {
+            NodeLabel::node(NETWORK, 1 + i)
+        };
+        origins.push(o.clone());
+        ops.push(ScheduledOperation::new(
+            o,
+            SimOperation::Put {
+                contract: c,
+                state: s,
+                subscribe: false,
+            },
+        ));
+    }
+    if env("BP_SCHED", 0) == 1 {
+        // Sweep-like schedule: slot-granular ops, a PUT every `put_slots`
+        // slots from a rotating origin pool, a 1.2 MB GET by another node
+        // `get_delay` slots after each PUT, gateway filler GETs otherwise.
+        let norig = env("BP_ORIGINS", 12);
+        let put_slots = env("BP_PUT_SLOTS", 80);
+        let get_delay = env("BP_GET_DELAY", 200);
+        let warm = SimOperation::create_test_contract(0x10);
+        let mut sched = vec![ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK, 0),
+            SimOperation::Put {
+                contract: warm.clone(),
+                state: vec![7u8; 64],
+                subscribe: false,
+            },
+        )];
+        for _ in 0..40 {
+            sched.push(ScheduledOperation::new(
+                NodeLabel::gateway(NETWORK, 0),
+                SimOperation::Get {
+                    contract_id: *warm.key().id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ));
+        }
+        origins.clear();
+        let mut gets_due: Vec<(usize, usize)> = Vec::new();
+        let mut idx = 0usize;
+        let mut slot = 0usize;
+        while idx < n_puts || !gets_due.is_empty() {
+            if let Some(pos) = gets_due.iter().position(|(d, _)| *d <= slot) {
+                let (_, i) = gets_due.remove(pos);
+                sched.push(ScheduledOperation::new(
+                    NodeLabel::node(NETWORK, norig + 1 + i % (nodes - norig)),
+                    SimOperation::Get {
+                        contract_id: keys[i],
+                        return_contract_code: true,
+                        subscribe: false,
+                    },
+                ));
+            } else if idx < n_puts && slot % put_slots == 0 {
+                let (c, st) = mk(idx);
+                let o = NodeLabel::node(NETWORK, 1 + idx % norig);
+                origins.push(o.clone());
+                sched.push(ScheduledOperation::new(
+                    o,
+                    SimOperation::Put {
+                        contract: c,
+                        state: st,
+                        subscribe: false,
+                    },
+                ));
+                gets_due.push((slot + get_delay, idx));
+                idx += 1;
+            } else {
+                sched.push(ScheduledOperation::new(
+                    NodeLabel::gateway(NETWORK, 0),
+                    SimOperation::Get {
+                        contract_id: *warm.key().id(),
+                        return_contract_code: false,
+                        subscribe: false,
+                    },
+                ));
+            }
+            slot += 1;
+        }
+        ops = sched;
+    }
+    let result = sim.run_controlled_simulation(
+        SEED,
+        ops,
+        Duration::from_secs(900),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "{:?}",
+        result.turmoil_result.err()
+    );
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let mut all_ok = true;
+    for (i, k) in keys.iter().enumerate() {
+        let ks = k.to_string();
+        let mut evs: Vec<(f64, String, String)> = Vec::new();
+        let mut requester_pref = String::new();
+        let mut resp_to_origin = false;
+        for l in logs.iter() {
+            let d = format!("{:?}", l.kind);
+            if !d.starts_with("Put(") || !d.contains(&ks) {
+                continue;
+            }
+            let t =
+                l.datetime.timestamp() as f64 + l.datetime.timestamp_subsec_nanos() as f64 / 1e9;
+            let variant = d[4..].split([' ', '{']).next().unwrap_or("").to_owned();
+            if variant == "Request" && requester_pref.is_empty() {
+                if let Some(r) = d.split("requester: ").nth(1) {
+                    requester_pref = r.split('@').next().unwrap_or("").to_owned();
+                }
+            }
+            if variant == "ResponseSent" && !requester_pref.is_empty() {
+                if let Some(r) = d.split("to: ").nth(1) {
+                    if r.split('@').next() == Some(requester_pref.as_str()) {
+                        resp_to_origin = true;
+                    }
+                }
+            }
+            let peer = l
+                .peer_id
+                .to_string()
+                .split('@')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            evs.push((t, peer, variant));
+        }
+        evs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let t0 = evs.first().map(|e| e.0).unwrap_or(0.0);
+        let success_at_origin = resp_to_origin;
+        println!(
+            "BP put#{i} origin={:?} n_put_events={} success={}",
+            origins[i],
+            evs.len(),
+            success_at_origin
+        );
+        for (t, p, v) in evs.iter().take(40) {
+            println!("BP   put#{i} t=+{:.3} peer={p} {v}", t - t0);
+        }
+        all_ok &= success_at_origin;
+    }
+    println!("BPRESULT all_ok={all_ok}");
+}

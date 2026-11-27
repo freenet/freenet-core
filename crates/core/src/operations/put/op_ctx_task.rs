@@ -256,6 +256,7 @@ async fn drive_client_put_inner(
     blocking_subscribe: bool,
 ) -> Result<DriverOutcome, OpError> {
     let key = contract.key();
+    tracing::info!(tx = %client_tx, contract = %key, "BPS drive_client_put_inner: entry");
 
     // Always send through send_and_await so process_message handles
     // local storage + hosting/interest/broadcast side effects.
@@ -594,6 +595,7 @@ async fn drive_client_put_inner(
         last_reply_overloaded: false,
     };
 
+    tracing::info!(tx = %client_tx, "BPS drive_client_put_inner: before drive_retry_loop");
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
 
     match loop_result {

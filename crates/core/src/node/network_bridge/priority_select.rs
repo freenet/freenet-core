@@ -393,6 +393,11 @@ where
             match Pin::new(&mut this.op_execution).poll_next(cx) {
                 Poll::Ready(Some(msg)) => {
                     this.high_priority_streak += 1;
+                    if crate::message::MessageStats::id(&msg.1).transaction_type()
+                        == crate::message::TransactionType::Put
+                    {
+                        tracing::info!(tx = %crate::message::MessageStats::id(&msg.1), "BPS select: op_execution PUT dequeued");
+                    }
                     return Poll::Ready(Some(SelectResult::OpExecution(Some(msg))));
                 }
                 Poll::Ready(None) => {

@@ -739,13 +739,9 @@ impl P2pConnManager {
             // interval is handed to the held-legs timer instead.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
-                Ok(claim)
-                    if op_manager.verify_soon.has_forced(
-                        &key,
-                        &peer_key,
-                        op_manager.ring.time_source.now(),
-                    ) =>
-                {
+                // EXPERIMENT (big-put-stall): spawn EVERY heal leg off the event loop,
+                // not only the verify-soon forced ones.
+                Ok(claim) => {
                     Self::spawn_forced_leg(
                         self.bridge.clone(),
                         op_manager.clone(),
@@ -754,18 +750,6 @@ impl P2pConnManager {
                         target,
                         claim,
                     );
-                }
-                Ok(_claim) => {
-                    super::super::broadcast_queue::broadcast_to_single_peer(
-                        &self.bridge,
-                        op_manager,
-                        key,
-                        new_state,
-                        target,
-                        None,
-                        super::super::broadcast_queue::no_fanout(),
-                    )
-                    .await;
                 }
                 Err(wait) => {
                     crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
