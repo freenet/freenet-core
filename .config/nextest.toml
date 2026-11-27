@@ -52,6 +52,16 @@ retries = 0
 filter = "test(lattice_probe_does_not_grow_degree_with_uptime)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# PUT stop rule: two 24-node simulations that each move a 1.2 MB streamed state
+# (about 4 minutes in total locally, so close to the default 240s cap and over it
+# on a slower runner).
+# retries = 0: a deterministic simulation, and three attempts would use most of
+# the Simulation job.
+[[profile.ci.overrides]]
+filter = "test(test_streamed_put_continues_while_a_closer_peer_exists)"
+slow-timeout = { period = "300s", terminate-after = 3 }
+retries = 0
+
 # Mixed-version interop (freenet-ping-app, mixed_version_test.rs). Each test
 # builds one or two Docker NAT networks of old and new binaries and runs PUT,
 # GET, SUBSCRIBE, UPDATE and a large-state transfer across versions; the floor

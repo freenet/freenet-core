@@ -21,6 +21,8 @@ A peer hosts a contract because **real demand routed to it**. "Real demand" is o
 
 The first two drive the **subscription chain** of sections 3–6; the third places an **every-hop copy** retained under the demand gauge of section 9. What a peer does **not** do is keep a copy **durable regardless of demand**: it does not retain a contract merely because it once forwarded a request, because a neighbor pushed it, or because it relayed traffic for it. The every-hop copy from a routed GET/PUT is held under that gauge (retained by its subscriber count and its GET/PUT recency, and the first thing evicted once it has neither), which is exactly what separates legitimate every-hop hosting from the durable relay-caching anti-pattern (section 9). Replication degree is not a tunable global constant; it emerges from where demand exists and how requests route.
 
+*PUT stop rule (2026-11-27).* A PUT hop that the chain descended to stops only when no ready, non-transient, non-skipped connected peer is strictly closer to the key than itself (equal distance is not closer). If the router's cost-ranked pick is not closer but another such peer is, the router ranks only the strictly closer peers and the PUT continues to one of them. First-hop selection at the originator is unchanged. See `put_routing_should_terminate` in `crates/core/src/operations/put/op_ctx_task.rs`.
+
 ### There is no "relay" category
 
 This is the single most important framing point, and it is easy to lose. A peer either **hosts** a contract (it holds the state, is subscribed, and stays fresh in the update mesh) or it **does not**. Forwarding a request one hop closer to the contract's key is just **routing**. It is not a persistent role, not a category, not a state a peer can be "stuck" in.

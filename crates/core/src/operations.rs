@@ -2369,6 +2369,118 @@ mod routing_dataset_call_site_pins {
         );
     }
 
+    /// The PUT stop rule ("stop only when no ready connected peer is strictly
+    /// closer to the key") lives in `Ring::descended_closest_potentially_hosting`
+    /// (selection) and `PutHopCtx::resolve` (stop decision). Every one of the
+    /// four hop drivers must (1) build the hop context, (2) pass
+    /// `hop_ctx.descended_own` to the selection, after the HTL check, (3)
+    /// resolve the selection and USE the result (`hop.terminate`, `hop.peer`),
+    /// and (4) not apply the stop predicate to the router's pick itself. Read
+    /// on masked production code (comments, strings and test modules removed),
+    /// by function body, and failing closed on a missing or duplicated function.
+    #[test]
+    fn put_hop_drivers_apply_the_stop_rule_to_the_resolved_hop() {
+        let production = production(PUT);
+        // (driver, HTL check, where the selection is invoked). `drive_relay_put`
+        // defines the selection as a closure and calls it under the HTL check.
+        for (driver, htl_guard, invoked, forwards_peer) in [
+            (
+                "drive_relay_put",
+                "letnext_hop=ifhtl>0{",
+                "pick(&",
+                "(peer,addr,hop_overridden)",
+            ),
+            (
+                "drive_relay_put_streaming",
+                "letnext_hop=ifhtl>0{",
+                "descended_closest_potentially_hosting(",
+                "else{Some(peer)}",
+            ),
+            (
+                "drive_relay_probe",
+                "letnext_hop=ifhtl>0{",
+                "descended_closest_potentially_hosting(",
+                "matchpeer.socket_addr()",
+            ),
+            (
+                "drive_relay_probe_reconcile",
+                "ifhtl==0{",
+                "descended_closest_potentially_hosting(",
+                "matchpeer.socket_addr()",
+            ),
+        ] {
+            let body = fn_body(&production, driver);
+            let at = |needle: &str| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("{driver}: missing `{needle}`"))
+            };
+            let ctx = at("PutHopCtx::new(");
+            let guard = at(htl_guard);
+            let select = at("descended_closest_potentially_hosting(");
+            let resolve = at("hop_ctx.resolve(");
+            let terminate = at("hop.terminate");
+            assert!(
+                ctx < select,
+                "{driver}: the hop context precedes the selection"
+            );
+            assert!(
+                guard < at(invoked),
+                "{driver}: HTL is checked before the selection"
+            );
+            assert!(select < resolve && resolve < terminate, "{driver}: order");
+            assert!(
+                body[select..resolve].contains("hop_ctx.descended_own"),
+                "{driver}: the selection must be given the descended location"
+            );
+            let peer_bound = body[resolve..]
+                .find("letpeer=hop.peer;")
+                .unwrap_or_else(|| panic!("{driver}: the resolved peer is not bound"));
+            assert!(
+                body[resolve + peer_bound..].contains(forwards_peer),
+                "{driver}: the resolved peer must be the one forwarded to (`{forwards_peer}`)"
+            );
+            for forbidden in [
+                "put_routing_should_terminate(",
+                "is_strictly_closer(",
+                "closest_potentially_hosting(DecisionLog",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{driver}: must not decide the stop itself (`{forbidden}`)"
+                );
+            }
+        }
+
+        // The stop decision itself: terminate only through the predicate,
+        // which an override always satisfies.
+        let resolve = fn_body(&production, "resolve");
+        assert!(resolve.contains("put_routing_should_terminate("));
+        assert!(resolve.contains("selection.overridden"));
+        let ring = fn_body(&production_ring(), "descended_closest_potentially_hosting");
+        assert!(ring.contains("strictly_closer_candidates("));
+        assert!(ring.contains("log.record("));
+
+        // The non-streaming terminus still replicates to the router's
+        // unrestricted pick (`hop.peer` is that pick when the hop stops).
+        let relay = fn_body(&production, "drive_relay_put");
+        assert!(relay.contains("letpeer=hop.peer;"));
+        assert!(relay.contains("letreplicate_to=peer.socket_addr();"));
+        // Every failure of a forward to an overridden hop finalizes locally:
+        // waiter registration, stream send, send/recv error, timeout.
+        assert_eq!(
+            relay
+                .matches("put_forward_failure_finalizes_locally(hop_overridden)")
+                .count(),
+            5,
+            "each forward-failure arm and the downstream-error arm of drive_relay_put \
+             must consult the override flag"
+        );
+    }
+
+    fn production_ring() -> String {
+        production(include_str!("ring.rs"))
+    }
+
     #[test]
     fn subscribe_sites_are_classified() {
         check(
