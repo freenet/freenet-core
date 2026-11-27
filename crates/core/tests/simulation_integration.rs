@@ -23907,10 +23907,14 @@ fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
         all.iter().filter(|(_, _, native, _)| *native).count() as u64,
         causes.get("native").copied().unwrap_or(0)
     );
-    let share = treated / decided as f64;
+    // D-8: the decision causes above are the check. `treated / decided` is a
+    // ratio of two counters taken at different points (a retried dial counts
+    // again) and can pass 1, so it is not asserted; no decision is refused
+    // for lack of setup room (`setup_refused` would fail the cause check), and
+    // most decisions are native.
     assert!(
-        (0.5..=1.0).contains(&share),
-        "native share {share:.2} of {decided} decisions: at 100% most decided pairs go native"
+        native_count * 2 >= decided as u64,
+        "{native_count} native of {decided} decisions: at 100% most decided pairs go native: {causes:?}"
     );
     assert_eq!(t.undecodable_closes(), 0);
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
