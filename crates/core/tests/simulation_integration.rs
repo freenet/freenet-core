@@ -26375,3 +26375,127 @@ fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
         "a node's event loop was held for {longest:?} by one event"
     );
 }
+
+/// Every node's second large PUT starts. Before the fix, the simulation build
+/// healed a stale peer by awaiting the send inside the node's event loop, and
+/// that send waits for its stream's completion, which the same loop has to
+/// dispatch. A node that had healed a peer was wedged from then on, so its next
+/// client PUT was never dequeued: it logged "client request received" and
+/// nothing after, and the harness read the sweep's PUT failures and GET misses
+/// from it. The schedule is the one that exposed it: 30 nodes, 24 PUTs of 1.2 MB
+/// 4 s apart from a rotation of 12 origins (so each origin issues two), filler
+/// GETs in between, and a GET of each PUT's contract 10 s later.
+///
+/// It takes about six minutes (30 nodes, 24 streamed PUTs), so it runs in the
+/// nightly simulation job (`nightly_tests`), not in PR CI;
+/// `test_heal_of_a_streamed_state_does_not_block_the_event_loop` is the PR-CI
+/// guard for the same defect.
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_every_origins_second_large_put_starts() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "second-big-put";
+    const SEED: u64 = 0xB16_9071;
+    const NODES: usize = 30;
+    const ORIGINS: usize = 12;
+    const PUTS: usize = 24;
+    const PUT_EVERY_SLOTS: usize = 80;
+    const GET_AFTER_SLOTS: usize = 200;
+    const STATE_LEN: usize = 1_200_000;
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, NODES, 7, 3, 10, 2, SEED).await;
+        sim.with_streaming_threshold(64 * 1024);
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(300));
+        sim.with_controlled_op_interval(Duration::from_millis(50));
+        sim
+    });
+    drop(rt);
+    let origin_of = |i: usize| NodeLabel::node(NETWORK, 1 + i % ORIGINS);
+    let contracts: Vec<_> = (0..PUTS)
+        .map(|i| SimOperation::create_test_contract(0x70 + i as u8))
+        .collect();
+    let warm = SimOperation::create_test_contract(0x10);
+    let filler = || {
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK, 0),
+            SimOperation::Get {
+                contract_id: *warm.key().id(),
+                return_contract_code: false,
+                subscribe: false,
+            },
+        )
+    };
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK, 0),
+        SimOperation::Put {
+            contract: warm.clone(),
+            state: vec![7u8; 64],
+            subscribe: false,
+        },
+    )];
+    operations.extend((0..40).map(|_| filler()));
+    let mut gets_due: Vec<(usize, usize)> = Vec::new();
+    let (mut next_put, mut slot) = (0usize, 0usize);
+    while next_put < PUTS || !gets_due.is_empty() {
+        if let Some(pos) = gets_due.iter().position(|(due, _)| *due <= slot) {
+            let (_, i) = gets_due.remove(pos);
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(NETWORK, ORIGINS + 1 + i % (NODES - ORIGINS)),
+                SimOperation::Get {
+                    contract_id: *contracts[i].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else if next_put < PUTS && slot % PUT_EVERY_SLOTS == 0 {
+            let mut state = vec![(next_put % 251) as u8; STATE_LEN];
+            state[..8].copy_from_slice(&(next_put as u64).to_le_bytes());
+            operations.push(ScheduledOperation::new(
+                origin_of(next_put),
+                SimOperation::Put {
+                    contract: contracts[next_put].clone(),
+                    state,
+                    subscribe: false,
+                },
+            ));
+            gets_due.push((slot + GET_AFTER_SLOTS, next_put));
+            next_put += 1;
+        } else {
+            operations.push(filler());
+        }
+        slot += 1;
+    }
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    // A PUT that never left its origin's operation queue never stored its
+    // state at the origin either.
+    let never_started: Vec<usize> = (0..PUTS)
+        .filter(|&i| {
+            result
+                .node_storages
+                .get(&origin_of(i))
+                .and_then(|storage| storage.get_stored_state(&contracts[i].key()))
+                .is_none()
+        })
+        .collect();
+    let longest = GlobalTestMetrics::longest_event_loop_event();
+    assert!(
+        never_started.is_empty(),
+        "PUTs that never started at their origin: {never_started:?} (longest event-loop event {longest:?})"
+    );
+    assert!(
+        longest < Duration::from_secs(10),
+        "a node's event loop was held for {longest:?} by one event"
+    );
+}

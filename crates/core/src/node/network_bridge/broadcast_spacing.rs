@@ -319,6 +319,16 @@ mod tests {
             );
         }
 
+        // The fan-out runs on the event loop too, so it must not await a send
+        // that waits for its stream's completion: it enqueues streams without
+        // a completion (`send_stream`) and hands forced legs to `spawn_leg`.
+        for awaited in ["broadcast_to_single_peer(", "send_stream_with_completion("] {
+            assert!(
+                !sim.contains(awaited),
+                "the simulation fan-out must not await `{awaited}` on the event loop"
+            );
+        }
+
         // The targeted heal shares the queue in production; the simulation
         // calls the send directly, so it must take the same claim.
         let heal = region(
