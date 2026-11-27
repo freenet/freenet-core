@@ -6599,7 +6599,7 @@ async fn a_native_join_without_a_connect_request_is_closed_after_the_deadline() 
     let stamp = zombie_sweep::LinkUseStamp::new(now);
     super::watch_native_join(entry.downgrade(), stamp.clone(), addr);
     stamp.record(now);
-    stamp.record_connect_request();
+    stamp.record_connect_request(now);
     tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN * 2).await;
     assert!(
         notices.try_recv().is_err(),

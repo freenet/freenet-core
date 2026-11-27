@@ -79,7 +79,17 @@ pub(super) const LINK_USE_EXEMPT_PER_IP_CAP: usize = 2;
 /// Divisor of `max_connections` giving the most transports, across all remotes,
 /// that may be kept alive by recent requests alone. See
 /// [`link_use_exempt_global_cap`].
-const LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR: usize = 4;
+const LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR: usize = 2;
+
+/// A transport whose remote sent a ConnectRequest within this long is not
+/// evicted by the global cap (see [`plan_zombie_sweep`]): it is mid-join, and
+/// an eviction would end the join. Twice the 60s pending-reservation window.
+pub(super) const CONNECT_REQUEST_PROTECTION: Duration = Duration::from_secs(120);
+
+/// Transports protected by [`CONNECT_REQUEST_PROTECTION`] may exceed the
+/// global cap, up to this multiple of it. The bound exists because a remote
+/// can send a ConnectRequest over every transport it opens.
+const CONNECT_PROTECTED_CAP_MULTIPLE: usize = 2;
 
 /// Most zombie transports dropped in one sweep slice. Each drop involves
 /// topology pruning and orphaned-transaction handling, and its final send to
@@ -127,15 +137,18 @@ pub(super) fn slice_spacing(last_slice_took: Duration) -> Duration {
 }
 
 /// The most transports, across all remotes, that may be kept alive by recent
-/// requests alone: a quarter of `max_connections`, and never fewer than
+/// requests alone: half of `max_connections`, and never fewer than
 /// [`LINK_USE_EXEMPT_PER_IP_CAP`].
 ///
 /// Such a transport is a route for a peer that is not in this node's ring, so
 /// its cost is ordinary per-connection work. Deriving the cap from
 /// `max_connections` ties it to the load the operator configured this node to
-/// carry, and a quarter keeps that extra load well below the ring's own budget
-/// (50 at the production default of 200). The floor keeps the exemption usable
-/// on the small `max_connections` values used in simulation and tests.
+/// carry. It was a quarter (50 at the production default of 200), and both
+/// production gateways sat at that cap, evicting 480-620 links an hour, while
+/// the demand the cap was cutting off measured about 55 on average and 63 at
+/// the peak. Half (100) leaves about 1.6x headroom over the peak. The floor
+/// keeps the exemption usable on the small `max_connections` values used in
+/// simulation and tests.
 pub(super) fn link_use_exempt_global_cap(max_connections: usize) -> usize {
     (max_connections / LINK_USE_EXEMPT_MAX_CONNECTIONS_DIVISOR).max(LINK_USE_EXEMPT_PER_IP_CAP)
 }
@@ -274,7 +287,9 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
 pub(super) struct LinkUseStamp {
     base: Instant,
     micros_since_base: Arc<std::sync::atomic::AtomicU64>,
-    connect_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Microseconds after `base` of the latest ConnectRequest, plus one, so
+    /// that zero means none has arrived.
+    connect_micros_plus_one: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LinkUseStamp {
@@ -282,20 +297,36 @@ impl LinkUseStamp {
         Self {
             base,
             micros_since_base: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            connect_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            connect_micros_plus_one: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// Records that a ConnectRequest arrived.
-    pub(super) fn record_connect_request(&self) {
-        self.connect_requested
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+    /// Records that a ConnectRequest arrived at `now`.
+    pub(super) fn record_connect_request(&self, now: Instant) {
+        let micros = u64::try_from(now.saturating_duration_since(self.base).as_micros())
+            .unwrap_or(u64::MAX - 1);
+        self.connect_micros_plus_one
+            .fetch_max(micros + 1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a ConnectRequest has arrived over the transport.
     pub(super) fn connect_requested(&self) -> bool {
-        self.connect_requested
+        self.connect_micros_plus_one
             .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
+    /// The instant of the most recent ConnectRequest, if any has arrived.
+    pub(super) fn last_connect_request(&self) -> Option<Instant> {
+        let stored = self
+            .connect_micros_plus_one
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let micros = stored.checked_sub(1)?;
+        Some(
+            self.base
+                .checked_add(Duration::from_micros(micros))
+                .unwrap_or(self.base),
+        )
     }
 
     pub(super) fn record(&self, now: Instant) {
@@ -335,7 +366,7 @@ pub(super) fn record_link_use_request(
         msg,
         NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { .. }))
     ) {
-        stamp.record_connect_request();
+        stamp.record_connect_request(now);
     }
     stamp.record(now);
     true
@@ -467,7 +498,18 @@ pub(super) struct SweepCandidate {
     /// Time since its remote last sent a request over it (see
     /// [`TransportActivity::idle`]); orders cap eviction.
     pub(super) idle: Duration,
+    /// Time since its remote last sent a ConnectRequest, if it ever did.
+    pub(super) connect_idle: Option<Duration>,
     pub(super) verdict: ZombieVerdict,
+}
+
+impl SweepCandidate {
+    /// Whether the remote sent a ConnectRequest recently enough that the
+    /// global cap must not evict this transport ([`CONNECT_REQUEST_PROTECTION`]).
+    fn connect_protected(&self) -> bool {
+        self.connect_idle
+            .is_some_and(|d| d <= CONNECT_REQUEST_PROTECTION)
+    }
 }
 
 /// Which transports one sweep slice drops, and why.
@@ -556,11 +598,14 @@ pub(super) fn plan_zombie_sweep(
         }
     }
 
-    // Most recently used first, then youngest; the address breaks remaining
-    // ties so the plan is deterministic.
+    // Transports mid-join (a ConnectRequest within
+    // [`CONNECT_REQUEST_PROTECTION`]) first, then most recently used, then
+    // youngest; the address breaks remaining ties so the plan is
+    // deterministic.
     exempt.sort_by(|a, b| {
-        a.idle
-            .cmp(&b.idle)
+        b.connect_protected()
+            .cmp(&a.connect_protected())
+            .then_with(|| a.idle.cmp(&b.idle))
             .then_with(|| a.age.cmp(&b.age))
             .then_with(|| a.addr.cmp(&b.addr))
     });
@@ -574,7 +619,11 @@ pub(super) fn plan_zombie_sweep(
         if *held >= per_ip_cap {
             plan.over_per_ip_cap += 1;
             over_cap.push(candidate);
-        } else if plan.kept_for_link_use.len() >= global_cap {
+        } else if plan.kept_for_link_use.len() >= global_cap
+            && !(candidate.connect_protected()
+                && plan.kept_for_link_use.len()
+                    < global_cap.saturating_mul(CONNECT_PROTECTED_CAP_MULTIPLE))
+        {
             plan.over_global_cap += 1;
             over_cap.push(candidate);
         } else {
@@ -611,6 +660,10 @@ pub(super) fn plan_sweep(
             let is_gateway = gateways.iter().any(|gw| gw.socket_addr() == Some(*addr));
             let age = now.saturating_duration_since(entry.created_at);
             let idle = now.saturating_duration_since(entry.link_use.last_use());
+            let connect_idle = entry
+                .link_use
+                .last_connect_request()
+                .map(|at| now.saturating_duration_since(at));
             let verdict = zombie_verdict(
                 TransportActivity { age, idle },
                 connection_manager.is_in_ring(*addr),
@@ -622,6 +675,7 @@ pub(super) fn plan_sweep(
                 addr: *addr,
                 age,
                 idle,
+                connect_idle,
                 verdict,
             }
         })
@@ -884,6 +938,19 @@ impl P2pConnManager {
 
         let slice = plan.slice(MAX_ZOMBIE_CLEANUP_PER_CYCLE);
         for addr in &slice.reap {
+            // One line per cap eviction: at most MAX_ZOMBIE_CLEANUP_PER_CYCLE
+            // per slice, so the volume is bounded without a separate limiter.
+            if plan.over_cap.contains(addr) {
+                if let Some(c) = candidates.iter().find(|c| c.addr == *addr) {
+                    tracing::info!(
+                        evicted_addr = %addr,
+                        age_secs = c.age.as_secs(),
+                        idle_secs = c.idle.as_secs(),
+                        connect_idle_secs = ?c.connect_idle.map(|d| d.as_secs()),
+                        "Zombie sweep cap eviction of a transport still in use"
+                    );
+                }
+            }
             self.drop_zombie_connection(*addr, handshake_cmd_sender)
                 .await;
         }
@@ -1103,16 +1170,85 @@ mod tests {
             addr: addr(a),
             age: Duration::from_secs(age_secs),
             idle: Duration::from_secs(idle_secs),
+            connect_idle: None,
             verdict: ZombieVerdict::KeepForLinkUse,
         }
     }
 
     #[test]
     fn global_cap_derives_from_max_connections() {
-        assert_eq!(link_use_exempt_global_cap(200), 50);
-        assert_eq!(link_use_exempt_global_cap(25), 6);
+        // Half of max_connections: production gateways measured ~55 average
+        // and ~63 peak uncapped demand, which a cap of 50 truncated.
+        assert_eq!(link_use_exempt_global_cap(200), 100);
+        assert!(link_use_exempt_global_cap(200) >= 63 + 63 / 2);
+        assert_eq!(link_use_exempt_global_cap(25), 12);
         assert_eq!(link_use_exempt_global_cap(5), LINK_USE_EXEMPT_PER_IP_CAP);
         assert_eq!(link_use_exempt_global_cap(0), LINK_USE_EXEMPT_PER_IP_CAP);
+    }
+
+    fn mid_join(a: &str, idle_secs: u64, connect_idle_secs: u64) -> SweepCandidate {
+        SweepCandidate {
+            connect_idle: Some(Duration::from_secs(connect_idle_secs)),
+            ..exempt(a, idle_secs)
+        }
+    }
+
+    /// A transport that sent a ConnectRequest within the protection window is
+    /// not cap-evicted, even when it is the least recently used; one whose
+    /// ConnectRequest is older, or that never sent one, still is.
+    #[test]
+    fn global_cap_spares_a_transport_mid_join() {
+        let plan = plan_zombie_sweep(
+            [
+                exempt("198.51.100.1:1", 10),
+                exempt("198.51.100.2:1", 20),
+                mid_join("198.51.100.3:1", 80, 100),
+                mid_join("198.51.100.4:1", 85, 121),
+            ],
+            2,
+            2,
+        );
+        assert!(
+            plan.kept_for_link_use.contains(&addr("198.51.100.3:1")),
+            "mid-join transport must be kept: {plan:?}"
+        );
+        assert_eq!(plan.kept_for_link_use.len(), 2);
+        assert!(
+            plan.over_cap.contains(&addr("198.51.100.4:1")),
+            "a ConnectRequest older than the window gives no protection: {plan:?}"
+        );
+        assert_eq!(plan.over_cap.len(), 2);
+    }
+
+    /// The protection is bounded: a remote cannot pin unlimited transports by
+    /// sending a ConnectRequest on each.
+    #[test]
+    fn mid_join_protection_is_bounded_by_a_multiple_of_the_cap() {
+        let candidates: Vec<_> = (1..=10)
+            .map(|i| mid_join(&format!("198.51.100.{i}:1"), 5, 5))
+            .collect();
+        let plan = plan_zombie_sweep(candidates, 2, 2);
+        assert_eq!(
+            plan.kept_for_link_use.len(),
+            2 * CONNECT_PROTECTED_CAP_MULTIPLE
+        );
+        assert_eq!(plan.over_cap.len(), 10 - 2 * CONNECT_PROTECTED_CAP_MULTIPLE);
+    }
+
+    /// `plan_sweep` fills `connect_idle` from the stamp the listener writes.
+    #[test]
+    fn plan_sweep_reads_connect_recency_from_the_stamp() {
+        let now = Instant::now() + Duration::from_secs(10_000);
+        let cm = crate::ring::ConnectionManager::test_default();
+        let a = addr("198.51.100.9:5000");
+        let mut connections = BTreeMap::new();
+        let e = entry_at(now, 400, 10);
+        e.link_use
+            .record_connect_request(now - Duration::from_secs(30));
+        connections.insert(a, e);
+        let (candidates, _) = plan_sweep(&connections, &[], &cm, now);
+        assert_eq!(candidates[0].connect_idle, Some(Duration::from_secs(30)));
+        assert!(candidates[0].connect_protected());
     }
 
     #[test]
@@ -1323,6 +1459,7 @@ mod tests {
             addr: addr("192.0.2.1:1"),
             age: Duration::from_secs(1000),
             idle: Duration::from_secs(1000),
+            connect_idle: None,
             verdict: ZombieVerdict::Reap,
         }];
         candidates.push(exempt("198.51.100.1:1", 500));
@@ -1331,6 +1468,7 @@ mod tests {
             addr: addr("192.0.2.2:1"),
             age: Duration::from_secs(60),
             idle: Duration::from_secs(60),
+            connect_idle: None,
             verdict: ZombieVerdict::Keep,
         });
         let plan = plan_zombie_sweep(candidates, 2, 1);
@@ -1351,6 +1489,7 @@ mod tests {
                 addr: SocketAddr::from(([192, 0, 2, 1], i + 1)),
                 age: Duration::from_secs(1000),
                 idle: Duration::from_secs(1000),
+                connect_idle: None,
                 verdict: ZombieVerdict::Reap,
             })
             .collect();
@@ -1411,6 +1550,7 @@ mod tests {
                     addr: addr("192.0.2.1:1"),
                     age: Duration::from_secs(900),
                     idle: Duration::from_secs(900),
+                    connect_idle: None,
                     verdict: ZombieVerdict::Reap,
                 },
                 exempt("198.51.100.1:1", 100),
@@ -1748,14 +1888,14 @@ mod tests {
     }
 
     /// The caps `plan_sweep` applies come from the connection manager: with
-    /// `max_connections` 8 the global cap is 2, and the per-IP cap is 2. This
+    /// `max_connections` 4 the global cap is 2, and the per-IP cap is 2. This
     /// fails if `plan_sweep` stops passing either cap.
     #[test]
     fn plan_sweep_applies_both_caps_from_the_connection_manager() {
         let now = Instant::now() + Duration::from_secs(10_000);
         let mut cm = crate::ring::ConnectionManager::test_default();
         // test_default: transient_ttl 60s, so a zombie by age after 180s.
-        cm.max_connections = 8;
+        cm.max_connections = 4;
 
         let mut connections = BTreeMap::new();
         // Three transports from one IP, all past the 180s age threshold and in
