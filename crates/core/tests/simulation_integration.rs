@@ -26342,14 +26342,25 @@ fn hs_run(
     policy_name: &str,
 ) -> String {
     use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
-    const SLOT_MS: u64 = 100;
-    const NODES: usize = 60;
-    const WARM_CONTRACTS: usize = 70;
-    const WARM_GETS_PER_NODE: usize = 56;
-    const STATE_BYTES: usize = 1_200_000;
-    // GET delay after the PUT, in slots: +10 s and +60 s.
-    const DELAYS: [usize; 2] = [100, 600];
+    let env_usize = |k: &str, d: usize| -> usize {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let slot_ms: u64 = env_usize("HS_SLOT_MS", 50) as u64;
+    let nodes: usize = env_usize("HS_NODES", 30);
+    let band_dense = nodes * 2 / 5;
+    let warm_gets_per_node = env_usize("HS_WARM_GETS", 110);
+    let warm_contracts = warm_gets_per_node + 24;
+    let state_bytes = env_usize("HS_STATE_BYTES", 1_200_000);
+    // GET delay after the PUT, in slots: +10 s and +60 s of virtual time.
+    let slots_per_s = (1000 / slot_ms) as usize;
+    let delays: [usize; 2] = [10 * slots_per_s, 60 * slots_per_s];
+    // Gap between measured PUTs (the gateway streams ~1.2 MB each).
+    let put_gap = env_usize("HS_PUT_GAP_S", 3) * slots_per_s;
     let debug = std::env::var("HS_DEBUG").is_ok();
+    let wall0 = std::time::Instant::now();
 
     // Gateway location, as in the placement-gap sim.
     setup_deterministic_state(seed);
@@ -26366,11 +26377,13 @@ fn hs_run(
             targets.push(hs_wrap(c + off));
         }
     } else {
-        for i in 0..24 {
-            targets.push(hs_wrap(c - 0.075 + 0.15 * (i as f64 + 0.5) / 24.0));
+        for i in 0..band_dense {
+            targets.push(hs_wrap(
+                c - 0.075 + 0.15 * (i as f64 + 0.5) / band_dense as f64,
+            ));
         }
     }
-    let rest = NODES - targets.len();
+    let rest = nodes - targets.len();
     for i in 0..rest {
         targets.push(hs_wrap(c + 0.15 + 0.70 * (i as f64 + 0.5) / rest as f64));
     }
@@ -26383,16 +26396,16 @@ fn hs_run(
     let rt = create_runtime();
     let (mut sim, logs_handle) = rt.block_on(async {
         let mut sim =
-            SimNetwork::new_with_node_locations(network, 1, NODES, 10, 7, 12, 4, seed, &targets)
+            SimNetwork::new_with_node_locations(network, 1, nodes, 10, 7, 12, 4, seed, &targets)
                 .await;
         sim.with_streaming_threshold(64 * 1024);
         sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
-        sim.with_controlled_op_interval(Duration::from_millis(SLOT_MS));
+        sim.with_controlled_op_interval(Duration::from_millis(slot_ms));
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle)
     });
     let locs = sim.get_peer_locations(); // gateway first
-    assert_eq!(locs.len(), 1 + NODES);
+    assert_eq!(locs.len(), 1 + nodes);
     assert!((locs[0] - g).abs() < 1e-9, "gateway location changed");
 
     let mut rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
@@ -26408,8 +26421,8 @@ fn hs_run(
     let mut churned: Vec<usize> = Vec::new();
     let mut lossy: Option<usize> = None;
     if cond == "churn" {
-        while churned.len() < NODES / 10 {
-            let n = 1 + next_rand() % NODES;
+        while churned.len() < nodes / 10 {
+            let n = 1 + next_rand() % nodes;
             if !churned.contains(&n) {
                 churned.push(n);
             }
@@ -26418,7 +26431,7 @@ fn hs_run(
     }
     if cond == "lossy" {
         // The regular node geometrically closest to the middle of the key band.
-        let n = (1..=NODES)
+        let n = (1..=nodes)
             .min_by(|&a, &b| hs_dist(locs[a], c).total_cmp(&hs_dist(locs[b], c)))
             .unwrap();
         lossy = Some(n);
@@ -26427,7 +26440,7 @@ fn hs_run(
     }
 
     // Measured contracts: keys inside c +/- 0.075, 2 cohorts (+10 s, +60 s).
-    let total = DELAYS.len() * per_cohort;
+    let total = 3 * per_cohort; // +10 s, +60 s, census (no GET)
     let mut containers = Vec::new();
     let mut key_locs = Vec::new();
     for s in 0..u16::MAX {
@@ -26443,14 +26456,32 @@ fn hs_run(
     }
     assert_eq!(containers.len(), total, "not enough keys in the band");
     // Warm-up contracts: small, anywhere, ids disjoint from the measured ones.
-    let warm: Vec<_> = (0..WARM_CONTRACTS)
+    let warm: Vec<_> = (0..warm_contracts)
         .map(|i| hs_contract(40000 + i as u16))
         .collect();
 
+    // PUT originators: the gateway (HS_ORIGIN=gw) or a pool of the regular nodes
+    // ring-nearest to the gateway, round-robin (default; a gateway origin was
+    // found to complete only its first 1.2 MB PUT in this harness).
+    let origins: Vec<NodeLabel> = if std::env::var("HS_ORIGIN").as_deref() == Ok("gw") {
+        vec![NodeLabel::gateway(network, 0)]
+    } else {
+        let mut near: Vec<usize> = (1..=nodes).filter(|n| !excluded.contains(n)).collect();
+        near.sort_by(|&a, &b| hs_dist(locs[a], g).total_cmp(&hs_dist(locs[b], g)));
+        near.iter()
+            .take(8)
+            .map(|&n| NodeLabel::node(network, n))
+            .collect()
+    };
+    for o in &origins {
+        if o.is_node() {
+            excluded.insert(o.number());
+        }
+    }
     // Requester per measured contract: below the key, ring distance 0.18..0.40.
     let mut requester = Vec::new();
     for kl in &key_locs {
-        let cand: Vec<usize> = (1..=NODES)
+        let cand: Vec<usize> = (1..=nodes)
             .filter(|n| !excluded.contains(n))
             .filter(|&n| (0.18..=0.40).contains(&hs_wrap(kl - locs[n])))
             .collect();
@@ -26474,9 +26505,9 @@ fn hs_run(
     let settle_slots = 100usize;
     // Each node GETs WARM_GETS_PER_NODE distinct warm contracts (round-robin
     // over nodes so no node issues two ops back to back).
-    for k in 0..WARM_GETS_PER_NODE {
-        for n in 1..=NODES {
-            let w = &warm[(n + k * 7) % WARM_CONTRACTS];
+    for k in 0..warm_gets_per_node {
+        for n in 1..=nodes {
+            let w = &warm[(n + k * 7) % warm_contracts];
             ops.push(ScheduledOperation::new(
                 NodeLabel::node(network, n),
                 SimOperation::Get {
@@ -26489,14 +26520,26 @@ fn hs_run(
     }
     let _ = settle_slots;
     let measure_start_slot = ops.len();
-    // Measured phase: PUT one contract every slot... spaced 2 slots so streaming
-    // transfers overlap less; each GET becomes due `delay` slots after its PUT.
+    // Measured phase: one PUT every `put_gap` slots; each GET is due `delay`
+    // slots after its PUT; idle slots are filled with a gateway GET of a warm
+    // contract it holds (a local hit), so a GET is never issued early.
+    let filler = |network: &str| {
+        ScheduledOperation::new(
+            NodeLabel::gateway(network, 0),
+            SimOperation::Get {
+                contract_id: *warm[0].key().id(),
+                return_contract_code: false,
+                subscribe: false,
+            },
+        )
+    };
     let mut pending: Vec<(usize, usize)> = Vec::new(); // (due slot, contract)
-    let churn_at = measure_start_slot + total / 2;
+    let churn_at = measure_start_slot + total * put_gap / 2;
     let mut crash_done = false;
     let mut recover_at: Option<usize> = None;
     let mut next_put = 0usize;
     let mut slot = measure_start_slot;
+    let mut next_put_slot = measure_start_slot;
     while next_put < total || !pending.is_empty() {
         if cond == "churn" && !crash_done && slot >= churn_at {
             for &n in &churned {
@@ -26507,7 +26550,7 @@ fn hs_run(
                 slot += 1;
             }
             crash_done = true;
-            recover_at = Some(slot + 600);
+            recover_at = Some(slot + 60 * slots_per_s);
             continue;
         }
         if let Some(at) = recover_at {
@@ -26523,19 +26566,7 @@ fn hs_run(
                 continue;
             }
         }
-        let due = pending.iter().position(|(d, _)| *d <= slot);
-        let pick = due.or_else(|| {
-            if next_put >= total {
-                pending
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, (d, _))| *d)
-                    .map(|(i, _)| i)
-            } else {
-                None
-            }
-        });
-        if let Some(pos) = pick {
+        if let Some(pos) = pending.iter().position(|(d, _)| *d <= slot) {
             let (_, ci) = pending.remove(pos);
             ops.push(ScheduledOperation::new(
                 NodeLabel::node(network, requester[ci]),
@@ -26545,27 +26576,33 @@ fn hs_run(
                     subscribe: false,
                 },
             ));
-        } else {
+        } else if next_put < total && slot >= next_put_slot {
             let ci = next_put;
             next_put += 1;
-            // Interleave the cohorts: even index = +10 s, odd = +60 s.
-            let delay = DELAYS[ci % DELAYS.len()];
+            next_put_slot = slot + put_gap;
+            // ci % 3: 0 = +10 s cohort, 1 = +60 s cohort, 2 = census (no GET).
+            let delay = delays[ci % 3 % delays.len()];
             ops.push(ScheduledOperation::new(
-                NodeLabel::gateway(network, 0),
+                origins[ci % origins.len()].clone(),
                 SimOperation::Put {
                     contract: containers[ci].clone(),
                     state: {
-                        let mut s = vec![(ci % 251) as u8; STATE_BYTES];
+                        let mut s = vec![(ci % 251) as u8; state_bytes];
                         s[..8].copy_from_slice(&(ci as u64).to_le_bytes());
                         s
                     },
                     subscribe: true,
                 },
             ));
-            pending.push((slot + delay, ci));
+            if ci % 3 != 2 {
+                pending.push((slot + delay, ci));
+            }
+        } else {
+            ops.push(filler(network));
         }
         slot += 1;
     }
+    let wall_setup = wall0.elapsed().as_secs_f64();
 
     let result = sim.run_controlled_simulation(
         seed,
@@ -26643,13 +26680,17 @@ fn hs_run(
     let mut put_lat = Vec::new();
     let mut put_fail = 0usize;
     let mut get_lat = Vec::new();
+    let mut ages: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
     let mut found = [0usize; 2];
     let mut n_get = [0usize; 2];
     let mut replicas = Vec::new();
     let mut per_peer: HashMap<String, usize> = HashMap::new();
     let mut dump_left = if debug { 3 } else { 0 };
     for (ci, ct) in containers.iter().enumerate() {
-        let coh = ci % DELAYS.len();
+        let coh = ci % 3;
+        if coh == 2 {
+            continue; // census contract: placement only, measured below
+        }
         let evs = by_inst
             .get(&ct.key().id().to_string())
             .map(Vec::as_slice)
@@ -26680,22 +26721,32 @@ fn hs_run(
         if let Some(t) = term {
             let start = get_start.unwrap_or(t.t);
             first_get = start;
+            ages[coh].push(start - put_start);
             if t.d.contains("outcome: Success") {
                 found[coh] += 1;
             }
             get_lat.push((t.t - start).max(0.0));
         }
-        // PUT end: the originator's (the peer that logged the first Put event)
-        // first terminal event after its start.
+        // PUT latency: first Put event to the first response delivered to the
+        // originator (the requester of the earliest Request).
         let origin = puts
             .iter()
+            .filter(|e| variant(e, 4) == "Request")
             .min_by(|a, b| a.t.total_cmp(&b.t))
-            .map(|e| e.peer.clone());
+            .and_then(|e| {
+                hs_field(&e.d, "requester: ").map(|r| r.split('@').next().unwrap_or("").to_owned())
+            });
         let mut ok = false;
         if let Some(o) = &origin {
             let end = puts
                 .iter()
-                .filter(|e| &e.peer == o && (variant(e, 4) == "PutSuccess"))
+                .filter(|e| {
+                    variant(e, 4) == "ResponseSent"
+                        && e.d
+                            .split("to: ")
+                            .nth(1)
+                            .is_some_and(|r| r.split('@').next() == Some(o.as_str()))
+                })
                 .map(|e| e.t)
                 .fold(f64::INFINITY, f64::min);
             if end.is_finite() {
@@ -26706,15 +26757,20 @@ fn hs_run(
         if !ok {
             put_fail += 1;
         }
-        // Replicas after the PUT, before the first GET: peers that stored.
-        let stored: HashSet<&str> = puts
-            .iter()
-            .filter(|e| variant(e, 4) == "PutSuccess" && e.t < first_get)
-            .map(|e| e.peer.as_str())
-            .collect();
-        replicas.push(stored.len() as f64);
-        for p in &stored {
-            *per_peer.entry((*p).to_owned()).or_default() += 1;
+        if debug && puts.is_empty() {
+            let inst = ct.key().id().to_string();
+            eprintln!("HS no-put contract {ci}: other events mentioning it:");
+            let mut shown = 0;
+            for l in logs.iter() {
+                let d = format!("{:?}", l.kind);
+                if d.contains(&inst) && !d.starts_with("Get(") {
+                    eprintln!("HS   {}", &d[..d.len().min(200)]);
+                    shown += 1;
+                    if shown >= 12 {
+                        break;
+                    }
+                }
+            }
         }
         if dump_left > 0 {
             dump_left -= 1;
@@ -26730,11 +26786,27 @@ fn hs_run(
             }
         }
     }
+    // Census contracts (never read): who hosts each at the end of the run.
+    let mut all_labels: Vec<NodeLabel> = vec![NodeLabel::gateway(network, 0)];
+    all_labels.extend((1..=nodes).map(|n| NodeLabel::node(network, n)));
+    for (ci, ct) in containers.iter().enumerate() {
+        if ci % 3 != 2 {
+            continue;
+        }
+        let mut n = 0usize;
+        for l in &all_labels {
+            if result.is_node_hosting(l, &ct.key()) {
+                n += 1;
+                *per_peer.entry(format!("{l}")).or_default() += 1;
+            }
+        }
+        replicas.push(n as f64);
+    }
     let mut counts: Vec<usize> = per_peer.values().copied().collect();
     counts.sort_unstable_by(|a, b| b.cmp(a));
     let tot_place: usize = counts.iter().sum();
     let top = |frac: f64| -> f64 {
-        let k = ((61.0 * frac).ceil() as usize).max(1);
+        let k = (((nodes + 1) as f64 * frac).ceil() as usize).max(1);
         if tot_place == 0 {
             return f64::NAN;
         }
@@ -26754,7 +26826,7 @@ fn hs_run(
             "\"replicas_med\":{:.1},\"replicas_mean\":{:.2},",
             "\"warm_min_events\":{},\"nodes_below_50\":{},",
             "\"put_hop_mean_rank\":{:.2},\"put_hop_n\":{},\"get_hop_mean_rank\":{:.2},\"get_hop_n\":{},",
-            "\"narrowed_decisions\":{},\"fell_back\":{},\"non_virtual_events\":{},\"lossy\":{:?},\"churned\":{}}}"
+            "\"narrowed_decisions\":{},\"fell_back\":{},\"non_virtual_events\":{},\"lossy\":\"{:?}\",\"churned\":{},\"wall_setup_s\":{:.0},\"wall_total_s\":{:.0},\"put_issued\":{},\"get_window_10_med_age_s\":{:.1},\"get_window_60_med_age_s\":{:.1}}}"
         ),
         policy_name,
         if sparse { "sparse" } else { "dense" },
@@ -26787,6 +26859,11 @@ fn hs_run(
         non_virtual,
         lossy,
         churned.len(),
+        wall_setup,
+        wall0.elapsed().as_secs_f64(),
+        total,
+        hs_pct(&mut ages[0], 0.5),
+        hs_pct(&mut ages[1], 0.5),
     );
     println!("HSCELL {out}");
     if let Ok(path) = std::env::var("HS_OUT") {
