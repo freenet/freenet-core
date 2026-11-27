@@ -1449,7 +1449,22 @@ a test passes its own; tests read their own, never the global).
   udp_fed_dropped>: pipes that ended sent or dropped, by what fed the
   inbound stream (each pair sums to quic_data_send_pipe_<result>), and
   quic_pipe_dropped_<source_error|source_stall_timeout|own_path>: the
-  dropped ones by cause (quic_send::pipe_drop_cause). transfer_failed and
+  dropped ones by cause (quic_send::pipe_drop_cause).
+  quic_short_dropped_<not_opened_exhausted|timed_out|paced|connection_lost|
+  peer_refused_data|budget_refused|stopped_other|invalid_frame|source_error|
+  queue_full|path_ended|no_udp_session>: Shorts counted in
+  quic_data_send_short_dropped, by cause; they sum to it, because
+  QuicPathStats::record_short_dropped is the only place a Short is counted
+  dropped. The cause is chosen where the drop is decided (route::
+  short_drop_cause in QuicPath::settle, DataRoute::queue_short, and the route
+  worker's send_elsewhere). Causes seen only on a native path (no UDP session):
+  not_opened_exhausted (no stream opened: the peer's credit after the native
+  retries, or a wait on this side's own resources, which is not retried),
+  timed_out, paced, connection_lost, peer_refused_data,
+  budget_refused, queue_full, path_ended, no_udp_session, since a path with a
+  UDP session sends those on UDP; stopped_other, invalid_frame and source_error
+  can occur on either. A full native queue is native_short_queue_full, not a
+  drop. transfer_failed and
   transfer_completed events carry `transport`: udp or quic.
   quic_ack_wait_expired_<stream|short|control>: ack-wait expiries that
   counted as strikes (path::StrikeCheck), by kind; expected 0 on honest

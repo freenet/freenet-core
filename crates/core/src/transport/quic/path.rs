@@ -166,7 +166,9 @@ use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::boundary::StreamProgressObserver;
-use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode, QuicDataCounters};
+use crate::transport::metrics::{
+    InboundStreamOutcome, QuicCloseCode, QuicDataCounters, SHORT_DROP_LABELS, ShortDropCause,
+};
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::peer_connection::streaming::StreamError;
 #[cfg(test)]
@@ -612,6 +614,7 @@ pub(crate) struct QuicPathStats {
     /// Data sends by [`SendKind`] and [`QuicSendResult`].
     sends: [[AtomicU64; QuicSendResult::COUNT]; SendKind::ALL.len()],
     send_events: [AtomicU64; QuicSendEvent::COUNT],
+    short_drops: [AtomicU64; SHORT_DROP_LABELS.len()],
     /// Stops the peer sent to data sends, in the order of [`stop_code::ALL`].
     stops: [AtomicU64; stop_code::ALL.len()],
 }
@@ -624,6 +627,7 @@ impl QuicPathStats {
             shared: std::array::from_fn(|_| AtomicU64::new(0)),
             sends: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             send_events: std::array::from_fn(|_| AtomicU64::new(0)),
+            short_drops: std::array::from_fn(|_| AtomicU64::new(0)),
             stops: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
@@ -640,16 +644,26 @@ impl QuicPathStats {
         self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count a send of `kind` that was dropped without a path outcome: a
-    /// native route's short refused by its full queue, or one the route could
-    /// not send on the path (it ended, or the peer refused data) and had no
-    /// UDP session for.
-    pub(in crate::transport) fn record_send_dropped(&self, kind: SendKind) {
-        self.record_send(kind, QuicSendResult::Dropped);
+    /// Count a Short that was dropped, here and node-wide, with its `cause`.
+    /// The only way a Short is counted as dropped (`record_send` refuses it),
+    /// so the causes sum to `short_dropped`.
+    pub(in crate::transport) fn record_short_dropped(&self, cause: ShortDropCause) {
+        self.record_send_unchecked(SendKind::Short, QuicSendResult::Dropped);
+        self.node.record_short_drop_cause(cause);
+        self.short_drops[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
+    /// A dropped Short has a cause: it goes through `record_short_dropped`.
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
+        debug_assert!(
+            !(kind == SendKind::Short && result == QuicSendResult::Dropped),
+            "a dropped Short is counted by record_short_dropped, with its cause"
+        );
+        self.record_send_unchecked(kind, result);
+    }
+
+    fn record_send_unchecked(&self, kind: SendKind, result: QuicSendResult) {
         self.node.record_send(kind, result);
         self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
     }
@@ -681,6 +695,12 @@ impl QuicPathStats {
             .iter()
             .map(|kind| self.send_count(*kind, result))
             .sum()
+    }
+
+    /// Shorts this path dropped for `cause`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn short_drop_count(&self, cause: ShortDropCause) -> u64 {
+        self.short_drops[cause as usize].load(Ordering::Relaxed)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

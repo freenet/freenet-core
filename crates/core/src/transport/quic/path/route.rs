@@ -38,7 +38,7 @@ use super::super::recycle::{self, ACK_WATCH_WINDOW, cap_held};
 use super::super::socket::CapHoldReading;
 use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, QuietProof, SendFailure};
 use super::{QuicPath, QuicSendError, stop_code};
-use crate::transport::metrics::QuicCloseCode;
+use crate::transport::metrics::{QuicCloseCode, ShortDropCause};
 
 /// Send timeouts in a row, with no acknowledgement on the path, that close it
 /// with `DOWNGRADE` ([`StallCount`]). A send that never opens or that waits for
@@ -193,6 +193,40 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
         (Done | GiveUp, _) => R::Dropped,
     };
     (step, result)
+}
+
+/// Why a Short whose send ended in `outcome` was given up, for
+/// `quic_short_dropped_<cause>`. Read where `settle` decides the drop, from the
+/// outcome that decided it. A message goes on UDP and is never given up for
+/// `Sent` or `MaybeDelivered`, so those have no cause.
+pub(crate) fn short_drop_cause(outcome: &BoundedSend) -> ShortDropCause {
+    use ShortDropCause as C;
+    match outcome {
+        BoundedSend::Sent | BoundedSend::MaybeDelivered(_) => {
+            debug_assert!(false, "a send that was done is not a drop");
+            C::StoppedOther
+        }
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut | NotOpened::NoCredit)) => {
+            C::NotOpenedExhausted
+        }
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_))) => {
+            C::ConnectionLost
+        }
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced) => {
+            C::Paced
+        }
+        BoundedSend::Failed(SendFailure::TimedOut) => C::TimedOut,
+        BoundedSend::Failed(SendFailure::Error(error)) => match error {
+            QuicSendError::InvalidFrame(_) => C::InvalidFrame,
+            QuicSendError::ConnectionLost(_) | QuicSendError::Closed => C::ConnectionLost,
+            QuicSendError::Source(_) | QuicSendError::LengthMismatch { .. } => C::SourceError,
+            QuicSendError::Stopped(code) => match u32::try_from(*code) {
+                Ok(stop_code::NOT_ACCEPTING_DATA) => C::PeerRefusedData,
+                Ok(stop_code::BUDGET_REFUSED) => C::BudgetRefused,
+                Ok(_) | Err(_) => C::StoppedOther,
+            },
+        },
+    }
 }
 
 /// Whether `outcome` is a send deadline running out with the stream open and
@@ -508,7 +542,11 @@ impl QuicPath {
             }
             other => other,
         };
-        self.stats.record_send(kind, result);
+        if kind == SendKind::Short && result == QuicSendResult::Dropped {
+            self.stats.record_short_dropped(short_drop_cause(outcome));
+        } else {
+            self.stats.record_send(kind, result);
+        }
         if matches!(
             outcome,
             BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced)

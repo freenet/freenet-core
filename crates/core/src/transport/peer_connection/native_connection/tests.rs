@@ -12,7 +12,7 @@ use crate::operations::orphan_streams::OrphanStreamRegistry;
 use crate::simulation::VirtualTime;
 use crate::transport::StreamId;
 use crate::transport::boundary::StreamSendOutcome;
-use crate::transport::metrics::ConnIdentity;
+use crate::transport::metrics::{ConnIdentity, ShortDropCause};
 use crate::transport::quic::framing::FrameHeader;
 use crate::transport::quic::path::{
     BoundedSend, QuicSendError, QuicSendEvent, QuicSendResult, SendFailure, SendKind, stop_code,
@@ -73,6 +73,19 @@ impl Rig {
     /// How many sends of `kind` the node's path ended as `result`.
     fn sends(&self, kind: SendKind, result: QuicSendResult) -> u64 {
         self.conn.path().stats().send_count(kind, result)
+    }
+
+    /// Shorts dropped for `cause`, and the causes' sum, which is the dropped
+    /// Shorts (`quic_short_dropped_<cause>` sums to `quic_data_send_short_dropped`).
+    fn short_drops(&self, cause: ShortDropCause) -> u64 {
+        self.conn.path().stats().short_drop_count(cause)
+    }
+
+    fn all_short_drops(&self) -> u64 {
+        ShortDropCause::ALL
+            .iter()
+            .map(|cause| self.short_drops(*cause))
+            .sum()
     }
 }
 
@@ -382,6 +395,8 @@ fn a_short_the_path_no_longer_takes_is_dropped_by_the_worker() {
             rig.conn.send_bytes(b"after".to_vec()).await.unwrap();
             rig.settle(Duration::from_secs(1)).await;
             assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 1);
+            assert_eq!(rig.short_drops(ShortDropCause::PeerRefusedData), 1);
+            assert_eq!(rig.all_short_drops(), 1);
             assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Sent), 0);
             assert!(
                 rig.peer.peer_inbound.shorts.try_recv().is_err(),
@@ -607,6 +622,7 @@ fn a_full_short_queue_refuses_the_send_and_keeps_the_connection() {
                 "{observed:?}"
             );
             assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 0);
+            assert_eq!(rig.all_short_drops(), 0, "a full queue is not a drop");
             assert_eq!(
                 rig.conn
                     .path()
@@ -1018,6 +1034,8 @@ fn a_short_is_dropped_once_its_retries_run_out() {
             );
             rig.settle(Duration::from_millis(300)).await;
             assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 1);
+            assert_eq!(rig.short_drops(ShortDropCause::NotOpenedExhausted), 1);
+            assert_eq!(rig.all_short_drops(), 1);
             assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetried), 2);
             assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetrySent), 0);
             assert_eq!(event(&rig, QuicSendEvent::StreamLimitFull), 3);

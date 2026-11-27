@@ -8375,6 +8375,7 @@ mod tests {
         data.path_srtt = (1124..1131).collect();
         data.path_tx_bps = (1131..1137).collect();
         data.late_end_judged = (1137..1140).collect();
+        data.short_dropped = (1140..1152).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
