@@ -717,7 +717,7 @@ function freenetBridge(authToken, userToken, hostedMode) {
     enable.textContent = 'Enable';
     enable.style.cssText =
       'cursor:pointer;border:none;border-radius:6px;padding:6px 12px;' +
-      'background:#007FFF;color:#fff;font:inherit;font-weight:600;';
+      'background:#2e65a0;color:#fff;font:inherit;font-weight:600;';
     var dismiss = document.createElement('button');
     dismiss.textContent = 'Not now';
     dismiss.style.cssText =
