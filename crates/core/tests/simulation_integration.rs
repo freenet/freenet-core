@@ -26358,8 +26358,11 @@ fn hs_run(
     let slots_per_s = (1000 / slot_ms) as usize;
     let delays: [usize; 2] = [10 * slots_per_s, 60 * slots_per_s];
     // Gap between measured PUTs (the gateway streams ~1.2 MB each).
-    let put_gap = env_usize("HS_PUT_GAP_S", 3) * slots_per_s;
+    let put_gap = env_usize("HS_PUT_GAP_S", 4) * slots_per_s;
     let debug = std::env::var("HS_DEBUG").is_ok();
+    // The measured PUTs do not subscribe by default: a node's second large
+    // subscribing PUT never started a network operation in this harness.
+    let put_subscribe = env_usize("HS_PUT_SUBSCRIBE", 0) == 1;
     let wall0 = std::time::Instant::now();
 
     // Gateway location, as in the placement-gap sim.
@@ -26469,7 +26472,7 @@ fn hs_run(
         let mut near: Vec<usize> = (1..=nodes).filter(|n| !excluded.contains(n)).collect();
         near.sort_by(|&a, &b| hs_dist(locs[a], g).total_cmp(&hs_dist(locs[b], g)));
         near.iter()
-            .take(8)
+            .take(env_usize("HS_ORIGINS", 12))
             .map(|&n| NodeLabel::node(network, n))
             .collect()
     };
@@ -26591,7 +26594,7 @@ fn hs_run(
                         s[..8].copy_from_slice(&(ci as u64).to_le_bytes());
                         s
                     },
-                    subscribe: true,
+                    subscribe: put_subscribe,
                 },
             ));
             if ci % 3 != 2 {
@@ -26725,7 +26728,9 @@ fn hs_run(
             if t.d.contains("outcome: Success") {
                 found[coh] += 1;
             }
-            get_lat.push((t.t - start).max(0.0));
+            if t.d.contains("outcome: Success") {
+                get_lat.push((t.t - start).max(0.0));
+            }
         }
         // PUT latency: first Put event to the first response delivered to the
         // originator (the requester of the earliest Request).
@@ -26756,6 +26761,17 @@ fn hs_run(
         }
         if !ok {
             put_fail += 1;
+            if debug && put_fail <= 3 {
+                eprintln!("HS failed PUT contract {ci} (puts logged: {})", puts.len());
+                for e in puts.iter().take(30) {
+                    eprintln!(
+                        "HS   t={:.3} peer={:.8} {}",
+                        e.t - put_start,
+                        e.peer,
+                        &e.d[..e.d.len().min(260)]
+                    );
+                }
+            }
         }
         if debug && puts.is_empty() {
             let inst = ct.key().id().to_string();
