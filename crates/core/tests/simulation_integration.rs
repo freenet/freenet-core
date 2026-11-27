@@ -24483,7 +24483,181 @@ enum SurvivorOrder {
     NativeFirstInbound,
 }
 
-/// Gate 18: both ends of a pair keep the same transport, the native one, and
+/// A forced-order run's seed search may go this far before the run is reported
+/// as having drifted. A change that reorders simulation tasks moves every run to
+/// another trajectory; the search absorbs that, but each seed costs a full
+/// simulation, so a long search is a test about to time out. When this trips,
+/// move the listed seed of the run to the one it reports.
+const SURVIVOR_SEED_SEARCH_WARN: u64 = 8;
+
+/// One run of gate 18; see `test_quic_native_both_ends_keep_the_same_transport_*`.
+fn check_native_survivor_run(
+    run_id: u8,
+    seed: u64,
+    quic_delay: Option<u64>,
+    intro_delay: Option<u64>,
+    order: Option<SurvivorOrder>,
+    drop_some: bool,
+) {
+    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
+    let name = format!("native-survivor-{run_id}");
+    // The decision a run must produce depends on event order, which any
+    // change to connection setup shifts. Search a bounded range of fixed
+    // seeds, starting at the listed one, for the first that yields it;
+    // the search is deterministic and fails closed below.
+    let decided_by = |t: &freenet::dev_tool::NativeWireTrace, order: SurvivorOrder| -> u64 {
+        match order {
+            SurvivorOrder::UdpFirst => t.survivor_swapped(),
+            SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
+            SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
+        }
+    };
+    let seed_range = if order.is_some() {
+        SURVIVOR_SEED_SEARCH
+    } else {
+        1
+    };
+    let mut found = None;
+    for offset in 0..seed_range {
+        let seed = seed + offset;
+        let nat = SimNat::all(NatFiltering::PortRestricted);
+        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+            sim.with_native_connect(100);
+            if let Some(ms) = quic_delay {
+                sim.delay_quic_datagrams(Duration::from_millis(ms));
+            }
+            if let Some(ms) = intro_delay {
+                sim.delay_udp_intros(Duration::from_millis(ms));
+            }
+            if let Some(order) = order {
+                sim.with_udp_dial_beside_every_native_dial(matches!(
+                    order,
+                    SurvivorOrder::NativeFirstInbound
+                ));
+            }
+            if drop_some {
+                let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+                labels.sort();
+                for (i, a) in labels.iter().enumerate() {
+                    for (j, b) in labels.iter().enumerate().skip(i + 1) {
+                        if (i + j) % 3 == 0 {
+                            sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+                        }
+                    }
+                }
+            }
+        });
+        let chose = order.is_none_or(|o| decided_by(&run.wire.trace, o) > 0);
+        if chose {
+            println!("{name}: seed {seed:#x} (offset {offset})");
+            assert!(
+                offset < SURVIVOR_SEED_SEARCH_WARN,
+                "{name}: the rule first chose {order:?} at seed {seed:#x} (offset {offset}); \
+                     start the search there so the run stays one simulation"
+            );
+            found = Some(run);
+            break;
+        }
+    }
+    let run = found.unwrap_or_else(|| {
+        panic!(
+            "{name}: premise: the rule chose {order:?} for none of the {seed_range} seeds \
+                 from {seed:#x}"
+        )
+    });
+    log_native_connect(&name, &run);
+    let t = &run.wire.trace;
+    let transports = t.transports();
+    let mut mismatched = Vec::new();
+    let mut one_ended_native = Vec::new();
+    let mut both = 0;
+    for (&(own, peer), &native) in &transports {
+        match transports.get(&(peer, own)) {
+            Some(&other) if own < peer => {
+                both += 1;
+                if other != native {
+                    mismatched.push((own, peer, native, other));
+                }
+            }
+            Some(_) => {}
+            None if native => one_ended_native.push((own, peer)),
+            None => {}
+        }
+    }
+    tracing::info!(
+        name,
+        swapped = t.survivor_swapped(),
+        udp_dropped = t.survivor_udp_dropped(),
+        held_at_both_ends = both,
+        native_at_both_ends = transports
+            .iter()
+            .filter(|((own, peer), native)| **native
+                && own < peer
+                && transports.get(&(*peer, *own)) == Some(&true))
+            .count(),
+        one_ended_native = one_ended_native.len(),
+        entries = transports.len(),
+        "survivor rule"
+    );
+    println!(
+        "{name}: swapped={} udp_dropped={} held_at_both_ends={both} \
+             one_ended_native={one_ended_native:?} entries={}",
+        t.survivor_swapped(),
+        t.survivor_udp_dropped(),
+        transports.len()
+    );
+    assert_eq!(
+        t.native_replaced_by_udp(),
+        Vec::new(),
+        "{name}: live native entries a UDP connection replaced"
+    );
+    assert!(
+        mismatched.is_empty(),
+        "{name}: pairs whose ends keep different transports (own, peer, own native, \
+             peer native): {mismatched:?}"
+    );
+    let held_both = both;
+    if let Some(order) = order {
+        let decided = decided_by(t, order);
+        assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
+        // Keep-first instead of native-wins shows as a pair that holds
+        // UDP at both ends although a native setup completed at both
+        // ends after both UDP entries were made; an inbound UDP
+        // connection replacing a native entry shows directly.
+        let seqs = t.transport_seqs();
+        let mut checked = 0;
+        let mut kept_udp = Vec::new();
+        for (a, b, native_at) in t.native_established_at_both_ends() {
+            let (Some(x), Some(y)) = (seqs.get(&(a, b)), seqs.get(&(b, a))) else {
+                continue;
+            };
+            checked += 1;
+            let udp_at_both =
+                transports.get(&(a, b)) == Some(&false) && transports.get(&(b, a)) == Some(&false);
+            if udp_at_both && native_at > *x.max(y) {
+                kept_udp.push((a, b));
+            }
+        }
+        println!("{name}: pairs with native at both ends, held at both: {checked}");
+        assert!(checked > 0, "{name}: premise: such pairs exist");
+        assert!(
+            kept_udp.is_empty(),
+            "{name}: pairs that kept UDP after native connected at both ends: {kept_udp:?}"
+        );
+    }
+    let (pairs, one_sided) = t.native_setup_pairs();
+    println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
+    let setups = (pairs, one_sided);
+    println!(
+        "one-sided native setups (10.2 item 20): {} of {} with both ends ended",
+        setups.1, setups.0
+    );
+    assert!(setups.0 > 0, "premise: native setups ended at both ends");
+    assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+/// Gate 18, one `#[test]` per run so each has its own time budget and the runs
+/// execute in parallel: both ends of a pair keep the same transport, the native one, and
 /// the rate of one-sided native setups (10.2 items 7 and 20). Behind
 /// port-restricted NATs with native on at 100%.
 ///
@@ -24505,191 +24679,59 @@ enum SurvivorOrder {
 /// In every run, every pair held at both ends when the run ends holds the
 /// same transport at both.
 #[test_log::test]
-fn test_quic_native_both_ends_keep_the_same_transport() {
-    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
-    let mut held_both = 0;
-    let mut setups = (0, 0);
-    for (run_id, seed, quic_delay, intro_delay, order, drop_some) in [
-        (0u8, 0x0059_40A5_00D1u64, None, None, None, false),
-        (1, 0x0059_40A5_00D2, None, None, None, true),
-        (2, 0x0059_40A5_00D3, Some(600), None, None, false),
-        (3, 0x0059_40A5_00D4, Some(1000), None, None, false),
-        (
-            4,
-            0x0059_40A5_00D6,
-            Some(600),
-            None,
-            Some(SurvivorOrder::UdpFirst),
-            false,
-        ),
-        (
-            5,
-            0x0059_40A5_00D7,
-            None,
-            Some(600),
-            Some(SurvivorOrder::NativeFirst),
-            false,
-        ),
-        (
-            6,
-            0x0059_40A5_00E0,
-            None,
-            Some(600),
-            Some(SurvivorOrder::NativeFirstInbound),
-            false,
-        ),
-    ] {
-        let name = format!("native-survivor-{run_id}");
-        // The decision a run must produce depends on event order, which any
-        // change to connection setup shifts. Search a bounded range of fixed
-        // seeds, starting at the listed one, for the first that yields it;
-        // the search is deterministic and fails closed below.
-        let decided_by = |t: &freenet::dev_tool::NativeWireTrace, order: SurvivorOrder| -> u64 {
-            match order {
-                SurvivorOrder::UdpFirst => t.survivor_swapped(),
-                SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
-                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
-            }
-        };
-        let seed_range = if order.is_some() {
-            SURVIVOR_SEED_SEARCH
-        } else {
-            1
-        };
-        let mut found = None;
-        for offset in 0..seed_range {
-            let seed = seed + offset;
-            let nat = SimNat::all(NatFiltering::PortRestricted);
-            let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
-                sim.with_native_connect(100);
-                if let Some(ms) = quic_delay {
-                    sim.delay_quic_datagrams(Duration::from_millis(ms));
-                }
-                if let Some(ms) = intro_delay {
-                    sim.delay_udp_intros(Duration::from_millis(ms));
-                }
-                if let Some(order) = order {
-                    sim.with_udp_dial_beside_every_native_dial(matches!(
-                        order,
-                        SurvivorOrder::NativeFirstInbound
-                    ));
-                }
-                if drop_some {
-                    let mut labels: Vec<NodeLabel> =
-                        sim.all_node_addresses().keys().cloned().collect();
-                    labels.sort();
-                    for (i, a) in labels.iter().enumerate() {
-                        for (j, b) in labels.iter().enumerate().skip(i + 1) {
-                            if (i + j) % 3 == 0 {
-                                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
-                            }
-                        }
-                    }
-                }
-            });
-            let chose = order.is_none_or(|o| decided_by(&run.wire.trace, o) > 0);
-            if chose {
-                println!("{name}: seed {seed:#x} (offset {offset})");
-                found = Some(run);
-                break;
-            }
-        }
-        let run = found.unwrap_or_else(|| {
-            panic!(
-                "{name}: premise: the rule chose {order:?} for none of the {seed_range} seeds \
-                 from {seed:#x}"
-            )
-        });
-        log_native_connect(&name, &run);
-        let t = &run.wire.trace;
-        let transports = t.transports();
-        let mut mismatched = Vec::new();
-        let mut one_ended_native = Vec::new();
-        let mut both = 0;
-        for (&(own, peer), &native) in &transports {
-            match transports.get(&(peer, own)) {
-                Some(&other) if own < peer => {
-                    both += 1;
-                    if other != native {
-                        mismatched.push((own, peer, native, other));
-                    }
-                }
-                Some(_) => {}
-                None if native => one_ended_native.push((own, peer)),
-                None => {}
-            }
-        }
-        tracing::info!(
-            name,
-            swapped = t.survivor_swapped(),
-            udp_dropped = t.survivor_udp_dropped(),
-            held_at_both_ends = both,
-            native_at_both_ends = transports
-                .iter()
-                .filter(|((own, peer), native)| **native
-                    && own < peer
-                    && transports.get(&(*peer, *own)) == Some(&true))
-                .count(),
-            one_ended_native = one_ended_native.len(),
-            entries = transports.len(),
-            "survivor rule"
-        );
-        println!(
-            "{name}: swapped={} udp_dropped={} held_at_both_ends={both} \
-             one_ended_native={one_ended_native:?} entries={}",
-            t.survivor_swapped(),
-            t.survivor_udp_dropped(),
-            transports.len()
-        );
-        assert_eq!(
-            t.native_replaced_by_udp(),
-            Vec::new(),
-            "{name}: live native entries a UDP connection replaced"
-        );
-        assert!(
-            mismatched.is_empty(),
-            "{name}: pairs whose ends keep different transports (own, peer, own native, \
-             peer native): {mismatched:?}"
-        );
-        held_both += both;
-        if let Some(order) = order {
-            let decided = decided_by(t, order);
-            assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
-            // Keep-first instead of native-wins shows as a pair that holds
-            // UDP at both ends although a native setup completed at both
-            // ends after both UDP entries were made; an inbound UDP
-            // connection replacing a native entry shows directly.
-            let seqs = t.transport_seqs();
-            let mut checked = 0;
-            let mut kept_udp = Vec::new();
-            for (a, b, native_at) in t.native_established_at_both_ends() {
-                let (Some(x), Some(y)) = (seqs.get(&(a, b)), seqs.get(&(b, a))) else {
-                    continue;
-                };
-                checked += 1;
-                let udp_at_both = transports.get(&(a, b)) == Some(&false)
-                    && transports.get(&(b, a)) == Some(&false);
-                if udp_at_both && native_at > *x.max(y) {
-                    kept_udp.push((a, b));
-                }
-            }
-            println!("{name}: pairs with native at both ends, held at both: {checked}");
-            assert!(checked > 0, "{name}: premise: such pairs exist");
-            assert!(
-                kept_udp.is_empty(),
-                "{name}: pairs that kept UDP after native connected at both ends: {kept_udp:?}"
-            );
-        }
-        let (pairs, one_sided) = t.native_setup_pairs();
-        println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
-        setups = (setups.0 + pairs, setups.1 + one_sided);
-    }
-    println!(
-        "one-sided native setups (10.2 item 20): {} of {} with both ends ended",
-        setups.1, setups.0
+fn test_quic_native_both_ends_keep_the_same_transport_plain() {
+    check_native_survivor_run(0u8, 0x0059_40A5_00D1u64, None, None, None, false);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_quic_dropped_between_some_pairs() {
+    check_native_survivor_run(1, 0x0059_40A5_00D2, None, None, None, true);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_quic_delayed_600() {
+    check_native_survivor_run(2, 0x0059_40A5_00D3, Some(600), None, None, false);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_quic_delayed_1000() {
+    check_native_survivor_run(3, 0x0059_40A5_00D4, Some(1000), None, None, false);
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_udp_first() {
+    check_native_survivor_run(
+        4,
+        0x0059_40A5_00D6,
+        Some(600),
+        None,
+        Some(SurvivorOrder::UdpFirst),
+        false,
     );
-    assert!(setups.0 > 0, "premise: native setups ended at both ends");
-    assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_native_first() {
+    check_native_survivor_run(
+        5,
+        0x0059_40A5_00D7,
+        None,
+        Some(600),
+        Some(SurvivorOrder::NativeFirst),
+        false,
+    );
+}
+
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport_native_first_inbound() {
+    check_native_survivor_run(
+        6,
+        0x0059_40A5_00EB,
+        None,
+        Some(600),
+        Some(SurvivorOrder::NativeFirstInbound),
+        false,
+    );
 }
 
 /// Option (b), the timeout path (10.4 answer 2): a native connection that
