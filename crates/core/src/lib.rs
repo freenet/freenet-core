@@ -240,6 +240,8 @@ pub mod dev_tool {
     // `set_nn_lattice_force_active` resets only the floor bypass (used by the
     // benefit-test cleanup guard). No-op in production builds (compiled out).
     #[cfg(any(test, feature = "testing"))]
+    pub use ring::put_cost_pick_hook::PutCostPickGuard;
+    #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 
     // Test hook: connection identity decisions since process start, by kind

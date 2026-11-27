@@ -4343,7 +4343,48 @@ impl Ring {
         contract_key: &ContractKey,
         skip_list: impl Contains<std::net::SocketAddr>,
     ) -> Option<PeerKeyLocation> {
+        self.closest_potentially_hosting_inner(log_as, contract_key, skip_list, None)
+    }
+
+    /// Like [`Self::closest_potentially_hosting`], but the router ranks only
+    /// the connected peers strictly closer to the key than `closer_than`
+    /// (this node's own location). Returns `None` when no such peer exists.
+    ///
+    /// The PUT relay uses this to keep routing toward the key when the
+    /// router's unrestricted cost pick is not closer than this node: the cost
+    /// ranking still chooses, but only among peers that make progress. Always
+    /// `Unlogged`: the unrestricted selection that preceded it is the logged
+    /// routing decision.
+    pub(crate) fn closest_potentially_hosting_strictly_closer(
+        &self,
+        contract_key: &ContractKey,
+        skip_list: impl Contains<std::net::SocketAddr>,
+        closer_than: Location,
+    ) -> Option<PeerKeyLocation> {
+        self.closest_potentially_hosting_inner(
+            crate::router::dataset::DecisionLog::Unlogged,
+            contract_key,
+            skip_list,
+            Some(closer_than),
+        )
+    }
+
+    fn closest_potentially_hosting_inner(
+        &self,
+        log_as: crate::router::dataset::DecisionLog,
+        contract_key: &ContractKey,
+        skip_list: impl Contains<std::net::SocketAddr>,
+        closer_than: Option<Location>,
+    ) -> Option<PeerKeyLocation> {
         let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
+        #[cfg(any(test, feature = "testing"))]
+        let is_put = closer_than.is_some()
+            || matches!(
+                log_as,
+                crate::router::dataset::DecisionLog::Joinable(
+                    crate::node::network_status::OpType::Put
+                )
+            );
         let log = self.candidate_log_for(log_as);
         // The router read lock is held across candidate gathering and
         // selection, as before candidate logging existed; it is released
@@ -4352,6 +4393,24 @@ impl Ring {
         let target = Location::from(contract_key);
         self.connection_manager
             .routing_with(target, None, skip_list, move |candidates| {
+                let narrowed: Vec<PeerKeyLocation>;
+                let mut candidates: &[PeerKeyLocation] = candidates;
+                if let Some(own) = closer_than {
+                    narrowed = strictly_closer_candidates(candidates, own, target);
+                    if narrowed.is_empty() {
+                        return None;
+                    }
+                    candidates = &narrowed;
+                }
+                #[cfg(any(test, feature = "testing"))]
+                let forced: Vec<PeerKeyLocation>;
+                #[cfg(any(test, feature = "testing"))]
+                if is_put {
+                    if let Some(pick) = put_cost_pick_hook::forced_pick(candidates, target) {
+                        forced = vec![pick];
+                        candidates = &forced;
+                    }
+                }
                 let (selected, decision, capture) = router.select_k_best_peers_capturing(
                     candidates.iter(),
                     target,
@@ -7746,6 +7805,73 @@ fn read_fd_soft_limit() -> Option<u64> {
 #[cfg(not(unix))]
 fn read_fd_soft_limit() -> Option<u64> {
     None
+}
+
+/// The candidates strictly closer to `target` than `own` is. A peer with no
+/// known location, or at exactly `own`'s distance, is not closer.
+pub(crate) fn strictly_closer_candidates(
+    candidates: &[PeerKeyLocation],
+    own: Location,
+    target: Location,
+) -> Vec<PeerKeyLocation> {
+    let own_dist = own.distance(target).as_f64();
+    candidates
+        .iter()
+        .filter(|p| {
+            p.location()
+                .is_some_and(|l| l.distance(target).as_f64() < own_dist)
+        })
+        .cloned()
+        .collect()
+}
+
+/// TEST-ONLY: force the router's cost-ranked PUT pick to be the FARTHEST of
+/// the `window` geometrically closest candidates, to reproduce a live router
+/// whose learned cost favours a peer that is not the closest to the key.
+/// Per thread (the deterministic simulation runs every node on the test
+/// thread). Off by default.
+#[cfg(any(test, feature = "testing"))]
+pub mod put_cost_pick_hook {
+    use std::cell::Cell;
+
+    use super::{Location, PeerKeyLocation};
+
+    thread_local! {
+        static WINDOW: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// Restores the previous setting when dropped.
+    #[must_use = "the hook reverts when the guard is dropped"]
+    pub struct PutCostPickGuard(Option<usize>);
+
+    impl PutCostPickGuard {
+        /// PUT next-hop picks become the farthest of the `window` closest
+        /// candidates (`window >= 1`).
+        pub fn farthest_of_closest(window: usize) -> Self {
+            assert!(window >= 1);
+            Self(WINDOW.with(|w| w.replace(Some(window))))
+        }
+    }
+
+    impl Drop for PutCostPickGuard {
+        fn drop(&mut self) {
+            WINDOW.with(|w| w.set(self.0));
+        }
+    }
+
+    pub(crate) fn forced_pick(
+        candidates: &[PeerKeyLocation],
+        target: Location,
+    ) -> Option<PeerKeyLocation> {
+        let window = WINDOW.with(Cell::get)?;
+        let dist = |p: &PeerKeyLocation| {
+            p.location()
+                .map_or(f64::MAX, |l| l.distance(target).as_f64())
+        };
+        let mut by_dist: Vec<&PeerKeyLocation> = candidates.iter().collect();
+        by_dist.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+        by_dist.into_iter().take(window).last().cloned()
+    }
 }
 
 #[cfg(test)]

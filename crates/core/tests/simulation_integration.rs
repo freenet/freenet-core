@@ -26497,3 +26497,178 @@ fn test_every_origins_second_large_put_starts() {
         "a node's event loop was held for {longest:?} by one event"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PUT stops only when no connected peer is strictly closer to the key
+// (hosting invariant 4; the gw1 live repro).
+// ---------------------------------------------------------------------------
+
+/// What a streamed-PUT run left behind.
+struct PutStopRun {
+    /// Ring distance from the key of each node hosting it, nearest first.
+    host_distances: Vec<f64>,
+    /// Ring distance of the nearest-to-key node in the network.
+    nearest_node_distance: f64,
+    /// Far requesters that ended up holding the state after a plain GET.
+    requesters_with_state: usize,
+    requesters_total: usize,
+}
+
+/// A 1.2 MB PUT from the node farthest from the key, then GETs from far nodes.
+/// With `cost_window = Some(w)` the router's cost pick for every PUT hop is
+/// forced to the farthest of the `w` geometrically closest candidates, which
+/// stands in for a live router whose learned cost prefers a peer that is not
+/// the closest to the key (nova-gw1 chose a first hop 0.155 from the key while
+/// peers within 0.014 were connected).
+fn run_put_stop_sim(seed: u64, cost_window: Option<usize>, with_gets: bool) -> PutStopRun {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+    const NUM_NODES: usize = 24;
+    const STATE_LEN: usize = 1_200_000;
+
+    setup_deterministic_state(seed);
+    let network = format!("put-stop-{seed:x}");
+    let contract = SimOperation::create_test_contract(0xC3);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state = SimOperation::create_large_state(STATE_LEN, 0x5A);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..NUM_NODES)
+        .map(|i| wrap(key_loc + (i as f64 + 0.5) / NUM_NODES as f64))
+        .collect();
+
+    let _hook = cost_window.map(freenet::dev_tool::PutCostPickGuard::farthest_of_closest);
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            NUM_NODES,
+            10,
+            7,
+            6,
+            3,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    sim.disable_placement_migration();
+    sim.with_streaming_threshold(64 * 1024);
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, NUM_NODES, key_loc);
+    let ring_dist = |a: f64| {
+        let d = (a - key_loc).abs();
+        d.min(1.0 - d)
+    };
+    let origin_no = ranked[NUM_NODES - 1];
+    let requester_nos: Vec<usize> = [8usize, 10, 12, 14, 16, 18]
+        .iter()
+        .map(|&i| ranked[i])
+        .collect();
+
+    let origin = NodeLabel::node(&network, origin_no);
+    let requesters: Vec<NodeLabel> = requester_nos
+        .iter()
+        .map(|n| NodeLabel::node(&network, *n))
+        .collect();
+    let mut operations = vec![ScheduledOperation::new(
+        origin.clone(),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: state.clone(),
+            subscribe: false,
+        },
+    )];
+    // GETs cache copies along their path, which would hide where the PUT
+    // stopped, so placement is measured in a run without them.
+    if with_gets {
+        for r in &requesters {
+            operations.push(ScheduledOperation::new(
+                r.clone(),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(600),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "seed={seed:x}: sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let mut host_distances: Vec<f64> = (1..=NUM_NODES)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(&network, *n), &contract_key))
+        .map(|n| ring_dist(locs[n]))
+        .collect();
+    host_distances.sort_by(f64::total_cmp);
+    let requesters_with_state = requesters
+        .iter()
+        .filter(|r| {
+            result
+                .node_storages
+                .get(*r)
+                .and_then(|s| s.get_stored_state(&contract_key))
+                .is_some()
+        })
+        .count();
+    PutStopRun {
+        host_distances,
+        nearest_node_distance: ring_dist(locs[ranked[0]]),
+        requesters_with_state,
+        requesters_total: requesters.len(),
+    }
+}
+
+/// gw1 shape: a streamed PUT whose router cost pick is farther from the key
+/// than the hop it is at, while a strictly closer peer is connected. The PUT
+/// must continue to a closer peer until no connected peer is closer, so a copy
+/// lands at the nearest-to-key node and far GETs find it. On main the #4363
+/// guard tests the cost-ranked pick, stops at the first descended hop, and
+/// leaves the copy far from the key.
+#[test_log::test]
+fn test_streamed_put_continues_while_a_closer_peer_exists() {
+    for seed in [0x6D_57_0001u64, 0x6D_57_0002] {
+        let placed = run_put_stop_sim(seed, Some(3), false);
+        eprintln!(
+            "seed={seed:x}: PUT hosts at {:?} (nearest node {:.4})",
+            placed.host_distances, placed.nearest_node_distance
+        );
+        let nearest_host = placed
+            .host_distances
+            .first()
+            .copied()
+            .expect("the PUT left no host at all");
+        // Two nodes can sit at the same distance on either side of the key.
+        assert!(
+            (nearest_host - placed.nearest_node_distance).abs() < 1e-3,
+            "seed={seed:x}: the PUT stopped with a closer peer connected: nearest host is \
+             {nearest_host:.4} from the key, nearest node {:.4} (hosts {:?})",
+            placed.nearest_node_distance,
+            placed.host_distances
+        );
+
+        let found = run_put_stop_sim(seed, Some(3), true);
+        assert!(
+            found.requesters_with_state >= found.requesters_total - 1,
+            "seed={seed:x}: far GETs did not find the PUT copy ({}/{})",
+            found.requesters_with_state,
+            found.requesters_total
+        );
+    }
+}
