@@ -2004,12 +2004,67 @@ mod tests {
         }
     }
 
+    /// `src` without comments or string and char literal contents, newlines
+    /// kept so line numbers hold. Not a Rust lexer: raw strings are not
+    /// recognised (a needle inside one would count, which fails loud), and
+    /// block comments do not nest.
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let (mut i, mut line, mut block, mut string) = (0, false, false, false);
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if c == '\n' {
+                line = false;
+                out.push('\n');
+            } else if line {
+            } else if block {
+                if c == '*' && next == Some('/') {
+                    block = false;
+                    i += 1;
+                }
+            } else if string {
+                if c == '\\' {
+                    i += 1;
+                } else if c == '"' {
+                    string = false;
+                }
+            } else if c == '/' && next == Some('/') {
+                line = true;
+                i += 1;
+            } else if c == '/' && next == Some('*') {
+                block = true;
+                i += 1;
+            } else if c == '"' {
+                string = true;
+            } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+                i += 2;
+            } else if c == '\'' && next == Some('\\') {
+                // An escaped char literal such as '\n' or '\''.
+                i += 3;
+                while i < chars.len() && chars[i] != '\'' {
+                    i += 1;
+                }
+            } else {
+                out.push(c);
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Native-connect demotion is gone: no node state, constant, counter
     /// recorder or arm cause for it remains anywhere in the crate's sources
-    /// (comments stripped). A node's native offer and decisions are lowered
-    /// only by the endpoint and the release percent. The needles are built at
-    /// run time so this file does not contain them. Mutation: restoring any
-    /// one name in any source file fails this.
+    /// or tests (comments and literals stripped). A node's native offer and
+    /// decisions are lowered only by the endpoint and the release percent.
+    /// The needles are built at run time so this file does not contain them.
+    /// Mutation: restoring any one name in any source or test file fails
+    /// this. It matches names, so it cannot see demotion re-added under
+    /// another name: the behavioural guards are the lifecycle tests
+    /// `rescues_in_either_role_never_turn_native_off` and
+    /// `a_failed_native_setup_leaves_the_udp_fallback_open_and_native_on`,
+    /// and the `test_quic_native` simulations.
     #[test]
     fn no_native_demotion_state_remains_in_the_crate() {
         let needles: Vec<String> = [
@@ -2021,12 +2076,14 @@ mod tests {
             ["ArmCause::", "Demoted"],
             ["record_native_rescue_", "strike"],
             ["fn is_", "demoted"],
+            ["Native", "Demoted"],
+            ["Acceptor", "Demoted"],
         ]
         .iter()
         .map(|parts| parts.concat())
         .collect();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![root];
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut stack = vec![manifest.join("src"), manifest.join("tests")];
         let mut scanned = 0usize;
         let mut hits = Vec::new();
         while let Some(dir) = stack.pop() {
@@ -2037,10 +2094,9 @@ mod tests {
                 } else if path.extension().is_some_and(|e| e == "rs") {
                     let text = std::fs::read_to_string(&path).expect("read a source file");
                     scanned += 1;
-                    for (n, line) in text.lines().enumerate() {
-                        let code = line.split("//").next().unwrap_or("");
+                    for (n, line) in code_only(&text).lines().enumerate() {
                         for needle in &needles {
-                            if code.contains(needle.as_str()) {
+                            if line.contains(needle.as_str()) {
                                 hits.push(format!("{}:{}: {needle}", path.display(), n + 1));
                             }
                         }
@@ -2050,8 +2106,22 @@ mod tests {
         }
         assert!(
             scanned > 200,
-            "premise: the scan reached the crate's sources ({scanned} files)"
+            "premise: the scan reached the crate's sources and tests ({scanned} files)"
         );
         assert!(hits.is_empty(), "native demotion is back: {hits:#?}");
+    }
+
+    /// The scanner behind the pin above drops comments and literals, and a
+    /// `//` inside a string does not hide the rest of its line.
+    #[test]
+    fn the_demotion_pin_scanner_strips_comments_and_literals_only() {
+        let src =
+            "let a = \"https://x\"; // note\nlet b = 1; /* c\nd */ let e = '\"'; let f = needle;\n";
+        let out = code_only(src);
+        assert!(out.contains("let b = 1;"));
+        assert!(out.contains("let f = needle;"), "{out:?}");
+        assert!(!out.contains("https"));
+        assert!(!out.contains("note"));
+        assert_eq!(out.lines().count(), 3, "newlines are kept");
     }
 }

@@ -291,6 +291,9 @@ pub mod sim_trace {
         /// decided, native, in the slice).
         decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool, bool)>>,
         decision_causes: parking_lot::Mutex<std::collections::BTreeMap<&'static str, u64>>,
+        /// Rescues (a UDP dial that connected after a native path failure) as
+        /// (node, `seq`), on the same order as `decisions`.
+        rescues: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
         /// Native failures, as (transaction, node, peer), whose node has not
         /// yet asked for a UDP dial to that peer in that transaction.
         fallbacks_pending: parking_lot::Mutex<
@@ -522,6 +525,10 @@ pub mod sim_trace {
             } => {
                 if connected && path_failed {
                     c.fallbacks_rescued.fetch_add(1, Ordering::Relaxed);
+                    if let Some(own) = own {
+                        let seq = c.seq.fetch_add(1, Ordering::Relaxed);
+                        c.rescues.lock().push((own, seq));
+                    }
                 }
                 c.fallbacks_ended.lock().push((own, peer, connected));
                 return;
@@ -794,6 +801,17 @@ pub mod sim_trace {
         /// native, in the slice), in the order made.
         pub fn decisions(&self) -> Vec<(SocketAddr, u64, bool, bool)> {
             self.0.decisions.lock().clone()
+        }
+        /// The order numbers of the rescues the node `own` made, oldest first,
+        /// on the same order as [`Self::decisions`].
+        pub fn rescues_of(&self, own: SocketAddr) -> Vec<u64> {
+            self.0
+                .rescues
+                .lock()
+                .iter()
+                .filter(|(node, _)| *node == own)
+                .map(|(_, seq)| *seq)
+                .collect()
         }
         /// Acceptors' decisions counted by cause: `native`, or why a decision
         /// was UDP (see [`NativeWireEvent::Decided`]). The labels come from `native::acceptor_verdict`.

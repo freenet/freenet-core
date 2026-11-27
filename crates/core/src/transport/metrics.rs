@@ -6894,7 +6894,7 @@ mod tests {
     }
 
     #[test]
-    fn only_path_failures_count_toward_demotion() {
+    fn only_path_failures_say_native_failed_on_path() {
         let counted: Vec<NativeSetupOutcome> = NativeSetupOutcome::ALL
             .into_iter()
             .filter(|o| o.says_native_failed_on_path())

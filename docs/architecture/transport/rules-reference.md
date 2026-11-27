@@ -2218,7 +2218,7 @@ Readiness: NativeConnectState, one per node in the ConnectionManager. Ready
   nodes), the configured transport-quic mode is prefer (set_endpoint's
   `prefer`: a native connection carries application data, which shadow
   keeps on UDP, so a shadow or off node is never ready in any role,
-  including gateway joins) . The joiner's offer reads
+  including gateway joins). The joiner's offer reads
   readiness(); the relay's decision reads acceptor_readiness() (the same,
   except that a node whose joiner role is off in a simulation still decides).
 Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a
