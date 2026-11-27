@@ -317,6 +317,23 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
         });
     }
 
+    /// Cleanup that measures staleness from the END of the retry window rather
+    /// than from the last failure: an entry is removed only once `max` has
+    /// passed since its `retry_after`.
+    ///
+    /// [`cleanup_expired`](Self::cleanup_expired) measures from `last_failure`,
+    /// so a key whose delay has reached `max` (plus jitter) loses its failure
+    /// history the moment the delay ends, and the next failure restarts from
+    /// the first delay. This variant keeps the history for a whole `max` after
+    /// the key may be retried, so a key that keeps failing keeps escalating.
+    #[cfg(any(test, target_os = "linux"))] // its only caller is the Linux compile worker
+    pub fn cleanup_after_retry_grace(&mut self) {
+        let now = Instant::now();
+        let grace = self.config.max();
+        self.entries
+            .retain(|_, entry| now <= entry.retry_after + grace);
+    }
+
     /// Remove all tracked entries, resetting backoff state entirely.
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -560,6 +577,34 @@ mod tests {
 
         assert!(tracker.is_in_backoff(&"key1".to_string()));
         assert!(!tracker.is_in_backoff(&"key2".to_string()));
+    }
+
+    #[test]
+    fn cleanup_after_retry_grace_keeps_history_for_a_max_after_retry() {
+        let max = Duration::from_secs(300);
+        let config = ExponentialBackoff::new(Duration::from_secs(10), max);
+        let mut tracker: TrackedBackoff<u32> = TrackedBackoff::new(config, 16);
+        tracker.record_failure(1);
+        tracker.record_failure(2);
+        let now = Instant::now();
+        // Key 1: retry window ended a minute ago. Key 2: ended over `max` ago.
+        tracker.set_retry_after(&1, now - Duration::from_secs(60));
+        tracker.set_retry_after(&2, now - max - Duration::from_secs(5));
+        tracker.cleanup_after_retry_grace();
+        assert_eq!(tracker.failure_count(&1), 1, "within the grace: kept");
+        assert_eq!(tracker.failure_count(&2), 0, "past the grace: forgotten");
+    }
+
+    #[test]
+    fn cleanup_expired_behaviour_is_unchanged() {
+        // Stale is measured from the last failure, which is just now here, so a
+        // key whose retry window has ended is still kept.
+        let config = ExponentialBackoff::new(Duration::from_secs(10), Duration::from_secs(300));
+        let mut tracker: TrackedBackoff<u32> = TrackedBackoff::new(config, 16);
+        tracker.record_failure(1);
+        tracker.set_retry_after(&1, Instant::now() - Duration::from_secs(1));
+        tracker.cleanup_expired();
+        assert_eq!(tracker.failure_count(&1), 1);
     }
 
     #[test]

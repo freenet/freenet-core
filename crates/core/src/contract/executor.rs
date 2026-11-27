@@ -2920,6 +2920,11 @@ mod tests {
                  the_largest_entry_fits_the_byte_bound",
             ),
             (
+                "LEGACY_RECORD_BYTES",
+                "size of one record in the previous format of the compile-accepted file, \
+                 used to read it; not memory held",
+            ),
+            (
                 "DEFAULT_DATA_FLOOR_BYTES",
                 "memory limit given to a separate compile-check process, not node memory; the node-side figure is reserved from the service memory limit, less the node's current resident memory and the other reservations, by compile_worker::budget, which keeps the whole service under 90% of it",
             ),
@@ -2934,10 +2939,6 @@ mod tests {
             (
                 "available",
                 "what a new compile-check reservation can still take: usable, less the node's resident memory and the reservations held (compile_worker::caps, enforced by compile_worker::budget); not a node cache budget",
-            ),
-            (
-                "LARGE_MODULE_BYTES",
-                "input size above which an in-process compile of an already accepted module reserves memory from the compile-check budget; a size threshold, not a memory budget",
             ),
             (
                 "MAX_REASON_BYTES",

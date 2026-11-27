@@ -222,6 +222,7 @@ fn compile_coalesced(
             POOL_THREADS_SEEN.store(rayon::current_num_threads(), Ordering::SeqCst);
             Module::new(engine, code)
         })
+        .and_then(|compiled| compiled)
     })
 }
 
@@ -235,22 +236,33 @@ pub(crate) fn compile_threads() -> usize {
         .clamp(1, 4)
 }
 
-/// The pool all compiles share.
-fn compile_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+/// The pool all compiles share, or why it could not be started.
+fn compile_pool() -> &'static Result<rayon::ThreadPool, String> {
+    static POOL: OnceLock<Result<rayon::ThreadPool, String>> = OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
             .num_threads(compile_threads())
             .thread_name(|i| format!("wasm-compile-{i}"))
             .build()
-            .expect("the compile thread pool starts")
+            .map_err(|e| format!("the compile thread pool did not start: {e}"))
     })
+}
+
+/// Run `f` on `pool`, or report why there is no pool.
+fn install_in<R: Send>(
+    pool: &Result<rayon::ThreadPool, String>,
+    f: impl FnOnce() -> R + Send,
+) -> wasmtime::Result<R> {
+    match pool {
+        Ok(pool) => Ok(pool.install(f)),
+        Err(reason) => Err(wasmtime::Error::msg(reason.clone())),
+    }
 }
 
 /// Compile `code` on the shared compile pool, exactly as the node does.
 #[cfg(target_os = "linux")]
 pub(crate) fn compile_module_in_pool(engine: &Engine, code: &[u8]) -> wasmtime::Result<Module> {
-    run_in_compile_pool(|| Module::new(engine, code))
+    run_in_compile_pool(|| Module::new(engine, code)).and_then(|compiled| compiled)
 }
 
 /// The engine the compile worker process uses (see
@@ -311,8 +323,8 @@ pub(crate) fn compile_and_classify(engine: &WorkerEngine, code: &[u8]) -> Worker
 }
 
 /// Run `f` so that wasmtime's parallel compilation uses [`compile_pool`].
-fn run_in_compile_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    compile_pool().install(f)
+fn run_in_compile_pool<R: Send>(f: impl FnOnce() -> R + Send) -> wasmtime::Result<R> {
+    install_in(compile_pool(), f)
 }
 
 // Test seam: the size of the pool the last compile ran in.
@@ -433,10 +445,15 @@ fn compile_coalesced_with(
     new_module: &dyn Fn(&Engine, &[u8]) -> wasmtime::Result<Module>,
 ) -> Result<Module, WasmError> {
     use super::compile_limits::{check_input_size, check_module};
+    // The coarse acceptance check covers contract code always and delegate code
+    // only on hosted nodes; any other delegate is compiled as it always was.
+    let checked = isolation.coarse_check_applies(kind);
     // Bound the input before hashing or converting it.
-    if let Err(refusal) = check_input_size(code) {
-        isolation.metrics().count(Outcome::RefusedSize);
-        return Err(refusal.into());
+    if checked {
+        if let Err(refusal) = check_input_size(code) {
+            isolation.metrics().count(Outcome::RefusedSize);
+            return Err(refusal.into());
+        }
     }
     let input_hash = *blake3::hash(code).as_bytes();
     if let Some(refusal) = verdicts.get(&input_hash) {
@@ -447,8 +464,14 @@ fn compile_coalesced_with(
     // `compile_limits`). Only the binary format is accepted from here on: the
     // text format is converted by a parser that runs before any limit, so it is
     // not taken from this path. A caller that holds text converts it first.
-    match check_module(code) {
-        Ok(shape) => {
+    let coarse = if checked {
+        check_module(code).map(Some)
+    } else {
+        Ok(None)
+    };
+    match coarse {
+        Ok(None) => {}
+        Ok(Some(shape)) => {
             // Early warning, once per code hash: a module this close to a
             // limit may be refused by a release that tightens it.
             if let Some((limit_name, value, limit)) = super::compile_limits::nearest_limit(&shape) {
@@ -1523,7 +1546,7 @@ impl ResourceLimiter for HostState {
 }
 
 impl WasmtimeEngine {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn engine_identity_for_tests(&self) -> u64 {
         engine_compat_id(&self.engine)
     }
@@ -2297,7 +2320,11 @@ impl WasmtimeEngine {
             .compile_metrics
             .clone()
             .unwrap_or_else(|| Arc::new(CompileMetrics::default()));
-        Arc::new(Isolation::inert(config.compile_isolation, metrics))
+        Arc::new(Isolation::inert(
+            config.compile_isolation,
+            config.compile_isolation_delegates,
+            metrics,
+        ))
     }
 
     /// Clone the backend engine for sharing with other runtimes.
@@ -3926,6 +3953,54 @@ mod tests {
         MODULE_NEW_CALLS.with(|calls| calls.get())
     }
 
+    /// A compile pool that did not start is an error for the compile, not a panic.
+    #[test]
+    fn a_compile_pool_that_did_not_start_is_a_compile_error() {
+        let failed: Result<rayon::ThreadPool, String> = Err("no threads".to_string());
+        let error = install_in(&failed, || 1).unwrap_err();
+        assert!(error.to_string().contains("no threads"));
+        assert_eq!(install_in(compile_pool(), || 7).unwrap(), 7);
+    }
+
+    /// The coarse acceptance check covers contract code on every node and
+    /// delegate code only on hosted nodes: a delegate over the size limit
+    /// compiles on a node that is not hosted, is refused on a hosted one, and a
+    /// contract of that size is refused on both.
+    #[test]
+    fn the_coarse_check_covers_delegates_only_on_hosted_nodes() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, MAX_MODULE_BYTES, test_support::padded_to,
+        };
+        let big = padded_to(MAX_MODULE_BYTES + 1024);
+        let mut plain = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        plain
+            .compile(&big)
+            .expect("a delegate on a node that is not hosted is not checked");
+        assert!(matches!(
+            plain.compile_contract(&big),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::ModuleTooLarge { .. }
+            ))
+        ));
+        let hosted_config = RuntimeConfig {
+            compile_isolation_delegates: true,
+            ..RuntimeConfig::default()
+        };
+        let mut hosted = WasmtimeEngine::new(&hosted_config, false).unwrap();
+        assert!(matches!(
+            hosted.compile(&big),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::ModuleTooLarge { .. }
+            ))
+        ));
+        assert!(matches!(
+            hosted.compile_contract(&big),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::ModuleTooLarge { .. }
+            ))
+        ));
+    }
+
     /// Every limit is enforced by `compile`: the module at the limit compiles and
     /// the first one past it is refused with that limit's variant, without the
     /// compiler being called for it.
@@ -3939,13 +4014,13 @@ mod tests {
             match &case.shadowed_by {
                 None => {
                     engine
-                        .compile(&(case.build)(at))
+                        .compile_contract(&(case.build)(at))
                         .unwrap_or_else(|e| panic!("{name}: the limit itself must compile: {e}"));
                     assert_eq!(module_new_calls(), before + 1, "{name}: compiled once");
                 }
                 Some(first) => {
                     // Another limit refuses a module at this one first.
-                    match engine.compile(&(case.build)(at)) {
+                    match engine.compile_contract(&(case.build)(at)) {
                         Err(WasmError::CompileRefused(got)) => assert_eq!(&got, first, "{name}"),
                         other => panic!("{name}: expected a refusal, got {:?}", other.err()),
                     }
@@ -3953,7 +4028,7 @@ mod tests {
                 }
             }
             let before = module_new_calls();
-            match engine.compile(&(case.build)(at + 1)) {
+            match engine.compile_contract(&(case.build)(at + 1)) {
                 Err(WasmError::CompileRefused(got)) => assert_eq!(got, case.refusal, "{name}"),
                 other => panic!("{name}: expected a refusal, got {:?}", other.err()),
             }
@@ -3979,7 +4054,7 @@ mod tests {
         );
         let before = module_new_calls();
         assert!(matches!(
-            engine.compile(&code),
+            engine.compile_contract(&code),
             Err(WasmError::CompileRefused(CompileRefusal::NestingTooDeep {
                 limit: 1
             }))
@@ -3996,20 +4071,20 @@ mod tests {
         // 600 nested blocks is 59% of the nesting limit of 1,024.
         let near = nested_blocks(600);
         let near_hash = *blake3::hash(&near).as_bytes();
-        engine.compile(&near).expect("inside every limit");
+        engine.compile_contract(&near).expect("inside every limit");
         assert!(
             !engine.verdicts.first_near_limit_report(&near_hash),
             "compiling the module did not report it"
         );
         let ordinary = nested_blocks(3);
         let ordinary_hash = *blake3::hash(&ordinary).as_bytes();
-        engine.compile(&ordinary).expect("ordinary");
+        engine.compile_contract(&ordinary).expect("ordinary");
         assert!(
             engine.verdicts.first_near_limit_report(&ordinary_hash),
             "an ordinary module was reported as near a limit"
         );
         // A second compile of the near module reports nothing new.
-        engine.compile(&near).expect("inside every limit");
+        engine.compile_contract(&near).expect("inside every limit");
         assert!(!engine.verdicts.first_near_limit_report(&near_hash));
     }
 
@@ -4022,7 +4097,7 @@ mod tests {
         let code = nested_blocks(2_000);
         let hash = *blake3::hash(&code).as_bytes();
         assert!(engine.verdicts.get(&hash).is_none());
-        assert!(engine.compile(&code).is_err());
+        assert!(engine.compile_contract(&code).is_err());
         assert!(
             engine.verdicts.get(&hash).is_some(),
             "the refusal was not remembered"
@@ -4048,10 +4123,10 @@ mod tests {
             .map(|o| s.outcome(*o))
             .sum::<u64>()
         };
-        assert!(engine.compile(&code).is_err());
+        assert!(engine.compile_contract(&code).is_err());
         assert_eq!(cached(&engine), 0, "the first refusal is not a cached one");
         for _ in 0..3 {
-            assert!(engine.compile(&code).is_err());
+            assert!(engine.compile_contract(&code).is_err());
         }
         assert_eq!(cached(&engine), 3);
     }
@@ -4118,7 +4193,7 @@ mod tests {
     fn a_huge_malformed_text_module_is_refused_with_a_small_message() {
         let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
         let input = format!("(module (x{}", "\t".repeat(1024 * 1024));
-        match engine.compile(input.as_bytes()) {
+        match engine.compile_contract(input.as_bytes()) {
             Err(WasmError::CompileRefused(refusal)) => {
                 assert!(
                     refusal.to_string().len() < 1024,
@@ -4145,7 +4220,7 @@ mod tests {
         let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
         let text = loops_text(MAX_FUNCTION_CONTROL_FRAMES as usize + 1);
         assert!(matches!(
-            engine.compile(&wat::parse_str(&text).unwrap()),
+            engine.compile_contract(&wat::parse_str(&text).unwrap()),
             Err(WasmError::CompileRefused(
                 CompileRefusal::TooManyControlFrames { .. }
             ))
@@ -4167,7 +4242,7 @@ mod tests {
         assert!(engine.offload_compilation);
         let code = nested_blocks(2_000);
         assert!(matches!(
-            engine.compile(&code),
+            engine.compile_contract(&code),
             Err(WasmError::CompileRefused(
                 CompileRefusal::NestingTooDeep { .. }
             ))
@@ -4200,14 +4275,14 @@ mod tests {
         assert!(Arc::ptr_eq(&a.verdicts, &b.verdicts));
         let code = nested_blocks(2_000);
         assert!(matches!(
-            a.compile(&code),
+            a.compile_contract(&code),
             Err(WasmError::CompileRefused(
                 CompileRefusal::NestingTooDeep { .. }
             ))
         ));
         let before = module_new_calls();
         assert!(matches!(
-            b.compile(&code),
+            b.compile_contract(&code),
             Err(WasmError::CompileRefused(
                 CompileRefusal::NestingTooDeep { .. }
             ))
@@ -4230,7 +4305,7 @@ mod tests {
         let mut engine = WasmtimeEngine::new_with_shared_backend(&config, false, backend).unwrap();
         let code = nested_blocks(2_000);
         let hash = *blake3::hash(&code).as_bytes();
-        assert!(engine.compile(&code).is_err());
+        assert!(engine.compile_contract(&code).is_err());
         assert!(engine.verdicts.get(&hash).is_some());
         clock.advance_time(VERDICT_TTL + Duration::from_secs(1));
         assert!(
@@ -4262,14 +4337,16 @@ mod tests {
         let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
         let text = b"(module (func (export \"f\")))".to_vec();
         let before = module_new_calls();
-        match engine.compile(&text) {
+        match engine.compile_contract(&text) {
             Err(WasmError::CompileRefused(CompileRefusal::NotBinary(_))) => {}
             other => panic!("expected a not-binary refusal, got {:?}", other.err()),
         }
         assert_eq!(module_new_calls(), before, "the compiler was called");
         // The same module in binary form compiles.
         let binary = wat::parse_bytes(&text).unwrap().into_owned();
-        engine.compile(&binary).expect("the binary form compiles");
+        engine
+            .compile_contract(&binary)
+            .expect("the binary form compiles");
     }
 
     /// The compile gate admits at most its capacity and releases a slot when a
@@ -4370,7 +4447,7 @@ mod tests {
                 .clamp(1, 4)
         );
         assert_eq!(
-            run_in_compile_pool(rayon::current_num_threads),
+            run_in_compile_pool(rayon::current_num_threads).unwrap(),
             compile_threads()
         );
         let backend = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();

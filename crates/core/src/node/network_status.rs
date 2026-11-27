@@ -360,6 +360,7 @@ pub(crate) fn auto_update_state() -> Option<serde_json::Value> {
 static COMPILE_ISOLATION_DEGRADED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 pub(crate) fn set_compile_isolation_degraded(degraded: bool) {
     COMPILE_ISOLATION_DEGRADED.store(degraded, std::sync::atomic::Ordering::Relaxed);
 }
@@ -374,6 +375,7 @@ pub(crate) fn compile_isolation_degraded() -> bool {
 static COMPILE_ISOLATION_REFUSING_FOR_MEMORY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
 pub(crate) fn set_compile_isolation_refusing_for_memory(refusing: bool) {
     COMPILE_ISOLATION_REFUSING_FOR_MEMORY.store(refusing, std::sync::atomic::Ordering::Relaxed);
 }

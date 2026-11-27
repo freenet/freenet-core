@@ -410,6 +410,17 @@ impl Isolation {
         *h.finalize().as_bytes()
     }
 
+    /// Whether the always-on coarse acceptance check (`compile_limits`) applies
+    /// to this kind of code: contract code always; delegate code only on hosted
+    /// nodes, the same rule as the worker. A delegate on any other node is
+    /// installed by the node's own client and is not checked.
+    pub(crate) fn coarse_check_applies(&self, kind: CodeKind) -> bool {
+        match kind {
+            CodeKind::Contract => true,
+            CodeKind::Delegate => self.0.isolate_delegates,
+        }
+    }
+
     /// Whether this kind of code goes through the worker under the current mode,
     /// and whether a refusal takes effect.
     fn plan(&self, kind: CodeKind) -> (bool, bool) {
@@ -872,8 +883,9 @@ impl Isolation {
 
     fn note_backoff(&self, hash: [u8; 32]) {
         let mut map = self.0.backoff.lock().unwrap_or_else(|e| e.into_inner());
-        // A module that has been quiet for a whole maximum back-off starts over.
-        map.cleanup_expired();
+        // A module that has been quiet for a whole maximum back-off after its
+        // retry window ended starts over.
+        map.cleanup_after_retry_grace();
         map.record_failure(hash);
     }
 
@@ -1077,6 +1089,49 @@ mod breaker_tests {
             within_jitter(left(&i), Duration::from_secs(1)),
             "starts again at one second"
         );
+    }
+
+    /// A module at the ceiling keeps its failure history for a whole maximum
+    /// back-off after its retry window ends, so the delay stays at the ceiling
+    /// instead of restarting at the first delay.
+    #[test]
+    fn a_module_at_the_ceiling_keeps_its_history_through_the_retry_window() {
+        let i = iso();
+        let hash = [7u8; 32];
+        let mut last = Duration::ZERO;
+        for round in 0..14 {
+            i.note_backoff(hash);
+            let delay =
+                i.0.backoff
+                    .lock()
+                    .unwrap()
+                    .remaining_backoff(&hash)
+                    .expect("in back-off");
+            assert!(delay + Duration::from_millis(500) >= last.mul_f64(0.8 / 1.2));
+            last = delay;
+            // The window ends; the retry fails again a little later.
+            i.0.backoff
+                .lock()
+                .unwrap()
+                .set_retry_after(&hash, Instant::now() - Duration::from_secs(1 + round));
+        }
+        assert!(
+            within_jitter(last, BACKOFF_MAX),
+            "grew to the ceiling and stayed: {last:?}"
+        );
+        // Quiet for longer than a maximum back-off after the window ended: forgotten.
+        i.0.backoff
+            .lock()
+            .unwrap()
+            .set_retry_after(&hash, Instant::now() - BACKOFF_MAX - Duration::from_secs(5));
+        i.note_backoff(hash);
+        let after =
+            i.0.backoff
+                .lock()
+                .unwrap()
+                .remaining_backoff(&hash)
+                .unwrap();
+        assert!(within_jitter(after, BACKOFF_FIRST), "{after:?}");
     }
 }
 

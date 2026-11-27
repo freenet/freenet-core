@@ -89,7 +89,9 @@ wasmtime_config.cranelift_opt_level(OptLevel::None);
 
 ### Acceptance rule
 
-Before any compile, `engine/compile_limits.rs` validates the module with a
+Before any compile of contract code (and of delegate code on a hosted node;
+other delegates are installed by the node's own client and are not checked),
+`engine/compile_limits.rs` validates the module with a
 `wasmparser` walk that counts its size, functions, locals, control frames,
 branch edges and other quantities, and refuses it as soon as a counter passes
 its limit. The same walk accepts only the WebAssembly 2.0 feature set, and the

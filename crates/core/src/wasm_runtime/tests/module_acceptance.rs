@@ -28,6 +28,12 @@ fn assert_invalid_module<T: std::fmt::Debug>(res: super::super::RuntimeResult<T>
 }
 
 async fn runtime(dir: &std::path::Path) -> Runtime {
+    runtime_for(dir, false).await
+}
+
+/// A runtime whose node is hosted or not: the acceptance rule covers delegate
+/// code only on a hosted node.
+async fn runtime_for(dir: &std::path::Path, hosted: bool) -> Runtime {
     let db = Storage::new(dir).await.unwrap();
     let contract_store =
         super::super::ContractStore::new(dir.join("contract"), 10_000, db.clone()).unwrap();
@@ -35,7 +41,12 @@ async fn runtime(dir: &std::path::Path) -> Runtime {
         super::super::DelegateStore::new(dir.join("delegate"), 10_000, db.clone()).unwrap();
     let secrets_store =
         super::super::SecretsStore::new(dir.join("secrets"), Default::default(), db).unwrap();
-    Runtime::build(contract_store, delegate_store, secrets_store, false).unwrap()
+    let config = super::super::RuntimeConfig {
+        compile_isolation_delegates: hosted,
+        ..Default::default()
+    };
+    Runtime::build_with_config(contract_store, delegate_store, secrets_store, false, config)
+        .unwrap()
 }
 
 /// The contract path: preparing a call for stored code that is over a limit
@@ -80,10 +91,17 @@ async fn a_supplied_contract_over_a_limit_is_an_invalid_module() {
     ));
 }
 
-/// The delegate path: running a delegate whose code is over a limit fails with
-/// `InvalidModule`.
+/// The delegate path on a hosted node: running a delegate whose code is over a
+/// limit fails with `InvalidModule`. A node that is not hosted does not check
+/// delegate code, so the same delegate reaches the compiler there.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_delegate_over_a_limit_is_an_invalid_module() {
+async fn a_delegate_over_a_limit_is_an_invalid_module_on_a_hosted_node_only() {
+    for hosted in [true, false] {
+        run_over_limit_delegate(hosted).await;
+    }
+}
+
+async fn run_over_limit_delegate(hosted: bool) {
     use super::super::DelegateRuntimeInterface;
     use chacha20poly1305::{
         XChaCha20Poly1305,
@@ -91,7 +109,7 @@ async fn a_delegate_over_a_limit_is_an_invalid_module() {
     };
 
     let temp_dir = get_temp_dir();
-    let mut runtime = runtime(temp_dir.path()).await;
+    let mut runtime = runtime_for(temp_dir.path(), hosted).await;
     let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
         &over_the_limit().into(),
         &vec![].into(),
@@ -106,7 +124,7 @@ async fn a_delegate_over_a_limit_is_an_invalid_module() {
         .secret_store
         .register_delegate(delegate.key().clone(), cipher, nonce)
         .unwrap();
-    assert_invalid_module(runtime.inbound_app_message(
+    let res = runtime.inbound_app_message(
         delegate.key(),
         &Parameters::from(vec![]),
         None,
@@ -114,5 +132,17 @@ async fn a_delegate_over_a_limit_is_an_invalid_module() {
         vec![InboundDelegateMsg::ApplicationMessage(
             ApplicationMessage::new(vec![1, 2, 3]),
         )],
-    ));
+    );
+    if hosted {
+        assert_invalid_module(res);
+    } else {
+        let err = res.expect_err("the module has no entry points");
+        assert!(
+            !matches!(
+                err.deref(),
+                RuntimeInnerError::ContractExecError(ContractExecError::InvalidModule(_))
+            ),
+            "a node that is not hosted does not check delegate code: {err}"
+        );
+    }
 }

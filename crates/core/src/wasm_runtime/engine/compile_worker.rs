@@ -145,6 +145,7 @@ mod inert {
 
     pub(crate) struct Isolation {
         metrics: Arc<CompileMetrics>,
+        isolate_delegates: bool,
     }
 
     pub(crate) struct Ticket;
@@ -154,13 +155,28 @@ mod inert {
     }
 
     impl Isolation {
-        pub(crate) fn inert(mode: CompileIsolationMode, metrics: Arc<CompileMetrics>) -> Self {
+        pub(crate) fn inert(
+            mode: CompileIsolationMode,
+            isolate_delegates: bool,
+            metrics: Arc<CompileMetrics>,
+        ) -> Self {
             if mode != CompileIsolationMode::Off {
                 tracing::warn!(
                     "compile-isolation is only available on Linux; it is ignored on this platform"
                 );
             }
-            Self { metrics }
+            Self {
+                metrics,
+                isolate_delegates,
+            }
+        }
+
+        /// See the Linux `Isolation::coarse_check_applies`.
+        pub(crate) fn coarse_check_applies(&self, kind: CodeKind) -> bool {
+            match kind {
+                CodeKind::Contract => true,
+                CodeKind::Delegate => self.isolate_delegates,
+            }
         }
 
         pub(crate) fn metrics(&self) -> &Arc<CompileMetrics> {

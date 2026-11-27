@@ -539,8 +539,10 @@ pub(crate) enum CompileRefusal {
     TypeArityTooLarge { limit: u64 },
     /// Found by the bounded compile check, not by the scan.
     #[error("checking the module used more CPU time than allowed")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux worker finds it
     OverCpu,
     #[error("checking the module used more memory than allowed")]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only the Linux worker finds it
     OverMemory,
 }
 

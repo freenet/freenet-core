@@ -23,7 +23,9 @@ Other wasm_runtime files use the `Engine` type alias and `WasmEngine` trait.
 
 ### Compiling code (`engine/compile_limits.rs`, `engine/compile_verdicts.rs`)
 
-An acceptance rule applies before any compile. `compile_coalesced` takes binary
+An acceptance rule applies before any compile of contract code, and of delegate
+code on hosted nodes only (`Isolation::coarse_check_applies`; other delegates are
+installed by the node's own client and are not checked). `compile_coalesced` takes binary
 input only (text format is refused as not binary before any conversion), then
 `compile_limits::check_module` validates the module with a `wasmparser` walk that
 also counts size, functions, locals, control frames and their nesting (an
@@ -73,7 +75,8 @@ Compilation is a separate path from the guest calls below: it runs on the
 contract-handling path (a cache miss in `prepare_contract_call` or
 `prepare_delegate_call`; the offload to a blocking thread does not free that
 path, which waits for the result) and is not covered by the guest wall-clock
-backstop. The limits above are a coarse pre-filter and not a cost bound. With
+backstop. The limits above apply to contract code on every node and to delegate
+code on hosted nodes only (other delegates are not checked). They are a coarse pre-filter and not a cost bound. With
 `compile-isolation` on, a hard-capped worker process (CPU time, memory and wall
 time limits) judges each module before the node compiles it, and that is what
 bounds a module the pre-filter lets through (`compile_worker/caps.rs`).
