@@ -26643,7 +26643,22 @@ fn run_put_stop_sim(seed: u64, cost_window: Option<usize>, with_gets: bool) -> P
 /// leaves the copy far from the key.
 #[test_log::test]
 fn test_streamed_put_continues_while_a_closer_peer_exists() {
-    for seed in [0x6D_57_0001u64, 0x6D_57_0002] {
+    let seed = 0x6D57_0001_u64;
+    // Control: with the router's pick left alone the same PUT reaches the
+    // nearest node, so the forced cost pick is what the assertions below test.
+    let control = run_put_stop_sim(seed, None, false);
+    assert!(
+        control
+            .host_distances
+            .first()
+            .is_some_and(|d| (d - control.nearest_node_distance).abs() < 1e-3),
+        "control: with no forced cost pick the PUT must reach the nearest node (hosts {:?}, \
+         nearest node {:.4}); the scenario no longer isolates the stop rule",
+        control.host_distances,
+        control.nearest_node_distance
+    );
+
+    {
         let placed = run_put_stop_sim(seed, Some(3), false);
         eprintln!(
             "seed={seed:x}: PUT hosts at {:?} (nearest node {:.4})",

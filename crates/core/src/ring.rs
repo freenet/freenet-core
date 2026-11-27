@@ -7807,20 +7807,25 @@ fn read_fd_soft_limit() -> Option<u64> {
     None
 }
 
-/// The candidates strictly closer to `target` than `own` is. A peer with no
-/// known location, or at exactly `own`'s distance, is not closer.
+/// Whether `candidate` is strictly closer to `target` than `own` is. A
+/// candidate with no known location, or at exactly `own`'s distance, is not.
+pub(crate) fn is_strictly_closer(
+    candidate: Option<Location>,
+    own: Location,
+    target: Location,
+) -> bool {
+    candidate.is_some_and(|c| c.distance(target).as_f64() < own.distance(target).as_f64())
+}
+
+/// The candidates strictly closer to `target` than `own` is.
 pub(crate) fn strictly_closer_candidates(
     candidates: &[PeerKeyLocation],
     own: Location,
     target: Location,
 ) -> Vec<PeerKeyLocation> {
-    let own_dist = own.distance(target).as_f64();
     candidates
         .iter()
-        .filter(|p| {
-            p.location()
-                .is_some_and(|l| l.distance(target).as_f64() < own_dist)
-        })
+        .filter(|p| is_strictly_closer(p.location(), own, target))
         .cloned()
         .collect()
 }
@@ -7870,7 +7875,9 @@ pub mod put_cost_pick_hook {
         };
         let mut by_dist: Vec<&PeerKeyLocation> = candidates.iter().collect();
         by_dist.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
-        by_dist.into_iter().take(window).last().cloned()
+        by_dist
+            .get(window.min(by_dist.len()).checked_sub(1)?)
+            .map(|p| (*p).clone())
     }
 }
 

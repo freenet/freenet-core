@@ -2002,7 +2002,23 @@ async fn run_relay_put<CB>(
 /// a farther peer.
 ///
 /// Returns `true` when the relay should stop forwarding and finalize
-/// locally.
+/// locally: the chain descended to this node AND `closer_peer_exists` is
+/// false.
+///
+/// # Stop only when no connected peer is strictly closer (2026-11-27)
+///
+/// This used to be tested against the router's cost-ranked pick: if the pick
+/// was not strictly closer than this node, the hop stopped. The router
+/// re-sorts the closest candidates by predicted cost, so the pick can be
+/// farther than a peer that is geometrically closer. nova-gw1 sent a 1.2 MB
+/// PUT to a first hop 0.155 from the key, which stopped there while peers
+/// within 0.014 of the key were connected. Now the stop needs that NO
+/// connected, non-skipped peer is strictly closer than this node
+/// (`put_resolve_next_hop`): if the router's pick is not closer but another
+/// peer is, the router ranks only the strictly-closer peers and the PUT goes
+/// to its pick. Equal distance is not closer. Not changed: the originator
+/// (never "descended") and its first-hop pick.
+///
 ///
 /// # The away-move alone is NOT sufficient (issue direction A)
 ///
@@ -2073,32 +2089,132 @@ async fn run_relay_put<CB>(
 fn put_routing_should_terminate(
     upstream_loc: Option<Location>,
     own_loc: Option<Location>,
-    next_hop_loc: Option<Location>,
     target: Location,
+    closer_peer_exists: bool,
 ) -> bool {
-    let (upstream_loc, own_loc, next_hop_loc) = match (upstream_loc, own_loc, next_hop_loc) {
-        (Some(up), Some(own), Some(next)) => (up, own, next),
-        // Unknown upstream/own/next location: cannot compare distances,
-        // so keep the prior forward-always behaviour rather than guess.
+    let (upstream_loc, own_loc) = match (upstream_loc, own_loc) {
+        (Some(up), Some(own)) => (up, own),
+        // Unknown upstream/own location: cannot compare distances, so keep
+        // the forward-always behaviour rather than guess.
         _ => return false,
     };
-    let upstream_dist = upstream_loc.distance(target).as_f64();
-    let own_dist = own_loc.distance(target).as_f64();
-    let next_dist = next_hop_loc.distance(target).as_f64();
-
     // Clause (1): the chain descended to reach us. The inbound hop
     // (upstream → own) moved strictly closer to the target, so this node
     // is the closest-seen point so far. At the originator loopback
     // `upstream == own`, making this strictly-less comparison false and
     // leaving the originator unguarded.
-    let descended_to_here = own_dist < upstream_dist;
+    let descended_to_here =
+        own_loc.distance(target).as_f64() < upstream_loc.distance(target).as_f64();
 
-    // Clause (2): the only forwardable next hop is NOT strictly closer to
-    // the target than we are — forwarding would climb back out of the
-    // neighbourhood we just reached (the #4363 overshoot).
-    let next_hop_moves_away = next_dist >= own_dist;
+    // Clause (2): no connected peer is strictly closer to the target than we
+    // are. Equal distance is not closer.
+    descended_to_here && !closer_peer_exists
+}
 
-    descended_to_here && next_hop_moves_away
+/// Whether the router's pick at a descended hop needs checking against the
+/// other connected peers: `Some(own_loc)` when the chain descended to this
+/// node and the router's pick is not strictly closer to the target than this
+/// node, `None` when the pick can be forwarded to as it is (not descended,
+/// unknown locations, or the pick itself makes progress).
+fn put_pick_needs_closer_search(
+    upstream_loc: Option<Location>,
+    own_loc: Option<Location>,
+    pick_loc: Option<Location>,
+    target: Location,
+) -> Option<Location> {
+    let (upstream_loc, own_loc, pick_loc) = match (upstream_loc, own_loc, pick_loc) {
+        (Some(up), Some(own), Some(pick)) => (up, own, pick),
+        _ => return None,
+    };
+    let own_dist = own_loc.distance(target).as_f64();
+    let descended_to_here = own_dist < upstream_loc.distance(target).as_f64();
+    let pick_is_closer = pick_loc.distance(target).as_f64() < own_dist;
+    (descended_to_here && !pick_is_closer).then_some(own_loc)
+}
+
+/// The outcome of the next-hop stop rule at one relay hop.
+struct PutNextHop {
+    /// The peer to forward to. When `terminate` is set it is the router's
+    /// unrestricted pick, kept as the target of the one-hop replication copy
+    /// that non-streaming PUTs still send.
+    peer: PeerKeyLocation,
+    terminate: bool,
+    upstream_loc: Option<Location>,
+    own_loc: Option<Location>,
+    next_hop_loc: Option<Location>,
+}
+
+/// Apply the stop rule to the router's pick at a relay hop (see
+/// `put_routing_should_terminate`). The router's cost ranking still chooses
+/// the next hop; it is overridden only when the chain has descended to this
+/// node and that pick is not strictly closer than this node. Then the router
+/// ranks the strictly-closer connected peers instead, and the PUT stops only
+/// if there are none.
+fn put_resolve_next_hop(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    skip_list: &HashSet<SocketAddr>,
+    upstream_addr: SocketAddr,
+    router_pick: PeerKeyLocation,
+) -> PutNextHop {
+    let target = Location::from(key);
+    // own_location() is the address-derived ring position (not the
+    // configured get_stored_location()); this matches the
+    // is_subscription_root precedent, which also reasons about "am I the
+    // routing terminus" from the address-derived location.
+    let own_loc = op_manager.ring.connection_manager.own_location().location();
+    // Upstream location resolves the inbound hop so the guard can tell "the
+    // chain descended to reach me" from "I just happen to sit closer to a
+    // random contract than my bootstrap peers". At the originator loopback
+    // (`upstream_addr == own_addr`) this resolves to our own location, leaving
+    // the originator unguarded by construction.
+    let upstream_loc = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(upstream_addr)
+        .and_then(|p| p.location());
+    let pick_loc = router_pick.location();
+    let Some(own) = put_pick_needs_closer_search(upstream_loc, own_loc, pick_loc, target) else {
+        return PutNextHop {
+            peer: router_pick,
+            terminate: false,
+            upstream_loc,
+            own_loc,
+            next_hop_loc: pick_loc,
+        };
+    };
+    match op_manager
+        .ring
+        .closest_potentially_hosting_strictly_closer(key, skip_list, own)
+    {
+        Some(closer) => {
+            let next_hop_loc = closer.location();
+            tracing::info!(
+                contract = %key,
+                router_pick_loc = ?pick_loc.map(|l| l.as_f64()),
+                chosen_loc = ?next_hop_loc.map(|l| l.as_f64()),
+                own_loc = ?own.as_f64(),
+                target_loc = target.as_f64(),
+                phase = "put_hop_overrode_farther_pick",
+                "PUT relay: router pick was not closer to the key than this node; \
+                 routing to a strictly closer peer instead"
+            );
+            PutNextHop {
+                peer: closer,
+                terminate: false,
+                upstream_loc,
+                own_loc,
+                next_hop_loc,
+            }
+        }
+        None => PutNextHop {
+            peer: router_pick,
+            terminate: put_routing_should_terminate(upstream_loc, own_loc, target, false),
+            upstream_loc,
+            own_loc,
+            next_hop_loc: pick_loc,
+        },
+    }
 }
 
 // NAMING LANDMINE: "relay" is a fossil of the hollow-relay firefight (#3763).
@@ -2226,35 +2342,21 @@ where
     let mut hop_source = super::path_log::HopSource::Router;
     let (next_peer, next_addr) = match next_hop {
         Some(peer) => {
-            // Greedy-routing terminus guard (#4363): finalize here only
-            // when the chain has provably descended to this node (the
-            // closest-seen point) AND the best next hop would climb back
-            // out of the contract neighbourhood. Forwarding past an
-            // overshoot would place the authoritative replica where
-            // greedy GETs never descend; terminating *before* the chain
-            // has reached the neighbourhood (e.g. at the originator
-            // loopback) would strand the contract far from the target —
-            // see `put_routing_should_terminate` for why the away-move
-            // alone is not a sufficient stop condition.
+            // Greedy-routing terminus guard (#4363): finalize here only when
+            // the chain has provably descended to this node (the
+            // closest-seen point) AND no connected peer is strictly closer to
+            // the key. When the router's cost-ranked pick is not closer but
+            // another connected peer is, the router ranks the strictly-closer
+            // peers and the PUT goes on to one of them. Terminating *before*
+            // the chain has reached the neighbourhood (e.g. at the originator
+            // loopback) would strand the contract far from the target; see
+            // `put_routing_should_terminate`.
             let target = crate::ring::Location::from(&key);
-            // own_location() is the address-derived ring position (not the
-            // configured get_stored_location()); this matches the
-            // is_subscription_root precedent, which also reasons about "am
-            // I the routing terminus" from the address-derived location.
-            let own_loc = op_manager.ring.connection_manager.own_location().location();
-            // Upstream location resolves the inbound hop so the guard can
-            // tell "the chain descended to reach me" from "I just happen
-            // to sit closer to a random contract than my bootstrap peers".
-            // At the originator loopback (`upstream_addr == own_addr`) this
-            // resolves to our own location, leaving the originator
-            // unguarded by construction.
-            let upstream_loc = op_manager
-                .ring
-                .connection_manager
-                .get_peer_by_addr(upstream_addr)
-                .and_then(|p| p.location());
-            let next_hop_loc = peer.location();
-            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
+            let hop = put_resolve_next_hop(op_manager, &key, &new_skip_list, upstream_addr, peer);
+            let (upstream_loc, own_loc, next_hop_loc) =
+                (hop.upstream_loc, hop.own_loc, hop.next_hop_loc);
+            let peer = hop.peer;
+            if hop.terminate {
                 // Finalize the operation at this closest-seen node (#4363
                 // placement) but STILL replicate the contract one hop onward so
                 // the UPDATE broadcast tree stays connected (#4509 convergence).
@@ -4201,19 +4303,16 @@ where
     let mut terminus_fired = false;
     let next_hop = match next_hop {
         Some(peer) => {
-            let target = crate::ring::Location::from(&contract_key);
-            let own_loc = op_manager.ring.connection_manager.own_location().location();
-            // Resolve the inbound hop so the guard can require "the chain
-            // descended to reach me" before treating an away-move as
-            // overshoot. Originator loopback resolves to our own location
-            // (unresolvable upstream), leaving it unguarded.
-            let upstream_loc = op_manager
-                .ring
-                .connection_manager
-                .get_peer_by_addr(upstream_addr)
-                .and_then(|p| p.location());
-            let next_hop_loc = peer.location();
-            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
+            let hop = put_resolve_next_hop(
+                op_manager,
+                &contract_key,
+                &new_skip_list,
+                upstream_addr,
+                peer,
+            );
+            let next_hop_loc = hop.next_hop_loc;
+            let peer = hop.peer;
+            if hop.terminate {
                 // Logged once, at step 6, after the replication attempt.
                 terminus_next_hop_loc = next_hop_loc;
                 terminus_fired = true;
@@ -5109,15 +5208,9 @@ async fn drive_relay_probe(
 
     let next_addr = match next_hop {
         Some(peer) => {
-            let target = crate::ring::Location::from(&key);
-            let own_loc = op_manager.ring.connection_manager.own_location().location();
-            let upstream_loc = op_manager
-                .ring
-                .connection_manager
-                .get_peer_by_addr(upstream_addr)
-                .and_then(|p| p.location());
-            let next_hop_loc = peer.location();
-            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
+            let hop = put_resolve_next_hop(op_manager, &key, &new_skip_list, upstream_addr, peer);
+            let peer = hop.peer;
+            if hop.terminate {
                 return relay_probe_send_response(
                     op_manager,
                     incoming_tx,
@@ -5431,15 +5524,9 @@ async fn drive_relay_probe_reconcile(
     );
     let next_addr = match next_hop {
         Some(peer) => {
-            let target = crate::ring::Location::from(&key);
-            let own_loc = op_manager.ring.connection_manager.own_location().location();
-            let upstream_loc = op_manager
-                .ring
-                .connection_manager
-                .get_peer_by_addr(upstream_addr)
-                .and_then(|p| p.location());
-            let next_hop_loc = peer.location();
-            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
+            let hop = put_resolve_next_hop(op_manager, &key, &new_skip_list, upstream_addr, peer);
+            let peer = hop.peer;
+            if hop.terminate {
                 return Ok(());
             }
             match peer.socket_addr() {
@@ -5504,6 +5591,7 @@ async fn drive_relay_probe_reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ring::is_strictly_closer;
 
     fn dummy_key() -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
@@ -5628,171 +5716,202 @@ mod tests {
     /// (distance 0.343), where it finalized — so greedy GETs descending
     /// to 0.211 never found the replica.
     ///
-    /// `put_routing_should_terminate` is the greedy-terminus guard that
-    /// stops the wander: when the chain has DESCENDED to the close node
-    /// (≈0.181, distance 0.03 from the 0.211 target) from a farther
-    /// upstream, and the only forwardable next hop (0.868, distance
-    /// 0.343) is FARTHER, the relay must terminate here instead of
-    /// forwarding to the farther peer.
+    /// `put_routing_should_terminate` stops the wander: when the chain has
+    /// DESCENDED to the close node (0.181, distance 0.03 from the 0.211
+    /// target) from a farther upstream, and NO connected peer is strictly
+    /// closer (the only forwardable peer, 0.868, is farther), the relay
+    /// terminates here.
     #[test]
-    fn put_routing_terminates_when_next_hop_moves_away_from_target() {
+    fn put_routing_terminates_when_no_connected_peer_is_closer() {
         let target = Location::new(0.211);
-        // Upstream that forwarded to us — farther from the target, so the
-        // inbound hop was a descending move (the chain reached us by
-        // getting closer). Without this, the away-move alone is the
-        // normal pre-neighbourhood state and MUST NOT terminate.
         let upstream = Location::new(0.868); // distance 0.343
-        // Close node: distance 0.03 from target (matches the hop-3 node
-        // in the diagnostic run).
-        let own = Location::new(0.181);
-        // The wander destination from the issue: distance 0.343.
-        let next_hop = Location::new(0.868);
-
-        // Sanity: this reproduces the geometry the issue describes.
-        assert!(
-            (own.distance(target).as_f64() - 0.03).abs() < 1e-9,
-            "own node should be ~0.03 from target"
-        );
+        let own = Location::new(0.181); // distance 0.03
+        let only_peer = Location::new(0.868); // distance 0.343, farther
+        assert!(!is_strictly_closer(Some(only_peer), own, target));
         assert!(
             own.distance(target).as_f64() < upstream.distance(target).as_f64(),
             "inbound hop must be a descending move (own closer than upstream)"
         );
         assert!(
-            next_hop.distance(target).as_f64() > own.distance(target).as_f64(),
-            "next hop must be farther than own node (the away-move)"
+            put_routing_should_terminate(Some(upstream), Some(own), target, false),
+            "must terminate when the chain descended here and no peer is closer"
         );
+    }
 
+    /// The nova-gw1 shape. The chain descended to a node 0.155 from the key;
+    /// the router's cost-ranked pick is farther than that node, but another
+    /// connected peer is strictly closer. The old guard tested only the
+    /// pick and stopped; the rule is now "stop only when NO connected peer is
+    /// strictly closer", so the relay must keep routing.
+    #[test]
+    fn put_routing_continues_when_pick_is_farther_but_a_closer_peer_exists() {
+        let target = Location::new(0.174);
+        let upstream = Location::new(0.9); // far
+        let own = Location::new(0.329); // distance 0.155
+        let pick = Location::new(0.60); // router's cost pick: farther than own
+        let closer = Location::new(0.18); // strictly closer, distance 0.006
+        assert!(!is_strictly_closer(Some(pick), own, target));
+        assert!(is_strictly_closer(Some(closer), own, target));
+
+        // The pick is not progress, so the relay must look at the other peers.
+        assert_eq!(
+            put_pick_needs_closer_search(Some(upstream), Some(own), Some(pick), target)
+                .map(|l| l.as_f64()),
+            Some(own.as_f64()),
+            "a descended hop whose pick is not closer must search the closer peers"
+        );
+        // A closer peer exists, so no terminus.
         assert!(
-            put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
-            "must terminate when the chain descended here and the only next \
-             hop moves away from the target"
+            !put_routing_should_terminate(Some(upstream), Some(own), target, true),
+            "a strictly closer connected peer exists: the PUT must continue"
+        );
+    }
+
+    /// When the router's pick already makes progress it is used as it is: no
+    /// second search, no behaviour change (this is every hop that worked
+    /// before, including every tiny-contract hop that did not stop).
+    #[test]
+    fn put_pick_that_is_closer_needs_no_search() {
+        let target = Location::new(0.211);
+        let upstream = Location::new(0.7);
+        let own = Location::new(0.5); // distance 0.289
+        let pick = Location::new(0.3); // distance 0.089, closer
+        assert!(is_strictly_closer(Some(pick), own, target));
+        assert_eq!(
+            put_pick_needs_closer_search(Some(upstream), Some(own), Some(pick), target),
+            None
         );
     }
 
     /// Regression for the #4509 over-aggressive guard. The originator's
-    /// own loopback relay runs with `upstream == own` (the loopback maps
-    /// `source_addr=None` to `upstream_addr=own_addr`). It frequently sits
+    /// own loopback relay runs with `upstream == own`. It frequently sits
     /// closer to a random contract than its sparse bootstrap peers, so a
-    /// guard that fired on the away-move alone would finalize the PUT *at
+    /// guard that fired on "no closer peer" alone would finalize the PUT *at
     /// the originator* — never forwarding the contract into its
-    /// neighbourhood, and making later SUBSCRIBE/GET fail "not found after
-    /// exhaustive search" (`test_multiple_clients_subscription`) /
-    /// "not cached locally" (`test_nat_peer_remote_subscription_*`). With
-    /// `upstream == own`, clause (1) "descended to here" is false, so the
-    /// originator MUST keep forwarding even though its only next hop is
-    /// farther.
+    /// neighbourhood. With `upstream == own`, clause (1) "descended to here"
+    /// is false, so the originator MUST keep forwarding even though no peer
+    /// is closer, and it never searches for a replacement pick (first-hop
+    /// selection at the originator is unchanged).
     #[test]
     fn put_routing_does_not_terminate_at_originator_loopback() {
         let target = Location::new(0.211);
-        // Originator sits closer to the contract than its only peer, but
-        // the inbound hop is a self-loop (upstream == own).
         let own = Location::new(0.181); // distance 0.03
         let next_hop = Location::new(0.868); // distance 0.343 — farther
+        assert!(!is_strictly_closer(Some(next_hop), own, target));
         assert!(
-            next_hop.distance(target).as_f64() > own.distance(target).as_f64(),
-            "test setup: next hop is farther (the away-move the old guard tripped on)"
+            !put_routing_should_terminate(Some(own), Some(own), target, false),
+            "originator loopback (upstream == own) must NEVER self-terminate"
         );
-        assert!(
-            !put_routing_should_terminate(Some(own), Some(own), Some(next_hop), target),
-            "originator loopback (upstream == own) must NEVER self-terminate — \
-             the chain has not descended anywhere yet"
+        assert_eq!(
+            put_pick_needs_closer_search(Some(own), Some(own), Some(next_hop), target),
+            None,
+            "the originator keeps the router's first-hop pick"
         );
     }
 
-    /// Normal forward replication on a chain that has NOT yet reached the
-    /// neighbourhood: the inbound hop did not descend (upstream was closer
-    /// or equal), so even a non-improving next hop must keep forwarding.
-    /// This is the dominant case on sparse/bootstrap topologies and the
-    /// one the over-aggressive `k == 1` guard regressed.
+    /// A chain that has NOT yet reached the neighbourhood (the inbound hop
+    /// did not descend) keeps forwarding, whatever the peers around it, and
+    /// keeps the router's pick.
     #[test]
     fn put_routing_forwards_when_chain_has_not_descended() {
         let target = Location::new(0.211);
-        // Upstream was already as close as us (no descending inbound hop).
         let upstream = Location::new(0.181); // distance 0.03
         let own = Location::new(0.5); // distance 0.289 — we moved AWAY coming in
         let next_hop = Location::new(0.868); // distance 0.343 — also farther
+        assert!(own.distance(target).as_f64() > upstream.distance(target).as_f64());
         assert!(
-            own.distance(target).as_f64() > upstream.distance(target).as_f64(),
-            "test setup: inbound hop did not descend"
+            !put_routing_should_terminate(Some(upstream), Some(own), target, false),
+            "must keep forwarding when the chain has not descended to us"
         );
-        assert!(
-            !put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
-            "must keep forwarding when the chain has not descended to us — \
-             terminating here would strand the contract far from the target"
-        );
-    }
-
-    /// Happy path: when the next hop is strictly closer to the target
-    /// than this node, the relay keeps forwarding (no premature stop) —
-    /// regardless of the inbound hop.
-    #[test]
-    fn put_routing_forwards_when_next_hop_is_closer() {
-        let target = Location::new(0.211);
-        let upstream = Location::new(0.7); // distance 0.489 (descending inbound)
-        let own = Location::new(0.5); // distance 0.289
-        let next_hop = Location::new(0.3); // distance 0.089 — closer
-        assert!(
-            next_hop.distance(target).as_f64() < own.distance(target).as_f64(),
-            "test setup: next hop must be closer"
-        );
-        assert!(
-            !put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
-            "must keep forwarding when the next hop makes progress"
+        assert_eq!(
+            put_pick_needs_closer_search(Some(upstream), Some(own), Some(next_hop), target),
+            None
         );
     }
 
-    /// Boundary: once the chain has descended here, a next hop at exactly
-    /// the same distance as this node is not progress, so the relay
-    /// terminates (the `>=` half of the strictly-closer rule). Prevents
-    /// two equidistant peers from ping-ponging the request.
+    /// Boundary: a peer at exactly this node's distance is not closer, so
+    /// once the chain has descended here it is a terminus. Prevents two
+    /// equidistant peers from ping-ponging the request.
     #[test]
-    fn put_routing_terminates_on_equal_distance_next_hop() {
+    fn put_routing_terminates_when_only_an_equal_distance_peer_exists() {
         let target = Location::new(0.5);
-        // Upstream farther than us so clause (1) holds (we descended here).
         let upstream = Location::new(0.8); // distance 0.3
-        // Both 0.1 from target (one CCW, one CW) → equal distance. Using
-        // values away from the 0.0/1.0 wrap-around keeps the two
-        // subtractions bit-identical so the equality is exact.
+        // Both 0.1 from target (one CCW, one CW); values away from the 0.0/1.0
+        // wrap keep the two subtractions bit-identical so equality is exact.
         let own = Location::new(0.4);
-        let next_hop = Location::new(0.6);
+        let peer = Location::new(0.6);
         assert_eq!(
             own.distance(target).as_f64(),
-            next_hop.distance(target).as_f64(),
-            "test setup: both peers equidistant from target"
+            peer.distance(target).as_f64()
         );
+        assert!(!is_strictly_closer(Some(peer), own, target));
         assert!(
-            own.distance(target).as_f64() < upstream.distance(target).as_f64(),
-            "test setup: inbound hop descended"
-        );
-        assert!(
-            put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
-            "equal-distance next hop is not progress; must terminate once descended"
+            put_routing_should_terminate(
+                Some(upstream),
+                Some(own),
+                target,
+                is_strictly_closer(Some(peer), own, target)
+            ),
+            "an equal-distance peer is not progress; must terminate once descended"
         );
     }
 
-    /// Edge: unknown upstream/own/next-hop location must fall back to the
-    /// prior forward-always behaviour (cannot reason about "closer").
+    /// Unknown locations fall back to forward-always (cannot reason about
+    /// "closer"); a peer with no known location is not "closer".
     #[test]
     fn put_routing_does_not_terminate_when_location_unknown() {
         let target = Location::new(0.211);
         let known = Location::new(0.181);
         let farther = Location::new(0.868);
-        assert!(
-            !put_routing_should_terminate(None, Some(known), Some(farther), target),
-            "unknown upstream location must not trigger termination"
+        assert!(!put_routing_should_terminate(
+            None,
+            Some(known),
+            target,
+            false
+        ));
+        assert!(!put_routing_should_terminate(
+            Some(farther),
+            None,
+            target,
+            false
+        ));
+        assert!(!put_routing_should_terminate(None, None, target, false));
+        assert_eq!(
+            put_pick_needs_closer_search(Some(farther), Some(known), None, target),
+            None
         );
-        assert!(
-            !put_routing_should_terminate(Some(farther), None, Some(known), target),
-            "unknown own location must not trigger termination"
-        );
-        assert!(
-            !put_routing_should_terminate(Some(farther), Some(known), None, target),
-            "unknown next-hop location must not trigger termination"
-        );
-        assert!(
-            !put_routing_should_terminate(None, None, None, target),
-            "all unknown must not trigger termination"
-        );
+        assert!(!is_strictly_closer(None, known, target));
+    }
+
+    /// The candidate filter keeps exactly the strictly-closer peers and keeps
+    /// all of them, so the router's cost ranking has a real choice among them
+    /// (the rule restricts WHICH peers are eligible, not how they are ranked).
+    #[test]
+    fn strictly_closer_candidates_keeps_every_closer_peer_and_no_other() {
+        let target = Location::new(0.5);
+        let own = Location::new(0.3); // distance 0.2
+        let peer_at = |want: f64| {
+            // Addresses hash to ring locations; find one near `want`.
+            (0u32..200_000)
+                .map(|i| {
+                    let b = i.to_be_bytes();
+                    SocketAddr::from(([10, b[1], b[2], 1], 1000))
+                })
+                .find(|a| (Location::from_address(a).as_f64() - want).abs() < 0.004)
+                .map(|a| {
+                    PeerKeyLocation::new(
+                        crate::transport::TransportKeypair::new().public().clone(),
+                        a,
+                    )
+                })
+                .expect("an address near the wanted location")
+        };
+        let near_a = peer_at(0.45); // distance ~0.05, closer
+        let near_b = peer_at(0.6); // distance ~0.1, closer
+        let far = peer_at(0.05); // distance ~0.45, not closer
+        let all = [far.clone(), near_a.clone(), near_b.clone()];
+        let kept = crate::ring::strictly_closer_candidates(&all, own, target);
+        assert_eq!(kept, vec![near_a, near_b]);
     }
 
     /// Issue #4251 follow-up: the PUT relay wrappers must mirror the UPDATE
@@ -7789,7 +7908,7 @@ mod tests {
     }
 
     /// Wiring pin for #4363: the greedy-routing terminus guard
-    /// (`put_routing_should_terminate`) MUST be invoked in the
+    /// (`put_resolve_next_hop`, which applies `put_routing_should_terminate`) MUST be invoked in the
     /// non-streaming relay body, BEFORE the chosen next hop is forwarded
     /// to. The `put_routing_should_terminate` unit tests only exercise
     /// the helper in isolation — without this pin, deleting the call site
@@ -7802,10 +7921,10 @@ mod tests {
         let src = include_str!("op_ctx_task.rs");
         let body = drive_relay_put_body(src);
 
-        let guard_pos = body.find("put_routing_should_terminate(").expect(
-            "drive_relay_put MUST call put_routing_should_terminate \
-             (the #4363 greedy-terminus guard); deleting it re-introduces \
-             the away-routing wander",
+        let guard_pos = body.find("put_resolve_next_hop(").expect(
+            "drive_relay_put MUST call put_resolve_next_hop (the #4363 \
+             greedy-terminus guard); deleting it re-introduces the \
+             away-routing wander",
         );
         // The guard sits inside the `Some(peer)` next-hop arm, which must
         // resolve the next hop's socket address before the request is
@@ -7861,9 +7980,9 @@ mod tests {
             + start;
         let body = &src[start..end];
 
-        let guard_pos = body.find("put_routing_should_terminate(").expect(
-            "drive_relay_put_streaming MUST call put_routing_should_terminate \
-             (the #4363 greedy-terminus guard) so the streaming path does not \
+        let guard_pos = body.find("put_resolve_next_hop(").expect(
+            "drive_relay_put_streaming MUST call put_resolve_next_hop (the \
+             #4363 greedy-terminus guard) so the streaming path does not \
              pipe a replica to a non-improving next hop",
         );
         // next_hop_addr is derived right before the piped-forward decision;
@@ -7893,6 +8012,54 @@ mod tests {
             "streaming terminus path MUST still replicate the contract onward \
              via relay_put_replicate_forward (#4509)"
         );
+    }
+
+    /// Wiring pin for the stop rule ("stop only when no connected peer is
+    /// strictly closer to the key", hosting invariant 4): the resolver that
+    /// every PUT hop goes through must (a) apply `put_routing_should_terminate`,
+    /// (b) look for a strictly-closer peer before deciding to stop, and (c) be
+    /// the only place that decides it, called from all four hop drivers
+    /// (full-state, streaming, probe, probe-reconcile). The unit tests cover the
+    /// pure predicates; this keeps the drivers from going back to testing the
+    /// router's cost-ranked pick alone.
+    #[test]
+    fn every_put_hop_driver_routes_through_the_stop_rule_resolver() {
+        let src = include_str!("op_ctx_task.rs");
+        let fn_body = |name: &str| {
+            let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+            let rest = &src[start + 1..];
+            let end = [
+                "\nasync fn ",
+                "\nfn ",
+                "\n// ── End of relay PUT driver",
+                "\n#[cfg(test)]",
+            ]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or(rest.len());
+            &src[start..start + 1 + end]
+        };
+        let resolver = fn_body("fn put_resolve_next_hop(");
+        assert!(resolver.contains("put_pick_needs_closer_search("));
+        assert!(resolver.contains("closest_potentially_hosting_strictly_closer("));
+        assert!(resolver.contains("put_routing_should_terminate("));
+        for driver in [
+            "async fn drive_relay_put<",
+            "async fn drive_relay_put_streaming",
+            "async fn drive_relay_probe(",
+            "async fn drive_relay_probe_reconcile(",
+        ] {
+            let body = fn_body(driver);
+            assert!(
+                body.contains("put_resolve_next_hop("),
+                "{driver} must resolve its next hop through put_resolve_next_hop"
+            );
+            assert!(
+                !body.contains("put_routing_should_terminate("),
+                "{driver} must not apply the stop rule to the router's pick directly"
+            );
+        }
     }
 
     // ── Upgrade-on-forward error paths (PR #4063) ─────────────────────
