@@ -2191,7 +2191,7 @@ impl P2pConnManager {
                                         .any(|gw| gw.socket_addr() == Some(target_addr));
 
                                     // D-8: there is no UDP to dial. A gateway is dialled
-                                    // natively (through its admission). Any other peer
+                                    // by its native join (through its admission). Any other peer
                                     // is not dialled: an unsolicited native dial cannot
                                     // be expected by it, so the message is dropped and
                                     // counted, the ring entry that has no transport is
@@ -2246,11 +2246,13 @@ impl P2pConnManager {
                                         }
                                         continue;
                                     }
-                                    let dial_transport = if no_udp {
-                                        crate::operations::connect::native::DialTransport::native_now()
-                                    } else {
-                                        crate::operations::connect::native::DialTransport::Udp
-                                    };
+                                    // A gateway keeps the `Udp` label, which is the join
+                                    // dial: `connect_outbound` tries the gateway's native
+                                    // join first (its admission), and with no UDP that is
+                                    // the only attempt. A plain native dial would not be
+                                    // a join and the gateway would not expect it.
+                                    let dial_transport =
+                                        crate::operations::connect::native::DialTransport::Udp;
 
                                     // Non-blocking enqueue to avoid self-deadlocking the
                                     // event loop (#4145). ev_listener_tx is drained by THIS
@@ -8594,7 +8596,8 @@ pub(crate) mod tests {
             + guard;
         let dial = arm.find("NodeEvent::ConnectPeer {").expect("dial moved");
         assert!(guard < counted && counted < pruned && pruned < cont && cont < dial);
-        assert!(arm.contains("DialTransport::native_now()"));
+        // A gateway keeps the `Udp` label: it is the join dial (native first).
+        assert!(arm.contains("let dial_transport =\n"));
         let connect_peer = &arm[dial..];
         let connect_peer = &connect_peer[..connect_peer.find("})").expect("event end")];
         assert!(connect_peer.contains("transport: dial_transport"));

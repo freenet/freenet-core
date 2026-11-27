@@ -638,6 +638,13 @@ impl GatewayJoinPolicy {
         peer: &TransportPublicKey,
     ) -> crate::operations::connect::native::GatewayJoinPlan {
         if origin == crate::transport::NatAttemptOrigin::Gateway {
+            // D-8: with no UDP the join is always native first. The slice, the
+            // gateway being marked native and the failure cooldown all end in
+            // `Legacy`, a UDP join that is refused, so a node would be shut out
+            // of a gateway for the cooldown after one failed attempt.
+            if !crate::transport::quic::breaker::udp_fallback() {
+                return crate::operations::connect::native::GatewayJoinPlan::NativeFirst;
+            }
             self.native.plan_gateway_join(&self.own, addr, peer)
         } else {
             crate::operations::connect::native::GatewayJoinPlan::Legacy
@@ -1356,6 +1363,35 @@ mod tests {
             elapsed: start.elapsed(),
             origins: connector.origins.into_inner(),
         }
+    }
+
+    /// D-8: with no UDP fallback (child process) a join to a gateway is native
+    /// first whatever the failure cooldown, the mark or the slice say; with UDP
+    /// (this process) a gateway that failed a native join is cooling down and
+    /// the plan is `LegacyCoolingDown`, as before.
+    #[test]
+    fn with_no_udp_a_gateway_join_is_always_native_first() {
+        use crate::operations::connect::native::GatewayJoinPlan;
+        let gw: SocketAddr = "192.0.2.9:31337".parse().unwrap();
+        let key = TransportKeypair::new().public().clone();
+        let (policy, _endpoint) = gateway_policy(&[gw]);
+        policy.native.record_gateway_join(gw, false);
+        let origin = crate::transport::NatAttemptOrigin::Gateway;
+        let plan = policy.plan(origin, gw, &key);
+        if !crate::transport::quic::breaker::run_with_no_udp_fallback(
+            module_path!(),
+            "with_no_udp_a_gateway_join_is_always_native_first",
+        ) {
+            assert_eq!(plan, GatewayJoinPlan::LegacyCoolingDown);
+            return;
+        }
+        assert_eq!(plan, GatewayJoinPlan::NativeFirst);
+        // An unmarked gateway too.
+        let (unmarked, _e) = gateway_policy(&[]);
+        assert_eq!(
+            unmarked.plan(origin, gw, &key),
+            GatewayJoinPlan::NativeFirst
+        );
     }
 
     /// D-8: a release dials no UDP. Through the real `connect_outbound_with`
