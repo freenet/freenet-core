@@ -634,6 +634,15 @@ async fn apply_preseeded_connections(
 ) {
     use crate::node::PeerId;
 
+    // D-8: with no UDP the first outbound message does not dial a ring peer
+    // that has no transport (it is dropped and the entry pruned), so the
+    // links are set up natively here, as a release would: each side dials the
+    // other at once (the native roles follow key order, both sides call the
+    // same setup) and retries a few times, since the peer may still be
+    // starting. A build that still has UDP keeps the lazy UDP dial.
+    let dial_natively = !crate::transport::quic::breaker::udp_fallback();
+    let mut to_dial = Vec::new();
+
     for peer in connections {
         let Some(addr) = peer.socket_addr() else {
             tracing::warn!("preseed_connections: skipping peer with unknown address: {peer}");
@@ -645,6 +654,9 @@ async fn apply_preseeded_connections(
         // double-injection is harmless. The bool return signals "just crossed
         // the readiness threshold", which we don't need here.
         let _ = op_manager.ring.add_connection(loc, peer_id, false).await;
+        if dial_natively {
+            to_dial.push(peer.clone());
+        }
         tracing::debug!(
             "preseed_connections: injected direct connection {} -> {peer} (@ {loc})",
             op_manager
@@ -654,5 +666,31 @@ async fn apply_preseeded_connections(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "<no addr>".to_string()),
         );
+    }
+    for peer in to_dial {
+        let op_manager = op_manager.clone();
+        GlobalExecutor::spawn(async move {
+            for attempt in 0..6u32 {
+                let (callback, mut rx) = tokio::sync::mpsc::channel(1);
+                let sent = op_manager
+                    .notify_node_event(crate::message::NodeEvent::ConnectPeer {
+                        peer: peer.clone(),
+                        tx: crate::message::Transaction::new::<connect::ConnectMsg>(),
+                        callback,
+                        is_gw: false,
+                        origin: crate::transport::NatAttemptOrigin::RingPeerNoTransport,
+                        transport: connect::native::DialTransport::native_now(),
+                    })
+                    .await;
+                if sent.is_err() {
+                    return;
+                }
+                if matches!(rx.recv().await, Some(Ok(_))) {
+                    return;
+                }
+                tracing::debug!(attempt, "preseed native dial to {peer} failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
     }
 }

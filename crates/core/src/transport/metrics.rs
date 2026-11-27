@@ -1211,6 +1211,9 @@ pub struct TransportMetrics {
     connect_native_decision_over_cap: AtomicU64,
     /// Outbound UDP dials a node refused because UDP is gone (D-8).
     connect_udp_dial_refused: AtomicU64,
+    /// Messages dropped for a ring peer with no transport, which a release
+    /// with no UDP does not dial (D-8).
+    ring_peer_no_transport_dropped: AtomicU64,
     /// Native setups this node did not admit as acceptor, deciding UDP
     /// instead (`connect::native::NativeSetupAdmission`) (reset each
     /// snapshot).
@@ -1790,6 +1793,7 @@ impl TransportMetrics {
             connect_native_decision_native_unsupported: AtomicU64::new(0),
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_udp_dial_refused: AtomicU64::new(0),
+            ring_peer_no_transport_dropped: AtomicU64::new(0),
             connect_native_admission_refused: AtomicU64::new(0),
             connect_native_admission_control_dropped: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
@@ -2475,6 +2479,13 @@ impl TransportMetrics {
     /// transport. The connect op sees a failed dial and tries another peer.
     pub(crate) fn record_connect_udp_dial_refused(&self) {
         self.connect_udp_dial_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A message for a ring peer with no transport was dropped: a release with
+    /// no UDP does not dial it (D-8).
+    pub(crate) fn record_ring_peer_no_transport_dropped(&self) {
+        self.ring_peer_no_transport_dropped
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3532,6 +3543,7 @@ impl TransportMetrics {
             connect_native_demotions: 0,
             connect_native_acceptor_demotions: 0,
             connect_udp_dial_refused: get64(&self.connect_udp_dial_refused),
+            ring_peer_no_transport_dropped: get64(&self.ring_peer_no_transport_dropped),
             connect_native_admission_refused: get64(&self.connect_native_admission_refused),
             connect_native_admission_control_dropped: get64(
                 &self.connect_native_admission_control_dropped,
@@ -4284,6 +4296,8 @@ pub struct TransportSnapshot {
     pub connect_native_demotions: u64,
     /// Outbound UDP dials refused because this build has no UDP transport (D-8).
     pub connect_udp_dial_refused: u64,
+    /// Messages dropped for a ring peer with no transport and no UDP to dial it (D-8).
+    pub ring_peer_no_transport_dropped: u64,
     /// Retired: always 0, as [`Self::connect_native_demotions`].
     pub connect_native_acceptor_demotions: u64,
     /// Native setups not admitted as acceptor (decided UDP instead).
@@ -4767,6 +4781,7 @@ impl TransportSnapshot {
             connect_native_decision_over_cap,
             connect_native_demotions,
             connect_udp_dial_refused,
+            ring_peer_no_transport_dropped,
             connect_native_acceptor_demotions,
             connect_native_admission_refused,
             connect_native_admission_control_dropped,
@@ -4959,6 +4974,7 @@ impl TransportSnapshot {
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
         self.connect_udp_dial_refused = connect_udp_dial_refused;
+        self.ring_peer_no_transport_dropped = ring_peer_no_transport_dropped;
         self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
         self.connect_native_admission_refused = connect_native_admission_refused;
         self.connect_native_admission_control_dropped = connect_native_admission_control_dropped;
@@ -5225,6 +5241,8 @@ struct SnapshotExtras {
     pub connect_native_demotions: u64,
     /// Outbound UDP dials refused because this build has no UDP transport (D-8).
     pub connect_udp_dial_refused: u64,
+    /// Messages dropped for a ring peer with no transport and no UDP to dial it (D-8).
+    pub ring_peer_no_transport_dropped: u64,
     /// Retired: always 0, as [`Self::connect_native_demotions`].
     pub connect_native_acceptor_demotions: u64,
     /// Native setups not admitted as acceptor (decided UDP instead).
@@ -5521,6 +5539,7 @@ impl SnapshotExtras {
             || self.connect_native_decision_native_unsupported != 0
             || self.connect_native_decision_over_cap != 0
             || self.connect_udp_dial_refused != 0
+            || self.ring_peer_no_transport_dropped != 0
             || self.connect_native_admission_refused != 0
             || self.connect_native_admission_control_dropped != 0
             || self.connect_native_rescued_by_udp_joiner != 0
@@ -8287,6 +8306,7 @@ mod tests {
             "connect_native_decision_over_cap",
             "connect_native_demotions",
             "connect_udp_dial_refused",
+            "ring_peer_no_transport_dropped",
             "connect_native_acceptor_demotions",
             "connect_native_admission_refused",
             "connect_native_admission_control_dropped",

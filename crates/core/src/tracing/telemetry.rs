@@ -3143,6 +3143,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_udp_dial_refused),
             );
             m.insert(
+                "ring_peer_no_transport_dropped".into(),
+                serde_json::json!(snapshot.ring_peer_no_transport_dropped),
+            );
+            m.insert(
                 "connect_native_acceptor_demotions".into(),
                 serde_json::json!(snapshot.connect_native_acceptor_demotions),
             );

@@ -2190,6 +2190,68 @@ impl P2pConnManager {
                                         .iter()
                                         .any(|gw| gw.socket_addr() == Some(target_addr));
 
+                                    // D-8: there is no UDP to dial. A gateway is dialled
+                                    // natively (through its admission). Any other peer
+                                    // is not dialled: an unsolicited native dial cannot
+                                    // be expected by it, so the message is dropped and
+                                    // counted, the ring entry that has no transport is
+                                    // pruned, and CONNECT maintenance (which sets up
+                                    // native with both sides expecting) refills it.
+                                    let no_udp = !crate::transport::quic::breaker::udp_fallback();
+                                    if no_udp && !is_gw {
+                                        crate::transport::TRANSPORT_METRICS
+                                            .record_ring_peer_no_transport_dropped();
+                                        tracing::warn!(
+                                            tx = %tx,
+                                            peer_addr = %target_addr,
+                                            phase = "connect",
+                                            "No transport to a ring peer and no UDP to dial it: \
+                                             dropping the message and pruning its ring entry"
+                                        );
+                                        if ctx
+                                            .bridge
+                                            .op_manager
+                                            .ring
+                                            .connection_manager
+                                            .is_in_ring(target_addr)
+                                        {
+                                            ctx.bridge
+                                                .op_manager
+                                                .ring
+                                                .prune_connection(
+                                                    PeerId::new(
+                                                        target_peer.pub_key().clone(),
+                                                        target_addr,
+                                                    ),
+                                                    crate::tracing::DisconnectReason::NetworkError(
+                                                        "no transport".to_string(),
+                                                    ),
+                                                )
+                                                .await;
+                                        }
+                                        if unsent_message_notice(
+                                            &msg,
+                                            tx,
+                                            target_addr,
+                                            &ctx.bridge.op_manager.ring.connection_manager.pub_key,
+                                        )
+                                        .is_some()
+                                        {
+                                            orphan_transaction(
+                                                &mut state,
+                                                &ctx.bridge.op_manager.ring.live_tx_tracker,
+                                                tx,
+                                                target_addr,
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                    let dial_transport = if no_udp {
+                                        crate::operations::connect::native::DialTransport::native_now()
+                                    } else {
+                                        crate::operations::connect::native::DialTransport::Udp
+                                    };
+
                                     // Non-blocking enqueue to avoid self-deadlocking the
                                     // event loop (#4145). ev_listener_tx is drained by THIS
                                     // task's own select loop, so a `.send().await` here that
@@ -2216,7 +2278,7 @@ impl P2pConnManager {
                                             callback,
                                             is_gw,
                                             origin: unconnected_dial_origin(is_gw),
-                                            transport: crate::operations::connect::native::DialTransport::Udp,
+                                            transport: dial_transport,
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
