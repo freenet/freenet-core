@@ -6129,6 +6129,7 @@ std::thread_local! {
     static GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_CLIENT_PUT_SUCCESSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_CLIENT_PUT_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_PUT_UNDELIVERED_ATTEMPTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Count + bytes for the existing-mesh case (holder found; only a
     // `StateDelta` ships via `ProbeReconcile`).
@@ -6238,6 +6239,7 @@ impl GlobalTestMetrics {
         GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT.with(|c| c.set(0));
         GLOBAL_CLIENT_PUT_SUCCESSES.with(|c| c.set(0));
         GLOBAL_CLIENT_PUT_FAILURES.with(|c| c.set(0));
+        GLOBAL_PUT_UNDELIVERED_ATTEMPTS.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(0));
@@ -6697,6 +6699,16 @@ impl GlobalTestMetrics {
         } else {
             GLOBAL_CLIENT_PUT_FAILURES.with(|c| c.set(c.get() + 1));
         }
+    }
+
+    /// Record a client PUT attempt known not to have left this node (P4).
+    pub fn record_put_undelivered_attempt() {
+        GLOBAL_PUT_UNDELIVERED_ATTEMPTS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Client PUT attempts known not to have left this node since the last reset.
+    pub fn put_undelivered_attempts() -> u64 {
+        GLOBAL_PUT_UNDELIVERED_ATTEMPTS.with(|c| c.get())
     }
 
     /// Client PUTs reported to the client as success since the last reset.

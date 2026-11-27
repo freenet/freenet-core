@@ -26511,6 +26511,10 @@ struct DeadFirstHopRun {
     remote_hosts: Vec<freenet::dev_tool::NodeLabel>,
     /// The scripted crash actually blocked traffic.
     crash_packets_dropped: u64,
+    /// Attempts the client PUT driver saw end known-undelivered (dispatch
+    /// failure or first-hop disconnect): proves the dead-first-hop path ran,
+    /// not merely that packets were dropped.
+    undelivered_attempts: u64,
 }
 
 /// Gateway + two peers, streaming-size state. The listed peers are crashed
@@ -26522,6 +26526,7 @@ fn run_dead_first_hop_put(
     network: &'static str,
     seed: u64,
     crash_node_numbers: &[usize],
+    streaming: bool,
 ) -> DeadFirstHopRun {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
 
@@ -26532,10 +26537,16 @@ fn run_dead_first_hop_put(
     let contract_key = contract.key();
     // Above the 64 KiB production streaming threshold: the shape of a River
     // room (contract code + state), which is the live-network case.
-    let state = SimOperation::create_large_state(96 * 1024, 0x44);
+    let state = if streaming {
+        SimOperation::create_large_state(96 * 1024, 0x44)
+    } else {
+        SimOperation::create_large_state(2 * 1024, 0x44)
+    };
 
     let mut sim = rt.block_on(async { SimNetwork::new(network, 1, 2, 7, 3, 10, 2, seed).await });
-    sim.with_streaming_threshold(64 * 1024);
+    if streaming {
+        sim.with_streaming_threshold(64 * 1024);
+    }
     sim.with_controlled_op_interval(Duration::from_secs(5));
     sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
 
@@ -26573,6 +26584,7 @@ fn run_dead_first_hop_put(
         failures: GlobalTestMetrics::client_put_failures(),
         remote_hosts,
         crash_packets_dropped: result.crash_packets_dropped(),
+        undelivered_attempts: GlobalTestMetrics::put_undelivered_attempts(),
     }
 }
 
@@ -26585,18 +26597,26 @@ fn run_dead_first_hop_put(
 /// reported success (#5458) while the contract never left the gateway.
 #[test_log::test]
 fn test_put_dead_first_hop_is_retried_to_another_peer() {
+    dead_first_hop_is_retried("put-dead-first-hop-retry", 0x5E4_0000_0001, true);
+}
+
+/// Same, for a payload under the streaming threshold: the forward is a plain
+/// `Request`, and the #3465 local success for a failed dispatch is now a retry.
+#[test_log::test]
+fn test_put_dead_first_hop_is_retried_to_another_peer_non_streaming() {
+    dead_first_hop_is_retried("put-dead-first-hop-retry-ns", 0x5E4_0000_0101, false);
+}
+
+fn dead_first_hop_is_retried(network: &'static str, seed: u64, streaming: bool) {
+    let mut undelivered = 0;
     for (idx, (crashed, survivor)) in [(1usize, 2usize), (2, 1)].into_iter().enumerate() {
-        let run = run_dead_first_hop_put(
-            "put-dead-first-hop-retry",
-            0x5E4_0000_0001 + idx as u64,
-            &[crashed],
-        );
+        let run = run_dead_first_hop_put(network, seed + idx as u64, &[crashed], streaming);
+        undelivered += run.undelivered_attempts;
         assert!(
             run.crash_packets_dropped > 0,
             "premise: the crash blocked traffic (crashed node {crashed})"
         );
-        let survivor_label =
-            freenet::dev_tool::NodeLabel::node("put-dead-first-hop-retry", survivor);
+        let survivor_label = freenet::dev_tool::NodeLabel::node(network, survivor);
         assert!(
             run.remote_hosts.contains(&survivor_label),
             "node {crashed} is dead, so the PUT must be retried to node {survivor} and \
@@ -26611,16 +26631,34 @@ fn test_put_dead_first_hop_is_retried_to_another_peer() {
             "once the retry lands, the client is told success (crashed node {crashed})"
         );
     }
+    assert!(
+        undelivered > 0,
+        "premise: in one of the two runs the first hop was the dead one, so an \
+         undelivered attempt must have been seen and retried"
+    );
 }
 
 /// P4 test 2: no peer can be reached. The contract is stored locally and goes
 /// nowhere, so the client must be told the PUT failed, not that it succeeded.
 #[test_log::test]
 fn test_put_no_reachable_peer_reports_failure_not_success() {
-    let run = run_dead_first_hop_put("put-no-reachable-peer", 0x5E4_0000_0010, &[1, 2]);
+    no_reachable_peer_fails("put-no-reachable-peer", 0x5E4_0000_0010, true);
+}
+
+#[test_log::test]
+fn test_put_no_reachable_peer_reports_failure_not_success_non_streaming() {
+    no_reachable_peer_fails("put-no-reachable-peer-ns", 0x5E4_0000_0110, false);
+}
+
+fn no_reachable_peer_fails(network: &'static str, seed: u64, streaming: bool) {
+    let run = run_dead_first_hop_put(network, seed, &[1, 2], streaming);
     assert!(
         run.crash_packets_dropped > 0,
         "premise: the crashes blocked traffic"
+    );
+    assert!(
+        run.undelivered_attempts > 0,
+        "premise: an attempt was seen to end undelivered, not just packets dropped"
     );
     assert!(
         run.remote_hosts.is_empty(),

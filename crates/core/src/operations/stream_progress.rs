@@ -412,6 +412,12 @@ impl Drop for StreamProgressGuard {
 /// confirm, and freenet/freenet-core#5458 for the still-open question of
 /// making the downstream reply itself reliable.
 ///
+/// **P4 (dead first hop):** a stall is still ONE attempt, but an attempt known
+/// not to have left this node (dispatch failure, first-hop disconnect before a
+/// reply) may be retried on another peer, within one shared
+/// `STREAMING_ATTEMPT_TIMEOUT_CAP` budget for the whole PUT. If every candidate
+/// then fails the client gets the failure, not the #5458 local success.
+///
 /// The real fix for both is to make the terminal reply arrive; until then this
 /// constant is a compromise between two bad outcomes rather than a derivation
 /// with a single right answer. Do not "tighten" it toward either end without

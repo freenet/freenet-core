@@ -520,6 +520,14 @@ pub(crate) trait RetryDriver {
     /// retry budget): no verdict came from the peer. Default: ignore.
     fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
 
+    /// How a [`AttemptOutcome::Retry`] attempt is labelled for the router.
+    /// Called once per `Retry`, after `classify`. Default `NotFound`; a driver
+    /// whose retry is a delivery failure (the request never reached the peer)
+    /// returns `SendFailure`.
+    fn retry_attempt_failure(&mut self) -> crate::operations::route_attempt::AttemptFailure {
+        crate::operations::route_attempt::AttemptFailure::NotFound
+    }
+
     /// Called when the connection to the peer the attempt was forwarded to
     /// dropped before any reply (`OpError::PeerDisconnected` for that hop),
     /// before `advance()`. Unlike a timeout, this tells the driver the
@@ -992,11 +1000,8 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 // ANT-2026-K0YQ8CG4). Both are recorded as a NotFound-class
                 // attempt failure against that hop.
                 driver.on_not_found_hop(attempt_hop.as_ref());
-                record_attempt_failure(
-                    driver,
-                    attempt_hop,
-                    crate::operations::route_attempt::AttemptFailure::NotFound,
-                );
+                let failure = driver.retry_attempt_failure();
+                record_attempt_failure(driver, attempt_hop, failure);
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {

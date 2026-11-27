@@ -218,9 +218,11 @@ fn exhausted_attempt_is_local_success(
 }
 
 /// Cause reported to the client when a PUT never left this node and no peer
-/// was left to try.
-pub(crate) const PUT_NO_REACHABLE_PEER_CAUSE: &str =
-    "PUT could not be forwarded to any reachable peer";
+/// was left to try. It says the state IS stored locally, so a client that
+/// re-PUTs the same version is not surprised by "version must be higher" (#3465).
+pub(crate) const PUT_NO_REACHABLE_PEER_CAUSE: &str = "PUT was stored locally on this node but could \
+     not be propagated to any reachable peer (a re-PUT of the same version will be \
+     rejected as not newer)";
 
 /// PUT driver has exactly two outcomes — no `SkipAlreadyDelivered` because
 /// PUT doesn't use `NodeEvent::LocalPutComplete` (the driver owns local
@@ -405,7 +407,8 @@ async fn drive_client_put_inner(
         /// eligible payloads (single attempt, no advancement) so the
         /// gateway's worst-case wall-clock budget for one client PUT
         /// stays at `STREAMING_ATTEMPT_TIMEOUT_CAP` (≤ 600s) instead
-        /// of `4 × cap` (≤ 40 min). See `MAX_PEER_ADVANCEMENTS_*`
+        /// of `4 × cap` (≤ 40 min); known-undelivered attempts raise it, within
+        /// one shared budget (`streaming_retry_budget_left`, P4). See `MAX_PEER_ADVANCEMENTS_*`
         /// rustdoc and freenet-git#53 for the failure mode this
         /// addresses.
         max_advancements: usize,
@@ -447,6 +450,28 @@ async fn drive_client_put_inner(
         /// An attempt after an undelivered one finished locally because no
         /// peer was left to forward to: the PUT never left this node.
         isolated_after_undelivered: bool,
+        /// The last `Retry` was an undelivered forward, labelled `SendFailure`
+        /// rather than the `NotFound` a bare `Retry` records.
+        last_retry_is_send_failure: bool,
+        /// When the driver started: streaming retries share one wall-clock
+        /// budget (`streaming_retry_budget_left`).
+        started: tokio::time::Instant,
+    }
+
+    impl PutRetryDriver<'_> {
+        /// An attempt after an undelivered one finished locally because no
+        /// peer was left to forward to: nothing but this node holds the
+        /// contract, so the PUT fails (it is stored locally, which the cause
+        /// says).
+        fn isolated_terminal(&mut self) -> AttemptOutcome<<Self as RetryDriver>::Terminal> {
+            self.isolated_after_undelivered = true;
+            AttemptOutcome::Terminal((
+                Err(PutTerminalError::from_wire(
+                    PUT_NO_REACHABLE_PEER_CAUSE.to_string(),
+                )),
+                None,
+            ))
+        }
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -485,29 +510,31 @@ async fn drive_client_put_inner(
 
         fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Self::Terminal> {
             match classify_reply(&reply) {
+                // The loopback relay's own local finalization (no peer left to
+                // forward to) answers `Stored` with hop_count 0, which no
+                // remote storer can (the first remote hop is at depth 1). After
+                // an undelivered attempt that is the same isolation as a
+                // `LocalCompletion` echo.
+                ReplyClass::Stored { hop_count: 0, .. } if self.undelivered_attempts > 0 => {
+                    self.isolated_terminal()
+                }
                 ReplyClass::Stored { key, hop_count } => {
                     AttemptOutcome::Terminal((Ok(key), Some(hop_count)))
                 }
                 // LocalCompletion = no remote hops traversed (originator
                 // is the storer). Forward depth is exactly 0.
                 ReplyClass::LocalCompletion { .. } if self.undelivered_attempts > 0 => {
-                    // An earlier attempt never left this node and now no peer
-                    // is left: nothing but this node holds the contract.
-                    self.isolated_after_undelivered = true;
-                    AttemptOutcome::Terminal((
-                        Err(PutTerminalError::from_wire(
-                            PUT_NO_REACHABLE_PEER_CAUSE.to_string(),
-                        )),
-                        None,
-                    ))
+                    self.isolated_terminal()
                 }
                 ReplyClass::LocalCompletion { key } => AttemptOutcome::Terminal((Ok(key), Some(0))),
                 ReplyClass::ForwardUndelivered => {
+                    crate::config::GlobalTestMetrics::record_put_undelivered_attempt();
                     self.undelivered_attempts += 1;
                     self.last_failure_undelivered = true;
                     // Reuse the overload bookkeeping: avoid that hop as the
                     // next attempt's first pick.
                     self.last_reply_overloaded = true;
+                    self.last_retry_is_send_failure = true;
                     AttemptOutcome::Retry
                 }
                 ReplyClass::TerminalError { cause } => AttemptOutcome::Terminal((Err(cause), None)),
@@ -522,6 +549,15 @@ async fn drive_client_put_inner(
         fn advance(&mut self) -> AdvanceOutcome {
             #[cfg(any(test, feature = "testing"))]
             PUT_RETRY_DRIVER_ADVANCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // One wall-clock budget across a streaming PUT's retries: each
+            // attempt may run up to the cap, so without this a hop that
+            // trickles fragments and then drops could be followed by three
+            // more of the same (about 40 min and four uplink transfers).
+            if self.stream_progress.is_some()
+                && !streaming_retry_budget_left(self.started.elapsed())
+            {
+                return AdvanceOutcome::Exhausted;
+            }
             match advance_to_next_peer(
                 self.op_manager,
                 &self.key,
@@ -556,6 +592,14 @@ async fn drive_client_put_inner(
             self.terminal_hop = hop;
         }
 
+        fn retry_attempt_failure(&mut self) -> crate::operations::route_attempt::AttemptFailure {
+            if std::mem::take(&mut self.last_retry_is_send_failure) {
+                crate::operations::route_attempt::AttemptFailure::SendFailure
+            } else {
+                crate::operations::route_attempt::AttemptFailure::NotFound
+            }
+        }
+
         fn on_attempt_peer_disconnected(&mut self, hop: &PeerKeyLocation) {
             // Not provably undelivered (the hop may have stored the PUT before
             // the connection dropped), but the originator cannot tell, and a
@@ -563,6 +607,7 @@ async fn drive_client_put_inner(
             // stays ambiguous (#5458).
             self.undelivered_attempts += 1;
             self.last_failure_undelivered = true;
+            crate::config::GlobalTestMetrics::record_put_undelivered_attempt();
             if let Some(addr) = hop.socket_addr()
                 && !self.overloaded_hops.contains(&addr)
             {
@@ -661,6 +706,8 @@ async fn drive_client_put_inner(
         undelivered_attempts: 0,
         last_failure_undelivered: false,
         isolated_after_undelivered: false,
+        last_retry_is_send_failure: false,
+        started: tokio::time::Instant::now(),
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -763,8 +810,8 @@ async fn drive_client_put_inner(
             // latches `local_store_committed` only after its own store
             // succeeded, so an error that arrives with the latch set is a
             // failure AFTER the contract was stored here: in practice a
-            // downstream hop's, or a loopback failure past the store (#3465
-            // already turns most of those into a local success). Propagation
+            // downstream hop's. (A loopback dispatch failure no longer ends
+            // here: it is the retryable undelivered cause, P4.) Propagation
             // failing after the local store is not the PUT failing, so publish
             // the same local success #5458 gives a silent relay one attempt
             // timeout later, without the wait. The cause is logged, not
@@ -775,7 +822,7 @@ async fn drive_client_put_inner(
                     .stream_progress
                     .as_ref()
                     .is_some_and(|p| p.handle().local_store_committed()),
-                driver.isolated_after_undelivered || driver.last_failure_undelivered,
+                driver.isolated_after_undelivered,
             );
             if locally_stored {
                 tracing::info!(
@@ -839,6 +886,17 @@ async fn drive_client_put_inner(
                 )
                 .await);
             }
+            // An undelivered attempt means the PUT is stored here and went no
+            // further: say so, so a client that re-PUTs the same version is
+            // not surprised by "version must be higher" (#3465).
+            let cause = if driver.undelivered_attempts > 0 {
+                format!(
+                    "{cause}; the state was stored locally on this node but not \
+                     propagated to any other peer"
+                )
+            } else {
+                cause
+            };
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
             }
@@ -1566,6 +1624,15 @@ pub(crate) const MAX_PEER_ADVANCEMENTS_NON_STREAMING: usize = 3;
 ///
 /// Non-streaming PUTs keep the legacy `3 advancements = 4 attempts`
 /// budget via [`MAX_PEER_ADVANCEMENTS_NON_STREAMING`].
+///
+/// **Exception (P4):** an attempt KNOWN not to have left this node (the
+/// forward could not be dispatched, or the first hop's connection dropped
+/// before a reply) raises the cap by one, up to
+/// [`MAX_PEER_ADVANCEMENTS_NON_STREAMING`], so a dead first hop does not end
+/// the PUT in a false local success. Ambiguous stalls never raise it, and
+/// the retries of one streaming PUT share a single wall-clock budget
+/// ([`streaming_retry_budget_left`]), so the bound above still holds to
+/// within one attempt.
 pub(crate) const MAX_PEER_ADVANCEMENTS_STREAMING: usize = 0;
 
 /// Ask the ring for a new closest peer, excluding all previously tried
@@ -1577,6 +1644,15 @@ pub(crate) const MAX_PEER_ADVANCEMENTS_STREAMING: usize = 0;
 /// The cap gates *advancements only* — `drive_retry_loop` runs the
 /// initial attempt before ever calling this. Total attempts is
 /// therefore `1 + max_advancements`.
+/// Whether a streaming PUT may still start another attempt `elapsed` after it
+/// began. Streaming retries (only ever raised by a known-undelivered attempt)
+/// share the one `STREAMING_ATTEMPT_TIMEOUT_CAP` budget a single attempt may
+/// use, so a streaming PUT's total wall-clock stays near that cap plus the
+/// last attempt, not `4 x cap` (freenet-git#53).
+fn streaming_retry_budget_left(elapsed: std::time::Duration) -> bool {
+    elapsed < crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP
+}
+
 fn advance_to_next_peer(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -8839,16 +8915,18 @@ mod tests {
         let driver_src = &src[driver_start..driver_end];
 
         let forward_branch = driver_src
-            .find("// Fire-and-forget forward; do NOT install a waiter")
+            .find(".record_hop(&incoming_tx, &next_peer);")
             .expect("the loopback forward branch");
         let loopback_start = driver_src[..forward_branch]
             .rfind("if originator_loopback {")
             .expect("originator_loopback block not found in drive_relay_put");
         let loopback_end = driver_src[loopback_start..]
-            .find("// Originator is awaiting the Response on its own callback")
+            .find("return Ok(());")
             .map(|p| loopback_start + p)
-            .expect("end-of-loopback-block marker not found");
-        let loopback_block = &driver_src[loopback_start..loopback_end];
+            .expect("the loopback block's exit not found");
+        let loopback_block = crate::contract::source_pin_util::strip_comments(
+            &driver_src[loopback_start..loopback_end],
+        );
 
         // Three dispatch sites (streaming metadata, send_stream, non-streaming
         // Request): each failure arm reports the undelivered cause.
@@ -9723,12 +9801,12 @@ mod route_attempt_driver_tests {
             include_str!("op_ctx_task.rs"),
             "async fn drive_relay_put<CB>(",
         );
-        // The loopback FORWARD branch: the `if originator_loopback` block
-        // that starts at the fire-and-forget forward comment.
-        // Anchored on that, not on the first such `if` in the function, which reads the first-hop exclusions
+        // The loopback FORWARD branch: the `if originator_loopback` block that
+        // records the hop. Anchored on that call, not on the first such `if`
+        // in the function, which reads the first-hop exclusions
         // (ANT-2026-K0YQ8CG4).
         let forward_branch = body
-            .find("// Fire-and-forget forward; do NOT install a waiter")
+            .find(".record_hop(&incoming_tx, &next_peer);")
             .expect("the loopback forward branch");
         let loopback = body[..forward_branch]
             .rfind("if originator_loopback {")
@@ -11745,6 +11823,12 @@ mod overloaded_first_hop_failover_tests {
     enum Answer {
         Overloaded,
         Stored,
+        /// The loopback relay's own report that its forward could not be
+        /// dispatched (what its three dispatch-failure arms emit).
+        Undelivered,
+        /// The relay's local finalization with no peer left to forward to:
+        /// `PutMsg::Response` with hop_count 0, which no remote storer sends.
+        StoredAtOriginator,
     }
 
     /// Play the event loop. A client attempt (a `PutMsg::Request` with no
@@ -11816,6 +11900,15 @@ mod overloaded_first_hop_failover_tests {
                                 id: *id,
                                 key: contract.key(),
                                 hop_count: 1,
+                            }),
+                            Answer::Undelivered => NetMessage::from(PutMsg::Error {
+                                id: *id,
+                                cause: PUT_FORWARD_UNDELIVERED_CAUSE.to_string(),
+                            }),
+                            Answer::StoredAtOriginator => NetMessage::from(PutMsg::Response {
+                                id: *id,
+                                key: contract.key(),
+                                hop_count: 0,
                             }),
                         };
                         if let Some(waiter) = waiters.remove(msg.id()) {
@@ -11941,6 +12034,125 @@ mod overloaded_first_hop_failover_tests {
         assert_ne!(
             hops[0], hops[1],
             "the second attempt avoids the first busy peer"
+        );
+    }
+
+    /// P4: an undelivered forward is retried on a DIFFERENT first hop, and the
+    /// failed attempt is labelled `SendFailure` (a Failure the router trains
+    /// on), not the untrained `NotFound` a bare retry records.
+    ///
+    /// FALSIFY: drop `PutRetryDriver::retry_attempt_failure` (the label
+    /// becomes `NotFound`, `failed_addrs` is empty).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_undelivered_forward_is_retried_and_labelled_send_failure() {
+        let label = "put-undelivered-retry";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 4).await;
+        let first_hops = serve_through_loopback(op_manager.clone(), rx, |attempt| {
+            if attempt == 0 {
+                Answer::Undelivered
+            } else {
+                Answer::Stored
+            }
+        });
+        let outcome = client_put(&op_manager, label).await;
+        let hops: Vec<SocketAddr> = first_hops.lock().iter().map(|(hop, _)| *hop).collect();
+        assert!(
+            matches!(outcome, DriverOutcome::Publish(Ok(_))),
+            "the retry's success is the outcome; first hops {hops:?}"
+        );
+        assert_eq!(hops.len(), 2, "one retry: {hops:?}");
+        assert_ne!(hops[0], hops[1], "the retry avoids the undelivered hop");
+        assert_eq!(
+            crate::operations::route_attempt::driver_test_support::failed_addrs(&op_manager),
+            vec![hops[0]],
+            "the undelivered hop is labelled a Failure (SendFailure)"
+        );
+    }
+
+    /// P4 (codex): the retry finds no peer left, so the relay finalizes locally
+    /// with `Response { hop_count: 0 }`. That is classified `Stored`, but it is
+    /// the same isolation as a `LocalCompletion` echo: the PUT never left this
+    /// node, so the client gets the failure, and the failure says the state is
+    /// stored locally.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_local_response_after_an_undelivered_attempt_is_a_failure() {
+        let label = "put-undelivered-then-isolated";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 4).await;
+        let _first_hops = serve_through_loopback(op_manager.clone(), rx, |attempt| {
+            if attempt == 0 {
+                Answer::Undelivered
+            } else {
+                Answer::StoredAtOriginator
+            }
+        });
+        match client_put(&op_manager, label).await {
+            DriverOutcome::Publish(Err(err)) => assert!(
+                err.to_string().contains("stored locally"),
+                "the error must say the state is stored locally: {err}"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    }
+
+    /// Without an undelivered attempt, the same local `Response` stays a
+    /// success (a node with no peers at all is a legitimate sole host).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_local_response_with_no_prior_undelivered_attempt_is_a_success() {
+        let label = "put-isolated-from-start";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 4).await;
+        let _first_hops =
+            serve_through_loopback(op_manager.clone(), rx, |_| Answer::StoredAtOriginator);
+        assert!(matches!(
+            client_put(&op_manager, label).await,
+            DriverOutcome::Publish(Ok(_))
+        ));
+    }
+
+    /// P4: every candidate undelivered: the client gets an error, and it says
+    /// the state is stored locally but not propagated.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn every_forward_undelivered_fails_and_says_stored_locally() {
+        let label = "put-undelivered-exhausted";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 8).await;
+        let first_hops = serve_through_loopback(op_manager.clone(), rx, |_| Answer::Undelivered);
+        match client_put(&op_manager, label).await {
+            DriverOutcome::Publish(Err(err)) => assert!(
+                err.to_string().contains("stored locally"),
+                "the error must say the state is stored locally: {err}"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(
+            first_hops.lock().len(),
+            1 + MAX_PEER_ADVANCEMENTS_NON_STREAMING
+        );
+    }
+
+    /// P4: streaming retries share one wall-clock budget: no further attempt
+    /// once a single attempt's cap has elapsed.
+    #[test]
+    fn streaming_retries_share_one_wall_clock_budget() {
+        use crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP as CAP;
+        assert!(streaming_retry_budget_left(std::time::Duration::ZERO));
+        assert!(streaming_retry_budget_left(
+            CAP - std::time::Duration::from_secs(1)
+        ));
+        assert!(!streaming_retry_budget_left(CAP));
+        let src = include_str!("op_ctx_task.rs");
+        let production = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let advance = production
+            .split("fn advance(&mut self) -> AdvanceOutcome")
+            .nth(1)
+            .and_then(|r| r.split("fn attempt_timeout").next())
+            .expect("PutRetryDriver::advance");
+        let advance = crate::contract::source_pin_util::strip_comments(advance);
+        assert!(
+            advance.contains("streaming_retry_budget_left(self.started.elapsed())"),
+            "advance() must stop streaming retries once the shared budget is spent"
         );
     }
 }
