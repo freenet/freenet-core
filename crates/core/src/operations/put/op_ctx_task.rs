@@ -200,9 +200,27 @@ async fn run_client_put(
 /// local copy existing does not mean the network-wide propagation that
 /// class of caller is more plausibly relying on has happened — they are
 /// deliberately excluded here and keep reporting the real failure.
-fn exhausted_attempt_is_local_success(is_streaming: bool, local_store_committed: bool) -> bool {
-    is_streaming && local_store_committed
+///
+/// # Known-undelivered attempts (P4)
+///
+/// The forward's outcome is only UNKNOWN when the attempt stalled. When the
+/// last attempt is known not to have left this node (the forward could not be
+/// dispatched, or the first hop's connection dropped before any reply),
+/// "the reply was lost" is not a possible explanation, so `forward_undelivered`
+/// rules the local success out and the client gets the failure. Those
+/// attempts are retried on the next candidate first (`PutRetryDriver`).
+fn exhausted_attempt_is_local_success(
+    is_streaming: bool,
+    local_store_committed: bool,
+    forward_undelivered: bool,
+) -> bool {
+    is_streaming && local_store_committed && !forward_undelivered
 }
+
+/// Cause reported to the client when a PUT never left this node and no peer
+/// was left to try.
+pub(crate) const PUT_NO_REACHABLE_PEER_CAUSE: &str =
+    "PUT could not be forwarded to any reachable peer";
 
 /// PUT driver has exactly two outcomes — no `SkipAlreadyDelivered` because
 /// PUT doesn't use `NodeEvent::LocalPutComplete` (the driver owns local
@@ -416,6 +434,19 @@ async fn drive_client_put_inner(
         /// `on_not_found_hop`, which `drive_retry_loop` calls with that
         /// attempt's recorded hop on every `Retry`.
         last_reply_overloaded: bool,
+        /// Attempts known not to have left this node (a forward that could
+        /// not be dispatched, or the first hop's connection dropping before a
+        /// reply). Each raises the advancement cap by one, up to
+        /// `MAX_PEER_ADVANCEMENTS_NON_STREAMING`, so a dead first hop does not
+        /// end a streaming PUT's single attempt. Ambiguous stalls never do.
+        undelivered_attempts: usize,
+        /// The most recent attempt ended undelivered. Reset for each new
+        /// attempt; read at `Exhausted`, where it rules out #5458's local
+        /// success (that success is for "sent, reply lost", not "never sent").
+        last_failure_undelivered: bool,
+        /// An attempt after an undelivered one finished locally because no
+        /// peer was left to forward to: the PUT never left this node.
+        isolated_after_undelivered: bool,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -426,6 +457,7 @@ async fn drive_client_put_inner(
         type Terminal = (Result<ContractKey, PutTerminalError>, Option<usize>);
 
         fn new_attempt_tx(&mut self) -> Transaction {
+            self.last_failure_undelivered = false;
             Transaction::new::<PutMsg>()
         }
 
@@ -458,7 +490,26 @@ async fn drive_client_put_inner(
                 }
                 // LocalCompletion = no remote hops traversed (originator
                 // is the storer). Forward depth is exactly 0.
+                ReplyClass::LocalCompletion { .. } if self.undelivered_attempts > 0 => {
+                    // An earlier attempt never left this node and now no peer
+                    // is left: nothing but this node holds the contract.
+                    self.isolated_after_undelivered = true;
+                    AttemptOutcome::Terminal((
+                        Err(PutTerminalError::from_wire(
+                            PUT_NO_REACHABLE_PEER_CAUSE.to_string(),
+                        )),
+                        None,
+                    ))
+                }
                 ReplyClass::LocalCompletion { key } => AttemptOutcome::Terminal((Ok(key), Some(0))),
+                ReplyClass::ForwardUndelivered => {
+                    self.undelivered_attempts += 1;
+                    self.last_failure_undelivered = true;
+                    // Reuse the overload bookkeeping: avoid that hop as the
+                    // next attempt's first pick.
+                    self.last_reply_overloaded = true;
+                    AttemptOutcome::Retry
+                }
                 ReplyClass::TerminalError { cause } => AttemptOutcome::Terminal((Err(cause), None)),
                 ReplyClass::Overloaded => {
                     self.last_reply_overloaded = true;
@@ -476,7 +527,8 @@ async fn drive_client_put_inner(
                 &self.key,
                 &mut self.tried,
                 &mut self.retries,
-                self.max_advancements,
+                (self.max_advancements + self.undelivered_attempts)
+                    .min(MAX_PEER_ADVANCEMENTS_NON_STREAMING),
             ) {
                 Some((next_target, _next_addr)) => {
                     self.current_target = next_target;
@@ -502,6 +554,16 @@ async fn drive_client_put_inner(
 
         fn on_terminal_hop(&mut self, hop: Option<PeerKeyLocation>) {
             self.terminal_hop = hop;
+        }
+
+        fn on_attempt_peer_disconnected(&mut self, hop: &PeerKeyLocation) {
+            self.undelivered_attempts += 1;
+            self.last_failure_undelivered = true;
+            if let Some(addr) = hop.socket_addr()
+                && !self.overloaded_hops.contains(&addr)
+            {
+                self.overloaded_hops.push(addr);
+            }
         }
 
         fn first_hop_exclusions(&self) -> Vec<std::net::SocketAddr> {
@@ -592,6 +654,9 @@ async fn drive_client_put_inner(
         terminal_hop: None,
         overloaded_hops: Vec::new(),
         last_reply_overloaded: false,
+        undelivered_attempts: 0,
+        last_failure_undelivered: false,
+        isolated_after_undelivered: false,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -706,6 +771,7 @@ async fn drive_client_put_inner(
                     .stream_progress
                     .as_ref()
                     .is_some_and(|p| p.handle().local_store_committed()),
+                driver.isolated_after_undelivered || driver.last_failure_undelivered,
             );
             if locally_stored {
                 tracing::info!(
@@ -743,6 +809,7 @@ async fn drive_client_put_inner(
                     .stream_progress
                     .as_ref()
                     .is_some_and(|p| p.handle().local_store_committed()),
+                driver.last_failure_undelivered,
             );
             // Intended (#5657): the attempts' Timeout labels stand even when
             // this reports a local success. A router label says whether the
@@ -1349,8 +1416,19 @@ enum ReplyClass {
     /// (`PUT_RELAY_OVERLOADED_CAUSE`). Not terminal: the driver tries its
     /// next peer.
     Overloaded,
+    /// The originator-loopback relay could not dispatch the forward at all
+    /// (`PUT_FORWARD_UNDELIVERED_CAUSE`): the PUT is known not to have left
+    /// this node. Not terminal: the driver tries its next peer.
+    ForwardUndelivered,
     Unexpected,
 }
+
+/// `PutMsg::Error` cause the originator-loopback relay reports when it could
+/// not dispatch the forward to the first hop it picked. Local to the
+/// originator (delivered over the loopback bypass, never on the wire). Short,
+/// so `bound_cause` passes it through unchanged.
+pub(crate) const PUT_FORWARD_UNDELIVERED_CAUSE: &str =
+    "PUT: forward to the first hop could not be dispatched";
 
 fn classify_reply(msg: &NetMessage) -> ReplyClass {
     match msg {
@@ -1379,6 +1457,11 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
             if cause == crate::operations::relay_admission::PUT_RELAY_OVERLOADED_CAUSE =>
         {
             ReplyClass::Overloaded
+        }
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Error { cause, .. }))
+            if cause == PUT_FORWARD_UNDELIVERED_CAUSE =>
+        {
+            ReplyClass::ForwardUndelivered
         }
         NetMessage::V1(NetMessageV1::Put(PutMsg::Error { cause, .. })) => {
             ReplyClass::TerminalError {
@@ -2568,22 +2651,22 @@ where
         // `run_relay_put`'s originator-loopback arm converted into a
         // `PutMsg::Error` — surfacing "PUT operation timed out" / "peer
         // connection dropped" to the client for an operation that in fact
-        // succeeded locally. Instead, on a forward-dispatch failure we
-        // finalize the PUT locally as a success (the originator is a valid
-        // storer for its own contract) via `relay_put_finalize_local`, which
-        // routes a `PutMsg::Response` back through the loopback bypass and
-        // classifies as `Stored`.
+        // succeeded locally. #3465 answered that by finalizing the PUT locally
+        // as a success, which also reported success for a PUT that never left
+        // the node (a dead first hop). A dispatch failure is now reported to
+        // the client driver as `PUT_FORWARD_UNDELIVERED_CAUSE` over the
+        // loopback bypass; the driver retries the next candidate and only
+        // reports failure once every candidate is exhausted.
         //
         // Fire-and-forget forward; do NOT install a waiter (would
         // overwrite the originator's pending_op_results callback).
         // On a successful dispatch the downstream Response returns
         // directly to the originator via the bypass.
-        let local_hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         // Tell the client driver's retry loop which peer this attempt really
         // went to, so its outcome is attributed to that peer (#5657). Recorded
-        // before the dispatch so a reply can never beat it; cleared on every
-        // local dispatch failure below (the PUT then finalizes locally and
-        // must not blame a peer that never received it).
+        // before the dispatch so a reply can never beat it. A local dispatch
+        // failure below keeps it, so the client driver blames and avoids that
+        // hop on its next attempt (P4).
         op_manager
             .attempt_hop_registry()
             .record_hop(&incoming_tx, &next_peer);
@@ -2599,7 +2682,6 @@ where
                 subscribe: false,
             });
             if let Err(err) = ctx.send_fire_and_forget(next_addr, metadata_msg).await {
-                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -2607,16 +2689,14 @@ where
                     error = %err,
                     phase = "relay_put_loopback_forward_failed",
                     "PUT relay (loopback): streaming-upgrade forward could not \
-                     be dispatched; finalizing PUT locally as success (#3465) — \
-                     state is stored on this node, propagation is best-effort"
+                     be dispatched; reporting the forward as undelivered so the client \
+                     driver tries its next candidate (P4, #3465)"
                 );
-                return relay_put_finalize_local(
+                return relay_put_send_error(
                     op_manager,
                     incoming_tx,
-                    key,
-                    merged_value,
+                    PUT_FORWARD_UNDELIVERED_CAUSE.to_string(),
                     upstream_addr,
-                    local_hop_count,
                 )
                 .await;
             }
@@ -2640,7 +2720,6 @@ where
                 )
                 .await
             {
-                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -2648,17 +2727,15 @@ where
                     %stream_id,
                     error = %err,
                     phase = "relay_put_loopback_forward_failed",
-                    "PUT relay (loopback): send_stream failed; finalizing PUT \
-                     locally as success (#3465) — state is stored on this node, \
-                     propagation is best-effort"
+                    "PUT relay (loopback): send_stream failed; reporting the \
+                     forward as undelivered so the client driver tries its \
+                     next candidate (P4, #3465)"
                 );
-                return relay_put_finalize_local(
+                return relay_put_send_error(
                     op_manager,
                     incoming_tx,
-                    key,
-                    merged_value,
+                    PUT_FORWARD_UNDELIVERED_CAUSE.to_string(),
                     upstream_addr,
-                    local_hop_count,
                 )
                 .await;
             }
@@ -2672,7 +2749,6 @@ where
                 skip_list: new_skip_list,
             });
             if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
-                op_manager.attempt_hop_registry().clear_hop(&incoming_tx);
                 tracing::warn!(
                     tx = %incoming_tx,
                     contract = %key,
@@ -2680,16 +2756,14 @@ where
                     error = %err,
                     phase = "relay_put_loopback_forward_failed",
                     "PUT relay (loopback): forward could not be dispatched; \
-                     finalizing PUT locally as success (#3465) — state is \
-                     stored on this node, propagation is best-effort"
+                     reporting the forward as undelivered so the client \
+                     driver tries its next candidate (P4, #3465)"
                 );
-                return relay_put_finalize_local(
+                return relay_put_send_error(
                     op_manager,
                     incoming_tx,
-                    key,
-                    merged_value,
+                    PUT_FORWARD_UNDELIVERED_CAUSE.to_string(),
                     upstream_addr,
-                    local_hop_count,
                 )
                 .await;
             }
@@ -6551,6 +6625,7 @@ mod tests {
                 other @ (ReplyClass::LocalCompletion { .. }
                 | ReplyClass::TerminalError { .. }
                 | ReplyClass::Overloaded
+                | ReplyClass::ForwardUndelivered
                 | ReplyClass::Unexpected) => {
                     panic!("expected Stored, got {other:?} for hc={hc}")
                 }
@@ -6577,6 +6652,7 @@ mod tests {
                 other @ (ReplyClass::LocalCompletion { .. }
                 | ReplyClass::TerminalError { .. }
                 | ReplyClass::Overloaded
+                | ReplyClass::ForwardUndelivered
                 | ReplyClass::Unexpected) => {
                     panic!("expected Stored, got {other:?} for hc={hc}")
                 }
@@ -6680,6 +6756,9 @@ mod tests {
                 "Error envelope must NOT classify as Unexpected — that \
                  returns RetryLoopOutcome::Unexpected, dropping the cause"
             ),
+            ReplyClass::ForwardUndelivered => {
+                panic!("an ordinary error cause must NOT classify as ForwardUndelivered")
+            }
             ReplyClass::Overloaded => {
                 panic!("an ordinary error cause must NOT classify as Overloaded")
             }
@@ -6707,6 +6786,7 @@ mod tests {
             ReplyClass::Stored { .. }
             | ReplyClass::LocalCompletion { .. }
             | ReplyClass::Overloaded
+            | ReplyClass::ForwardUndelivered
             | ReplyClass::Unexpected => {
                 panic!("expected TerminalError with empty cause")
             }
@@ -6740,6 +6820,7 @@ mod tests {
             ReplyClass::Stored { .. }
             | ReplyClass::LocalCompletion { .. }
             | ReplyClass::Overloaded
+            | ReplyClass::ForwardUndelivered
             | ReplyClass::Unexpected => {
                 panic!("expected TerminalError with truncated cause")
             }
@@ -6760,6 +6841,7 @@ mod tests {
             ReplyClass::Stored { .. }
             | ReplyClass::LocalCompletion { .. }
             | ReplyClass::Overloaded
+            | ReplyClass::ForwardUndelivered
             | ReplyClass::Unexpected => panic!("expected TerminalError"),
         }
     }
@@ -6880,6 +6962,7 @@ mod tests {
             ReplyClass::Stored { .. }
             | ReplyClass::LocalCompletion { .. }
             | ReplyClass::Overloaded
+            | ReplyClass::ForwardUndelivered
             | ReplyClass::Unexpected => {
                 panic!(
                     "PutMsg::Error must classify as TerminalError — \
@@ -7130,29 +7213,48 @@ mod tests {
         );
     }
 
+    /// P4: the loopback relay's undelivered-forward cause classifies as a
+    /// retryable `ForwardUndelivered`, never a terminal error.
+    #[test]
+    fn classify_reply_undelivered_forward_cause_is_retryable() {
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: Transaction::new::<PutMsg>(),
+            cause: PUT_FORWARD_UNDELIVERED_CAUSE.to_string(),
+        }));
+        assert!(matches!(
+            classify_reply(&msg),
+            ReplyClass::ForwardUndelivered
+        ));
+    }
+
     /// #5458: the decision table for `exhausted_attempt_is_local_success`.
     /// Only the streaming-AND-committed cell may report success; the other
     /// three must keep reporting the real failure.
     #[test]
     fn exhausted_attempt_is_local_success_decision_table() {
         assert!(
-            exhausted_attempt_is_local_success(true, true),
+            exhausted_attempt_is_local_success(true, true, false),
             "streaming + locally committed → success"
         );
         assert!(
-            !exhausted_attempt_is_local_success(true, false),
+            !exhausted_attempt_is_local_success(true, false, false),
             "streaming but NOT yet committed (watchdog fired before the local \
              store finished) must NOT report success — that would be a false \
              positive for a PUT that never actually applied"
         );
         assert!(
-            !exhausted_attempt_is_local_success(false, true),
+            !exhausted_attempt_is_local_success(false, true, false),
             "non-streaming PUTs retry across peers before exhausting; a local \
              copy existing must not paper over exhausting every peer"
         );
         assert!(
-            !exhausted_attempt_is_local_success(false, false),
+            !exhausted_attempt_is_local_success(false, false, false),
             "neither streaming nor committed → definitely not a success"
+        );
+        assert!(
+            !exhausted_attempt_is_local_success(true, true, true),
+            "P4: the last attempt is known not to have left this node, so \
+             \"the reply was lost\" is not possible and success would be false"
         );
     }
 
@@ -8663,23 +8765,23 @@ mod tests {
         );
     }
 
-    /// Regression pin for issue #3465: in `drive_relay_put`'s
-    /// originator-loopback arm, a *forward-dispatch* failure MUST finalize
-    /// the PUT locally as a **success** (`relay_put_finalize_local`, which
-    /// sends `PutMsg::Response`), NOT propagate the error.
+    /// Regression pin for issue #3465 and P4: in `drive_relay_put`'s
+    /// originator-loopback arm, a *forward-dispatch* failure MUST be reported
+    /// to the client driver as the local `PUT_FORWARD_UNDELIVERED_CAUSE`
+    /// `PutMsg::Error`, NOT propagated as `return Err(..)` and NOT finalized
+    /// as a local success.
     ///
     /// At the loopback forward, Step 1 (`relay_put_store_locally`) has
-    /// already stored the state on the originator's own node. The pre-fix
-    /// code did `return Err(err)` on a dispatch failure, and
-    /// `run_relay_put`'s loopback arm converted that into a `PutMsg::Error`
-    /// — so the client saw "PUT operation timed out" / "peer connection
-    /// dropped" for a PUT that was in fact applied locally (the reporter
-    /// proved local success by re-PUTing at version+1 and getting "version
-    /// must be higher than current version N"). This pin fails if any of
-    /// the three loopback dispatch-failure sites regresses to `return
-    /// Err(...)` instead of `relay_put_finalize_local`.
+    /// already stored the state on the originator's own node. #3465: the
+    /// pre-fix code did `return Err(err)`, which `run_relay_put` turned into a
+    /// `PutMsg::Error` surfacing "PUT operation timed out" for a PUT that was
+    /// applied locally. Its fix finalized as a local success. That hid a dead
+    /// first hop (the PUT never left the node, yet the client was told it
+    /// succeeded), so the failure is now a distinguished, retryable cause: the
+    /// client driver tries its next candidate first and only then decides
+    /// (`PutRetryDriver`, `exhausted_attempt_is_local_success`).
     #[test]
-    fn drive_relay_put_loopback_forward_failure_finalizes_locally_not_error() {
+    fn drive_relay_put_loopback_forward_failure_reports_undelivered_not_success() {
         let src = include_str!("op_ctx_task.rs");
         let driver_start = src
             .find("async fn drive_relay_put<CB>(")
@@ -8690,14 +8792,8 @@ mod tests {
             .expect("end of drive_relay_put not found");
         let driver_src = &src[driver_start..driver_end];
 
-        // Isolate the originator-loopback block: from `if originator_loopback {`
-        // to its terminal `return Ok(());` (the "originator is awaiting the
-        // Response on its own callback" comment marks the block end).
-        // The forward branch is the `if originator_loopback` block that
-        // computes `local_hop_count`, not the first such `if` in the function
-        // (that one reads the first-hop exclusions, ANT-2026-K0YQ8CG4).
         let forward_branch = driver_src
-            .find("let local_hop_count")
+            .find("// Fire-and-forget forward; do NOT install a waiter")
             .expect("the loopback forward branch");
         let loopback_start = driver_src[..forward_branch]
             .rfind("if originator_loopback {")
@@ -8709,29 +8805,29 @@ mod tests {
         let loopback_block = &driver_src[loopback_start..loopback_end];
 
         // Three dispatch sites (streaming metadata, send_stream, non-streaming
-        // Request) each guard a forward with `if let Err(err) = ...`. Every one
-        // of those failure arms must finalize locally as success.
-        let finalize_count = loopback_block.matches("relay_put_finalize_local(").count();
+        // Request): each failure arm reports the undelivered cause.
+        let undelivered_count = loopback_block
+            .matches("PUT_FORWARD_UNDELIVERED_CAUSE.to_string()")
+            .count();
         assert!(
-            finalize_count >= 3,
-            "issue #3465: all three originator-loopback forward-dispatch \
-             failure arms MUST call relay_put_finalize_local (success), so a \
-             locally-applied PUT is not reported as a hard failure; found only \
-             {finalize_count} call(s)"
+            undelivered_count >= 3,
+            "all three originator-loopback forward-dispatch failure arms MUST \
+             report PUT_FORWARD_UNDELIVERED_CAUSE; found {undelivered_count}"
         );
-
-        // And none of them may return the forward error to the caller (which
-        // run_relay_put would turn into a client-visible PutMsg::Error).
+        assert!(
+            !loopback_block.contains("relay_put_finalize_local("),
+            "P4: a forward that could not be dispatched MUST NOT be finalized \
+             as a local success; the client driver retries the next candidate"
+        );
         assert!(
             !loopback_block.contains("return Err(err)"),
-            "issue #3465: the originator-loopback forward-dispatch failure arms \
-             MUST NOT `return Err(err)` — the state is already stored locally, \
-             so propagate best-effort and finalize the PUT as a success"
+            "issue #3465: the loopback forward-dispatch failure arms MUST NOT \
+             `return Err(err)`: report the undelivered cause instead"
         );
         assert!(
             !loopback_block.contains("send_stream failed: {err}"),
             "issue #3465: the send_stream failure arm MUST NOT bubble a \
-             NotificationChannelError — finalize locally as success instead"
+             NotificationChannelError"
         );
     }
 
@@ -9582,11 +9678,11 @@ mod route_attempt_driver_tests {
             "async fn drive_relay_put<CB>(",
         );
         // The loopback FORWARD branch: the `if originator_loopback` block
-        // that computes `local_hop_count`. Anchored on that, not on the first
-        // such `if` in the function, which reads the first-hop exclusions
+        // that starts at the fire-and-forget forward comment.
+        // Anchored on that, not on the first such `if` in the function, which reads the first-hop exclusions
         // (ANT-2026-K0YQ8CG4).
         let forward_branch = body
-            .find("let local_hop_count")
+            .find("// Fire-and-forget forward; do NOT install a waiter")
             .expect("the loopback forward branch");
         let loopback = body[..forward_branch]
             .rfind("if originator_loopback {")

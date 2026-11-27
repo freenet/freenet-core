@@ -520,6 +520,13 @@ pub(crate) trait RetryDriver {
     /// retry budget): no verdict came from the peer. Default: ignore.
     fn on_attempt_hop(&mut self, _hop: Option<&crate::ring::PeerKeyLocation>) {}
 
+    /// Called when the connection to the peer the attempt was forwarded to
+    /// dropped before any reply (`OpError::PeerDisconnected` for that hop),
+    /// before `advance()`. Unlike a timeout, this tells the driver the
+    /// request did not get a verdict from that peer, so the forward is known
+    /// not to have completed. Default: ignore.
+    fn on_attempt_peer_disconnected(&mut self, _hop: &crate::ring::PeerKeyLocation) {}
+
     /// Peers the originator-loopback relay should not pick as this attempt's
     /// first hop, handed to it through
     /// [`crate::operations::route_attempt::AttemptHopRegistry`] and applied to
@@ -904,6 +911,9 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     (OpError::PeerDisconnected { peer }, Some(hop_addr)) => *peer == hop_addr,
                     _ => false,
                 };
+                if blame && let Some(hop) = hop.as_ref() {
+                    driver.on_attempt_peer_disconnected(hop);
+                }
                 if blame {
                     record_attempt_failure(
                         driver,
