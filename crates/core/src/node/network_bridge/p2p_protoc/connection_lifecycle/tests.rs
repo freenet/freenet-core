@@ -1775,6 +1775,76 @@ async fn teardown_of_an_unkeyed_connection_runs_no_per_peer_cleanup() {
     }
 }
 
+/// A zombie-sweep cap eviction of a QUIC-native transport ends it with a
+/// CONNECTION_CLOSE (`NODE_DROPPED_PEER`) that the remote receives, so a peer
+/// whose link was evicted learns at once instead of sending into a dead link
+/// until its own idle timeout. Driven through the real sweep (plan, reap, the
+/// real per-connection task and native connection) and asserted on what the
+/// remote sees.
+#[test]
+fn zombie_sweep_reap_of_a_native_transport_closes_it_for_the_remote() {
+    crate::transport::native_pair_testing::run_native_pair(
+        "zombie-sweep-native-close",
+        |conn, peer| async move {
+            tokio::time::pause();
+            // max_connections 4: the global cap is 2.
+            let mut h = Harness::with_config("zombie-sweep-native-close", |config| {
+                config.max_number_of_connections(4);
+            })
+            .await;
+            let native = conn.remote_addr();
+            h.use_addr(native);
+            h.mgr
+                .handle_successful_connection(
+                    None,
+                    conn,
+                    &mut h.state,
+                    None,
+                    true,
+                    &h.handshake,
+                    IdentitySource::Dialled,
+                )
+                .await
+                .expect("handle_successful_connection");
+            assert!(h.mgr.connections.contains_key(&native), "connection kept");
+            let busy_a: SocketAddr = "198.51.100.71:7001".parse().unwrap();
+            let busy_b: SocketAddr = "198.51.100.72:7001".parse().unwrap();
+            h.accept(busy_a).await;
+            h.accept(busy_b).await;
+            peer.settle(Duration::from_millis(200)).await;
+            assert!(peer.is_open(), "premise: the link is open before the sweep");
+
+            // All three are past the zombie age and in use; the native one is
+            // the least recently used, so the cap evicts it.
+            tokio::time::advance(Duration::from_secs(1000)).await;
+            let now = tokio::time::Instant::now();
+            for (addr, idle_secs) in [(native, 50), (busy_a, 1), (busy_b, 2)] {
+                h.mgr.connections[&addr]
+                    .link_use
+                    .record(now - Duration::from_secs(idle_secs));
+            }
+            let handshake = h.handshake.clone();
+            let mut state = zombie_sweep::ZombieSweepState::new(now);
+            h.mgr
+                .sweep_zombie_transports(&handshake, &mut state, true)
+                .await;
+            assert_eq!(state.cap_evictions_total, 1, "the sweep cap-evicted it");
+            assert!(!h.mgr.connections.contains_key(&native));
+            assert!(h.mgr.connections.contains_key(&busy_a));
+            assert!(h.mgr.connections.contains_key(&busy_b));
+
+            peer.settle(Duration::from_secs(1)).await;
+            assert_eq!(
+                peer.close_code_from_node(),
+                Some(u64::from(
+                    crate::transport::metrics::QuicCloseCode::NodeDroppedPeer.code()
+                )),
+                "the remote must receive CONNECTION_CLOSE when the sweep evicts its link"
+            );
+        },
+    );
+}
+
 /// The source a connection's identity was bound from, if it has one.
 fn bound_source(h: &Harness, addr: SocketAddr) -> Option<IdentitySource> {
     h.mgr.connections[&addr].identity.source()
@@ -6599,7 +6669,7 @@ async fn a_native_join_without_a_connect_request_is_closed_after_the_deadline() 
     let stamp = zombie_sweep::LinkUseStamp::new(now);
     super::watch_native_join(entry.downgrade(), stamp.clone(), addr);
     stamp.record(now);
-    stamp.record_connect_request();
+    stamp.record_connect_request(now);
     tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN * 2).await;
     assert!(
         notices.try_recv().is_err(),
