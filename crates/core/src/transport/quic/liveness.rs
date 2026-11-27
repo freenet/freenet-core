@@ -622,7 +622,7 @@ mod tests {
         // While the switch says UDP exists, a peer never restarts.
         assert_eq!(
             restarts_for_quic(false),
-            !crate::transport::quic::breaker::UDP_FALLBACK
+            !crate::transport::quic::breaker::udp_fallback()
         );
         // Nothing in the unit-test binary enables it.
         assert!(!gateway_quic_restarts(true));

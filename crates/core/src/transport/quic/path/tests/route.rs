@@ -909,7 +909,9 @@ fn udp_rows() -> Vec<(BoundedSend, NextStep, NextStep)> {
 /// (D-3, dark).
 #[test]
 fn an_upgraded_path_keeps_its_udp_fallback_while_the_constant_is_true() {
-    const { assert!(super::super::super::breaker::UDP_FALLBACK) };
+    // A lib unit test reads `true` (D-8; see `breaker::udp_fallback`): the
+    // shipped constant is false, and D-9 deletes this with the with-UDP rules.
+    assert!(super::super::super::breaker::udp_fallback());
     assert!(QuicPathLimits::DEFAULT.effective_udp_fallback());
     assert!(!QuicPathLimits::NATIVE.effective_udp_fallback());
     bounded(|| async move {

@@ -289,11 +289,22 @@ pub(crate) fn udp_fallback() -> bool {
             return false;
         }
     }
-    #[cfg(any(test, feature = "testing"))]
-    if no_udp_fallback_process() {
-        return false;
+    // D-8: the lib's unit tests (`cfg(test)`) still test the with-UDP rules,
+    // which D-9 deletes with them, so they read `true` unless the process was
+    // started with `FREENET_TEST_NO_UDP_FALLBACK`. Every other build, the
+    // simulations (feature `testing`) included, reads the release value.
+    #[cfg(test)]
+    {
+        !no_udp_fallback_process()
     }
-    UDP_FALLBACK
+    #[cfg(not(test))]
+    {
+        #[cfg(feature = "testing")]
+        if no_udp_fallback_process() {
+            return false;
+        }
+        UDP_FALLBACK
+    }
 }
 
 /// Whether this process was started with `FREENET_TEST_NO_UDP_FALLBACK` set.
@@ -2322,7 +2333,8 @@ mod tests {
             module_path!(),
             "the_no_udp_fallback_environment_is_per_process",
         ) {
-            assert_eq!(udp_fallback(), UDP_FALLBACK);
+            // A unit-test process reads `true` since D-8 (see `udp_fallback`).
+            assert!(udp_fallback());
             return;
         }
         assert!(!udp_fallback());
