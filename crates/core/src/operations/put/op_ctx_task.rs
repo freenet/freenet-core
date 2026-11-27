@@ -557,6 +557,10 @@ async fn drive_client_put_inner(
         }
 
         fn on_attempt_peer_disconnected(&mut self, hop: &PeerKeyLocation) {
+            // Not provably undelivered (the hop may have stored the PUT before
+            // the connection dropped), but the originator cannot tell, and a
+            // retry is idempotent. Only a stall, with the connection still up,
+            // stays ambiguous (#5458).
             self.undelivered_attempts += 1;
             self.last_failure_undelivered = true;
             if let Some(addr) = hop.socket_addr()
@@ -2716,7 +2720,7 @@ where
                     stream_id,
                     bytes::Bytes::from(payload_bytes),
                     None,
-                    progress,
+                    progress.clone(),
                 )
                 .await
             {
@@ -7227,6 +7231,48 @@ mod tests {
         ));
     }
 
+    /// #5458 must keep reporting success for a stalled attempt (the hop may
+    /// have applied the PUT and only the reply was lost): the undelivered
+    /// flag is raised ONLY by the disconnect hook and the undelivered-forward
+    /// reply, never by the stall/timeout path, and every local-success
+    /// decision reads it.
+    #[test]
+    fn stall_stays_ambiguous_only_undelivered_paths_rule_out_local_success() {
+        let op_ctx = include_str!("../op_ctx.rs");
+        assert_eq!(
+            op_ctx
+                .matches("driver.on_attempt_peer_disconnected(")
+                .count(),
+            1,
+            "the disconnect hook has exactly one call site"
+        );
+        let timeout_arm = op_ctx
+            .split("outcome = \"timeout\"")
+            .nth(1)
+            .and_then(|rest| rest.split("AdvanceOutcome::Exhausted").next())
+            .expect("timeout arm of drive_retry_loop");
+        assert!(
+            !timeout_arm.contains("on_attempt_peer_disconnected"),
+            "a stall must not be treated as undelivered (#5458)"
+        );
+        let src = include_str!("op_ctx_task.rs");
+        let production = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(
+            production
+                .matches("last_failure_undelivered = true;")
+                .count(),
+            2,
+            "only the disconnect hook and the undelivered-forward reply set the flag"
+        );
+        assert_eq!(
+            production
+                .matches("exhausted_attempt_is_local_success(")
+                .count(),
+            3, // the definition and the two call sites
+            "both local-success call sites pass through the decision function"
+        );
+    }
+
     /// #5458: the decision table for `exhausted_attempt_is_local_success`.
     /// Only the streaming-AND-committed cell may report success; the other
     /// three must keep reporting the real failure.
@@ -9669,9 +9715,9 @@ mod route_attempt_driver_tests {
     }
 
     /// Source pin: the originator-loopback PUT relay reports its hop before
-    /// dispatching and clears it on each local dispatch failure.
+    /// dispatching and keeps it on each local dispatch failure (P4).
     #[test]
-    fn loopback_put_relay_records_and_clears_its_hop() {
+    fn loopback_put_relay_records_and_keeps_its_hop() {
         use crate::operations::route_attempt::driver_test_support::production_fn_body;
         let body = production_fn_body(
             include_str!("op_ctx_task.rs"),
@@ -9700,8 +9746,13 @@ mod route_attempt_driver_tests {
             .find("return Ok(());")
             .expect("loopback exit")
             + loopback;
+        // P4: a local dispatch failure is reported as an undelivered forward and
+        // retried, so the hop stays recorded: the client driver avoids it as the
+        // next first hop and labels the failed attempt against it. (Before P4 the
+        // PUT finalized locally as a success and the hop was cleared so that a
+        // success was not blamed on a peer that never received it.)
         let failures = body[loopback..loopback_end]
-            .matches("return relay_put_finalize_local(")
+            .matches("PUT_FORWARD_UNDELIVERED_CAUSE.to_string()")
             .count();
         let clears = body[loopback..loopback_end]
             .matches(".clear_hop(&incoming_tx);")
@@ -9711,8 +9762,8 @@ mod route_attempt_driver_tests {
             "the loopback branch has local dispatch failures"
         );
         assert_eq!(
-            failures, clears,
-            "every local dispatch failure in the loopback branch must clear the hop"
+            clears, 0,
+            "a local dispatch failure must keep the hop recorded (P4)"
         );
         // Each loopback dispatch is followed, in its own branch and after its
         // failure arm, by exactly one stamp of its local dispatch (#5657).
@@ -9741,7 +9792,7 @@ mod route_attempt_driver_tests {
                 .rfind("} else {")
                 .expect("the plain branch follows the streaming one");
         let fails_between =
-            |from: usize, to: usize| code[from..to].contains("return relay_put_finalize_local(");
+            |from: usize, to: usize| code[from..to].contains("return relay_put_send_error(");
         assert!(
             metadata < stamps[0]
                 && stamps[0] < payload
