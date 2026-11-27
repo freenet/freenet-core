@@ -581,7 +581,7 @@ pub(crate) struct ConnectionManager {
     /// the floor (`NodeConfig::quic_native_floor_override` or the production
     /// one) and the simulation's pre-floor decoder mode.
     native_wire: crate::operations::connect::native::NativeWire,
-    /// This node's QUIC-native connect state: readiness and demotion.
+    /// This node's QUIC-native connect state: readiness.
     native_connect: Arc<crate::operations::connect::native::NativeConnectState>,
     /// Version-gate refusal counters (#5156). Both `supports_hash_first_summaries`
     /// and `supports_summary_first_put` fail closed to the full-bytes fallback

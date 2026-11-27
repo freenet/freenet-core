@@ -437,8 +437,7 @@ pub(crate) trait RelayContext {
     ) -> Option<PeerKeyLocation>;
 
     /// This node's readiness for QUIC-native connections, read when it
-    /// decides as acceptor: off while either its joiner or its acceptor
-    /// demotion runs (`NativeConnectState::acceptor_readiness`).
+    /// decides as acceptor (`NativeConnectState::acceptor_readiness`).
     fn native_readiness(&self) -> native::NativeReadiness;
 
     /// Whether this node holds a transport to the joiner, by key or by
@@ -1785,11 +1784,6 @@ pub(super) async fn dispatch_expect_connection_from(
                                 .record_connect_native_rescued_by_udp(
                                     crate::transport::NativeConnectSide::Acceptor,
                                 );
-                            record_native_rescue_strike(
-                                &op_manager,
-                                crate::transport::NatAttemptOrigin::ConnectAcceptor,
-                                &peer,
-                            );
                         }
                         #[cfg(any(test, feature = "testing"))]
                         native_wire_trace::record_at(
@@ -1814,86 +1808,6 @@ pub(super) async fn dispatch_expect_connection_from(
         }
     });
     Ok(())
-}
-
-/// A native setup with `peer`, made in the role `origin` names, failed on the
-/// path and UDP to the same peer then connected: a rescue, the only evidence
-/// that counts toward demotion (`native::DEMOTION_FAILURES`). Strikes that
-/// role's streak (the joiner's or the acceptor's), each across distinct peers,
-/// so the same rescue seen at two sites counts once. Other origins strike
-/// nothing, and nor does a rescue with one of this node's configured gateways
-/// (matched by address or key, as the connection lifecycle labels a dial to
-/// one `Gateway`): callers pass the CONNECT role, which does not say whether
-/// the peer is a gateway.
-///
-/// Known residuals, both giving the ACCEPTOR a rescue it did not earn, since
-/// the joiner never dialled native but does dial UDP:
-/// - the joiner's plan for this acceptor was a UDP dial at the fallback time
-///   (`AcceptorDialPlan::UdpAt`: the response arrived with less than
-///   `NATIVE_MIN_WINDOW_LEFT` of the acceptor's window left); bounded by the
-///   response's travel time (10.2 item 6);
-/// - the joiner's own native setup was refused locally (`TooLate`,
-///   `OverBudget*`, `SetupsFull`, `AlreadyWaiting`, `AllowSetFull`,
-///   `KeyConflict`, `UnusableKey`) and it fell back to UDP; the joiner's
-///   streak does not count those (not a path failure), but the acceptor's
-///   setup timed out and its UDP fallback connected;
-/// - the joiner offered native and then lost it (demoted, or its endpoint
-///   went down) before the acceptor's `Native` decision arrived, so it
-///   refused the decision and dialled UDP at the fallback time
-///   (`native::refused_decision_plan`). The acceptor cannot tell a refusal
-///   from a broken path, so this is not fixed on the wire. Bounded: it needs
-///   a demotion within the response's travel time, and the acceptor demotes
-///   only after rescues with `ACCEPTOR_DEMOTION_FAILURES` (3) distinct
-///   joiners within the streak window (6 h).
-pub(crate) fn record_native_rescue_strike(
-    op_manager: &OpManager,
-    origin: crate::transport::NatAttemptOrigin,
-    peer: &PeerKeyLocation,
-) {
-    let is_configured_gateway = op_manager.configured_gateways.iter().any(|gw| {
-        gw.pub_key() == peer.pub_key()
-            || (gw.socket_addr().is_some() && gw.socket_addr() == peer.socket_addr())
-    });
-    if is_configured_gateway {
-        return;
-    }
-    let native_connect = op_manager.ring.connection_manager.native_connect();
-    // (whether the acceptor's streak counted it, whether it demoted)
-    let (as_acceptor, demoted) = match origin {
-        crate::transport::NatAttemptOrigin::ConnectJoiner => {
-            (false, native_connect.record_failure(peer.pub_key()))
-        }
-        crate::transport::NatAttemptOrigin::ConnectAcceptor => {
-            (true, native_connect.record_acceptor_failure(peer.pub_key()))
-        }
-        crate::transport::NatAttemptOrigin::Gateway
-        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => return,
-    };
-    #[cfg(any(test, feature = "testing"))]
-    {
-        use native_wire_trace::{NativeWireEvent, record_at};
-        let own = op_manager.ring.connection_manager.get_own_addr();
-        match (as_acceptor, own, peer.socket_addr()) {
-            (true, Some(own), _) => {
-                record_at(
-                    own,
-                    NativeWireEvent::AcceptorStreak {
-                        own,
-                        len: native_connect.acceptor_streak(),
-                    },
-                );
-                if demoted {
-                    record_at(own, NativeWireEvent::AcceptorDemoted { own });
-                }
-            }
-            (false, _, Some(addr)) if demoted => {
-                record_at(addr, NativeWireEvent::NativeDemoted);
-            }
-            _ => {}
-        }
-    }
-    #[cfg(not(any(test, feature = "testing")))]
-    let _ = (as_acceptor, demoted);
 }
 
 /// The acceptor's UDP hole punch towards `peer` at `addr`: an expected-inbound
@@ -4485,7 +4399,6 @@ mod tests {
         let self_loc = make_peer(4000);
         let joiner = make_peer(5000);
         let ready = native::NativeReadiness {
-            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4515,7 +4428,6 @@ mod tests {
         let self_loc = make_peer(4000);
         let joiner = make_peer(5000);
         let ready = native::NativeReadiness {
-            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4550,7 +4462,6 @@ mod tests {
         // A control pair (this acceptor at percent 0) at an acceptor with no
         // room leaves the control arm too, so the two arms see the same load.
         let at_zero = native::NativeReadiness {
-            demoted: false,
             ready: true,
             percent: 0,
         };
@@ -4588,7 +4499,6 @@ mod tests {
         let joiner = make_peer(5000);
         let peer_a = make_peer(6000);
         let ready = native::NativeReadiness {
-            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4661,7 +4571,6 @@ mod tests {
         let peer_b = make_peer(7000);
         let offer = Some(native::NativeOffer::capable(100));
         let ready = native::NativeReadiness {
-            demoted: false,
             ready: true,
             percent: 100,
         };

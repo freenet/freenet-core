@@ -286,16 +286,14 @@ pub mod sim_trace {
         joiner_responses_without_decision: AtomicU64,
         native_established: AtomicU64,
         native_failed: AtomicU64,
-        native_demotions: AtomicU64,
         decisions_refused: AtomicU64,
         /// Decisions on an offered request, as (acceptor, `seq` when it
         /// decided, native, in the slice).
         decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool, bool)>>,
         decision_causes: parking_lot::Mutex<std::collections::BTreeMap<&'static str, u64>>,
-        /// Acceptor-role demotions, as (node, `seq`).
-        acceptor_demotions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
-        /// The longest acceptor failure streak each node reached.
-        acceptor_streak_peaks: parking_lot::Mutex<std::collections::BTreeMap<SocketAddr, usize>>,
+        /// Rescues (a UDP dial that connected after a native path failure) as
+        /// (node, `seq`), on the same order as `decisions`.
+        rescues: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
         /// Native failures, as (transaction, node, peer), whose node has not
         /// yet asked for a UDP dial to that peer in that transaction.
         fallbacks_pending: parking_lot::Mutex<
@@ -395,12 +393,10 @@ pub mod sim_trace {
         JoinerResponse { with_decision: bool },
         /// A node's QUIC-native dial ended, as joiner or acceptor.
         NativeDial { established: bool },
-        /// A node turned its own native connects off.
-        NativeDemoted,
         /// The node `own`, as acceptor, decided an offered request: `Native`
         /// or not, and `in_slice`: the pair's bucket was below the offered
         /// percent and the acceptor held no transport to the joiner, so a
-        /// ready, undemoted acceptor at a release percent at or above the
+        /// ready acceptor at a release percent at or above the
         /// offer would decide `Native`. Recorded where it decides, not when
         /// the answer goes out.
         Decided {
@@ -408,17 +404,10 @@ pub mod sim_trace {
             native: bool,
             in_slice: bool,
             /// Why the decision was what it was (`native`, or the cause of a
-            /// UDP decision: `held`, `demoted`, `not_ready`, `setup_refused`,
+            /// UDP decision: `held`, `not_ready`, `setup_refused`,
             /// `offered_zero`, `outside_slice`), as `native::ArmCause` labels them.
             cause: &'static str,
         },
-        /// The node `own` stopped deciding `Native` as acceptor after native
-        /// failures with distinct joiners.
-        AcceptorDemoted { own: SocketAddr },
-        /// The node `own` had a native failure as acceptor; its streak is now
-        /// `len` distinct joiners (0 if this failure demoted it, or if it was
-        /// already demoted and so counted nothing).
-        AcceptorStreak { own: SocketAddr, len: usize },
         /// The node `own` failed a native setup with `peer` in `tx`; the
         /// connect op must dial UDP to that peer next.
         NativeFailedFor {
@@ -536,6 +525,10 @@ pub mod sim_trace {
             } => {
                 if connected && path_failed {
                     c.fallbacks_rescued.fetch_add(1, Ordering::Relaxed);
+                    if let Some(own) = own {
+                        let seq = c.seq.fetch_add(1, Ordering::Relaxed);
+                        c.rescues.lock().push((own, seq));
+                    }
                 }
                 c.fallbacks_ended.lock().push((own, peer, connected));
                 return;
@@ -567,17 +560,6 @@ pub mod sim_trace {
                 *c.decision_causes.lock().entry(cause).or_insert(0) += 1;
                 let seq = c.seq.fetch_add(1, Ordering::Relaxed);
                 c.decisions.lock().push((own, seq, native, in_slice));
-                return;
-            }
-            NativeWireEvent::AcceptorStreak { own, len } => {
-                let mut peaks = c.acceptor_streak_peaks.lock();
-                let peak = peaks.entry(own).or_insert(0);
-                *peak = (*peak).max(len);
-                return;
-            }
-            NativeWireEvent::AcceptorDemoted { own } => {
-                let seq = c.seq.fetch_add(1, Ordering::Relaxed);
-                c.acceptor_demotions.lock().push((own, seq));
                 return;
             }
             NativeWireEvent::NativeReplacedByUdp { own } => {
@@ -681,7 +663,6 @@ pub mod sim_trace {
             } => &c.joiner_responses_without_decision,
             NativeWireEvent::NativeDial { established: true } => &c.native_established,
             NativeWireEvent::NativeDial { established: false } => &c.native_failed,
-            NativeWireEvent::NativeDemoted => &c.native_demotions,
             NativeWireEvent::DecisionRefused => &c.decisions_refused,
             NativeWireEvent::NativeSuperseded => {
                 c.native_failed.fetch_add(1, Ordering::Relaxed);
@@ -812,33 +793,30 @@ pub mod sim_trace {
         pub fn native_failed(&self) -> u64 {
             Self::get(&self.0.native_failed)
         }
-        /// Times a node demoted itself.
         /// `Native` decisions joiners refused as unsupported.
         pub fn decisions_refused(&self) -> u64 {
             Self::get(&self.0.decisions_refused)
-        }
-        pub fn native_demotions(&self) -> u64 {
-            Self::get(&self.0.native_demotions)
         }
         /// Acceptors' decisions on offered requests, as (acceptor, order,
         /// native, in the slice), in the order made.
         pub fn decisions(&self) -> Vec<(SocketAddr, u64, bool, bool)> {
             self.0.decisions.lock().clone()
         }
+        /// The order numbers of the rescues the node `own` made, oldest first,
+        /// on the same order as [`Self::decisions`].
+        pub fn rescues_of(&self, own: SocketAddr) -> Vec<u64> {
+            self.0
+                .rescues
+                .lock()
+                .iter()
+                .filter(|(node, _)| *node == own)
+                .map(|(_, seq)| *seq)
+                .collect()
+        }
         /// Acceptors' decisions counted by cause: `native`, or why a decision
         /// was UDP (see [`NativeWireEvent::Decided`]). The labels come from `native::acceptor_verdict`.
         pub fn decision_causes(&self) -> std::collections::BTreeMap<&'static str, u64> {
             self.0.decision_causes.lock().clone()
-        }
-        /// Acceptor-role demotions, as (node, order), on the same order as
-        /// [`Self::decisions`].
-        pub fn acceptor_demotions(&self) -> Vec<(SocketAddr, u64)> {
-            self.0.acceptor_demotions.lock().clone()
-        }
-        /// The longest acceptor failure streak each node reached without
-        /// demoting (a demotion clears the streak).
-        pub fn acceptor_streak_peaks(&self) -> std::collections::BTreeMap<SocketAddr, usize> {
-            self.0.acceptor_streak_peaks.lock().clone()
         }
         /// Native failures followed by a UDP dial from the same node to the
         /// same peer in the same transaction.

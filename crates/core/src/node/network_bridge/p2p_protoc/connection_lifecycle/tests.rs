@@ -3670,71 +3670,88 @@ async fn a_native_connection_binds_its_proven_key() {
     h.assert_own_key_absent();
 }
 
+/// A harness whose node can dial native (override 100, QUIC endpoint up), so
+/// its readiness reads `ready` at percent 100 until something lowers it.
+async fn native_ready_harness(id: &str) -> Harness {
+    use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+    let h = Harness::with_config(id, |config| config.native_connect_override = Some(100)).await;
+    let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+    h.mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .native_connect()
+        .set_endpoint(watch, true);
+    assert_native_still_on(&h, "premise");
+    h
+}
+
+/// The node still offers its full percent as joiner and still decides
+/// `Native` as acceptor (for every bucket it is asked about): native failures
+/// of any kind, in either role, lower neither.
+fn assert_native_still_on(h: &Harness, after: &str) {
+    use crate::operations::connect::native::{NativeDecision, NativeOffer, decide_native};
+    let native = h
+        .mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .native_connect();
+    let joiner = native.readiness();
+    assert!(joiner.ready, "{after}: ready as joiner");
+    assert_eq!(joiner.percent, 100, "{after}: joiner offer");
+    let acceptor = native.acceptor_readiness();
+    assert!(acceptor.ready, "{after}: ready as acceptor");
+    for bucket in [0u8, 50, 99] {
+        assert_eq!(
+            decide_native(Some(NativeOffer::capable(100)), acceptor, bucket, false),
+            NativeDecision::Native,
+            "{after}: acceptor decides Native in bucket {bucket}"
+        );
+    }
+}
+
 /// A failed native setup: the connect op dials UDP next, so the address is
 /// not marked failed and the peer gets no backoff, either of which would
-/// refuse that dial. With no UDP connection to the peer, no failure strikes
-/// either streak, whatever its outcome or role: a strike needs evidence that
-/// native failed where UDP worked (a rescue), and UDP may fail for the same
-/// reason (an incompatible pair, a peer that never dialled).
+/// refuse that dial. However many setups fail, in whatever role and with
+/// whatever outcome, the node keeps offering native and deciding it.
 #[tokio::test]
-async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_strikes_nothing_alone() {
+async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_native_on() {
     use crate::operations::connect::native::DialTransport;
     use crate::transport::NativeSetupOutcome;
-    let mut h = Harness::new("native-failure").await;
+    let mut h = native_ready_harness("native-failure").await;
     use crate::transport::NatAttemptOrigin;
-    // (round, outcome, origin, joiner demotions, acceptor demotions). Each
-    // round fails with as many distinct peers as either threshold; none
-    // demotes anything.
-    for (round, outcome, origin, demotions, acceptor_demotions) in [
+    for (round, outcome, origin) in [
         (
             0u16,
             NativeSetupOutcome::OverBudgetDestination,
             NatAttemptOrigin::ConnectJoiner,
-            0,
-            0,
         ),
         (
             1,
             NativeSetupOutcome::OverBudgetDestination,
             NatAttemptOrigin::ConnectAcceptor,
-            0,
-            0,
         ),
-        // Before any role is demoted, so a leak into either streak would
-        // demote it (a demoted streak ignores further failures).
-        (
-            2,
-            NativeSetupOutcome::TimedOut,
-            NatAttemptOrigin::Gateway,
-            0,
-            0,
-        ),
+        (2, NativeSetupOutcome::TimedOut, NatAttemptOrigin::Gateway),
         (
             3,
             NativeSetupOutcome::TimedOut,
             NatAttemptOrigin::RingPeerNoTransport,
-            0,
-            0,
         ),
         (
             4,
             NativeSetupOutcome::TimedOut,
             NatAttemptOrigin::ConnectAcceptor,
-            0,
-            0,
         ),
         (
             5,
             NativeSetupOutcome::HandshakeFailed,
             NatAttemptOrigin::ConnectJoiner,
-            0,
-            0,
         ),
     ] {
-        for i in 0..crate::operations::connect::native::DEMOTION_FAILURES
-            .max(crate::operations::connect::native::ACCEPTOR_DEMOTION_FAILURES)
-            as u16
-        {
+        for i in 0..10u16 {
             let addr: SocketAddr = format!("203.0.113.231:{}", 6210 + round * 10 + i)
                 .parse()
                 .unwrap();
@@ -3766,28 +3783,7 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_strikes_nothing_
                 "a native failure gives no backoff"
             );
         }
-        assert_eq!(
-            h.mgr
-                .bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .native_connect()
-                .demotions(),
-            demotions,
-            "{outcome:?} as {origin:?}"
-        );
-        assert_eq!(
-            h.mgr
-                .bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .native_connect()
-                .acceptor_demotions(),
-            acceptor_demotions,
-            "{outcome:?} as {origin:?}: acceptor role"
-        );
+        assert_native_still_on(&h, &format!("{outcome:?} as {origin:?}"));
     }
 }
 
@@ -3830,199 +3826,46 @@ async fn native_failure_beside_udp(
 }
 
 /// A native path failure while a UDP connection to the same peer exists is
-/// a rescue, and strikes the streak of the role the setup was made in; three
-/// with distinct peers demote that role only. A refusal by the node's own
-/// limits beside a UDP connection is no strike, and gateway or no-transport
-/// dials strike nothing.
+/// a rescue (the UDP connection is the other side's fallback, or this one's,
+/// connected first). The node keeps offering and deciding native however many
+/// rescues it collects with distinct peers, in either role: there is no
+/// demotion, so the only cost of a failed setup is the UDP connection it
+/// falls back to.
 #[tokio::test]
-async fn a_native_path_failure_beside_a_udp_connection_is_a_strike() {
+async fn rescues_in_either_role_never_turn_native_off() {
     use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
-    let mut h = Harness::new("native-rescue-strike").await;
-    // (round, outcome, origin, joiner demotions, acceptor demotions),
-    // cumulative; the rows that must strike nothing come first, before any
-    // role is demoted (a demoted streak ignores further strikes).
-    for (round, outcome, origin, demotions, acceptor_demotions) in [
+    let mut h = native_ready_harness("native-rescue-no-demotion").await;
+    for (round, outcome, origin) in [
         (
             0u16,
             NativeSetupOutcome::OverBudgetDestination,
             NatAttemptOrigin::ConnectAcceptor,
-            0,
-            0,
         ),
-        (
-            1,
-            NativeSetupOutcome::TimedOut,
-            NatAttemptOrigin::Gateway,
-            0,
-            0,
-        ),
+        (1, NativeSetupOutcome::TimedOut, NatAttemptOrigin::Gateway),
         (
             2,
             NativeSetupOutcome::TimedOut,
             NatAttemptOrigin::RingPeerNoTransport,
-            0,
-            0,
         ),
         (
             3,
             NativeSetupOutcome::TimedOut,
             NatAttemptOrigin::ConnectAcceptor,
-            0,
-            1,
         ),
         (
             4,
             NativeSetupOutcome::HelloLost,
             NatAttemptOrigin::ConnectJoiner,
-            1,
-            1,
         ),
     ] {
-        for i in 0..crate::operations::connect::native::DEMOTION_FAILURES as u16 {
-            let addr: SocketAddr = format!("203.0.113.237:{}", 6400 + round * 10 + i)
+        for i in 0..10u16 {
+            let addr: SocketAddr = format!("203.0.113.237:{}", 6400 + round * 20 + i)
                 .parse()
                 .unwrap();
             native_failure_beside_udp(&mut h, PeerKeyLocation::new(key(), addr), origin, outcome)
                 .await;
         }
-        let native = h
-            .mgr
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .native_connect();
-        assert_eq!(native.demotions(), demotions, "{outcome:?} as {origin:?}");
-        assert_eq!(
-            native.acceptor_demotions(),
-            acceptor_demotions,
-            "{outcome:?} as {origin:?}: acceptor role"
-        );
-    }
-}
-
-/// 10.2 item 2: the acceptor role's streak is reset only by a native success
-/// as acceptor, the mirror of the joiner rule below. One acceptor strike (a
-/// rescue) short of the threshold, a success as joiner and one more acceptor
-/// strike demote the acceptor role (and the node then decides Udp); a
-/// success as acceptor in the same place resets the streak.
-#[tokio::test]
-async fn only_an_acceptors_native_success_resets_its_acceptor_streak() {
-    use crate::operations::connect::native::DialTransport;
-    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
-    for (case, success_origin, demotions) in [
-        (0u16, NatAttemptOrigin::ConnectJoiner, 1),
-        (1, NatAttemptOrigin::ConnectAcceptor, 0),
-    ] {
-        let mut h = Harness::new(&format!("native-acceptor-success-origin-{case}")).await;
-        let addr = |i: u16| -> SocketAddr {
-            format!("203.0.113.236:{}", 6340 + case * 100 + i)
-                .parse()
-                .unwrap()
-        };
-        let short = crate::operations::connect::native::ACCEPTOR_DEMOTION_FAILURES as u16 - 1;
-        for i in 0..short {
-            native_failure_beside_udp(
-                &mut h,
-                PeerKeyLocation::new(key(), addr(i)),
-                NatAttemptOrigin::ConnectAcceptor,
-                NativeSetupOutcome::TimedOut,
-            )
-            .await;
-        }
-        let winner = PeerKeyLocation::new(key(), addr(50));
-        let _result =
-            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
-        h.handshake_event(HandshakeEvent::OutboundEstablished {
-            transaction: Transaction::new::<ConnectMsg>(),
-            peer: winner,
-            connection: Box::new(IdleConnection::new(addr(50))),
-            transient: false,
-            transport: DialTransport::native_now(),
-            origin: success_origin,
-        })
-        .await;
-        native_failure_beside_udp(
-            &mut h,
-            PeerKeyLocation::new(key(), addr(60)),
-            NatAttemptOrigin::ConnectAcceptor,
-            NativeSetupOutcome::TimedOut,
-        )
-        .await;
-        let native = h
-            .mgr
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .native_connect();
-        assert_eq!(
-            native.acceptor_demotions(),
-            demotions,
-            "a native success as {success_origin:?}"
-        );
-        assert_eq!(native.demotions(), 0, "the joiner role saw no failure");
-    }
-}
-
-/// Review round 2: demotion is attributed by the same rule for successes as
-/// for strikes. A native success as acceptor does not reset the joiner
-/// streak, so two joiner strikes (rescues), an acceptor success and a third
-/// joiner strike demote the node; a success as joiner in the same place
-/// resets the streak and the node is not demoted.
-#[tokio::test]
-async fn only_a_joiners_native_success_resets_its_demotion_streak() {
-    use crate::operations::connect::native::DialTransport;
-    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
-    for (case, success_origin, demotions) in [
-        (0u16, NatAttemptOrigin::ConnectAcceptor, 1),
-        (1, NatAttemptOrigin::ConnectJoiner, 0),
-    ] {
-        let mut h = Harness::new(&format!("native-success-origin-{case}")).await;
-        let addr = |i: u16| -> SocketAddr {
-            format!("203.0.113.233:{}", 6240 + case * 10 + i)
-                .parse()
-                .unwrap()
-        };
-        for i in 0..2 {
-            native_failure_beside_udp(
-                &mut h,
-                PeerKeyLocation::new(key(), addr(i)),
-                NatAttemptOrigin::ConnectJoiner,
-                NativeSetupOutcome::TimedOut,
-            )
-            .await;
-        }
-        let winner = PeerKeyLocation::new(key(), addr(2));
-        let _result =
-            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
-        h.handshake_event(HandshakeEvent::OutboundEstablished {
-            transaction: Transaction::new::<ConnectMsg>(),
-            peer: winner,
-            connection: Box::new(IdleConnection::new(addr(2))),
-            transient: false,
-            transport: DialTransport::native_now(),
-            origin: success_origin,
-        })
-        .await;
-        native_failure_beside_udp(
-            &mut h,
-            PeerKeyLocation::new(key(), addr(3)),
-            NatAttemptOrigin::ConnectJoiner,
-            NativeSetupOutcome::TimedOut,
-        )
-        .await;
-        assert_eq!(
-            h.mgr
-                .bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .native_connect()
-                .demotions(),
-            demotions,
-            "a native success as {success_origin:?}"
-        );
+        assert_native_still_on(&h, &format!("{outcome:?} as {origin:?}"));
     }
 }
 
@@ -4877,53 +4720,6 @@ async fn a_native_dial_onto_a_stale_key_replaces_the_entry() {
     assert_eq!(h.ring_key_at(addr).as_ref(), Some(new.pub_key()));
     assert_eq!(h_count(&h), 1);
     assert_eq!(survivor_here(), survivors, "not a survivor decision");
-}
-
-/// Gate 19: a working native setup as joiner resets the demotion streak
-/// even when its connection is not the one kept (a native entry was already
-/// there) or is swapped in: two joiner timeouts, the success, a third
-/// timeout, and the node is not demoted.
-#[tokio::test]
-async fn a_native_success_resets_the_streak_whatever_is_kept() {
-    use crate::operations::connect::native::DialTransport;
-    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
-    for (case, existing) in [(0u16, Arrival::Native), (1, Arrival::OutboundUdp)] {
-        let mut h = Harness::new(&format!("survivor-streak-{case}")).await;
-        let addr = |i: u16| -> SocketAddr {
-            format!("203.0.113.242:{}", 6330 + case * 10 + i)
-                .parse()
-                .unwrap()
-        };
-        let fail = |i: u16| HandshakeEvent::OutboundFailed {
-            transaction: Transaction::new::<ConnectMsg>(),
-            peer: PeerKeyLocation::new(key(), addr(i)),
-            error: ConnectionError::FailedConnectOp,
-            transient: false,
-            transport: DialTransport::native_now(),
-            native_outcome: Some(NativeSetupOutcome::TimedOut),
-            origin: NatAttemptOrigin::ConnectJoiner,
-        };
-        h.handshake_event(fail(0)).await;
-        h.handshake_event(fail(1)).await;
-        let winner = PeerKeyLocation::new(key(), addr(2));
-        h.handshake_event(existing.event(&winner, false)).await;
-        h.handshake_event(Arrival::Native.event(&winner, false))
-            .await;
-        h.prove_native(addr(2));
-        assert!(h.mgr.connections[&addr(2)].native, "{existing:?}: premise");
-        h.handshake_event(fail(3)).await;
-        assert_eq!(
-            h.mgr
-                .bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .native_connect()
-                .demotions(),
-            0,
-            "{existing:?}: the success reset the streak"
-        );
-    }
 }
 
 /// Gate 19: the both-dials counter counts only the beside pair. A UDP dial

@@ -23735,13 +23735,33 @@ fn native_shorts_sent(upgrades: &freenet::dev_tool::QuicUpgradeTrace) -> usize {
         .count()
 }
 
+/// Every acceptor decision that was UDP although its pair was in the slice
+/// came from a refused setup (the acceptor had no room), and from nothing
+/// else. In particular none is `not_ready` or `outside_slice`: nothing lowers
+/// a node's native offer or decisions after native failures.
+fn assert_in_slice_udp_only_from_refused_setups(
+    t: &freenet::dev_tool::NativeWireTrace,
+    what: &str,
+) {
+    let in_slice_udp = t
+        .decisions()
+        .iter()
+        .filter(|(_, _, native, in_slice)| *in_slice && !*native)
+        .count() as u64;
+    let causes = t.decision_causes();
+    let refused = causes.get("setup_refused").copied().unwrap_or(0);
+    assert_eq!(
+        in_slice_udp, refused,
+        "{what}: in-slice UDP decisions must all be refused setups; causes {causes:?}"
+    );
+}
+
 fn log_native_connect(name: &str, run: &NativeConnectRun) {
     let t = &run.wire.trace;
     tracing::info!(
         name,
         established = t.native_established(),
         failed = t.native_failed(),
-        demotions = t.native_demotions(),
         responses_native = t.responses_native(),
         native_shorts = native_shorts_sent(&run.upgrades),
         "native connect trace"
@@ -23857,7 +23877,7 @@ fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     assert!(native_dials > 0, "some pairs decided native");
     // Every acceptor decision has a cause, produced where the arm is chosen
     // (`native::acceptor_verdict`). At 100 percent the slice is the whole
-    // bucket range, and nothing in this sim refuses a setup, demotes a node
+    // bucket range, and nothing in this sim refuses a setup
     // or holds an endpoint down, so each decision is native or a pair that
     // already held a transport: nothing else is counted.
     let causes = t.decision_causes();
@@ -23893,8 +23913,8 @@ fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
 /// Until UDP is removed a failed native setup must never cost the join. Every
 /// QUIC datagram between every pair is dropped, so every native setup times
 /// out; each is followed by today's UDP dial and every node still joins. The
-/// timeouts are with distinct peers, so nodes demote themselves. Fails
-/// closed: native setups must have been tried and failed, and none formed.
+/// timeouts are with distinct peers, and no node stops trying native for it
+/// (the cause set below is `native` only). Fails closed: native setups must have been tried and failed, and none formed.
 #[test_log::test]
 fn test_quic_native_failed_setups_fall_back_to_udp() {
     use freenet::dev_tool::NodeLabel;
@@ -23918,7 +23938,9 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     );
     assert!(t.native_failed() > 0, "premise: native setups failed");
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
-    assert!(t.native_demotions() > 0, "nodes demoted themselves");
+    // Nothing lowers a node's native offer or decisions, however many setups
+    // failed: every in-slice UDP decision is an admission refusal.
+    assert_in_slice_udp_only_from_refused_setups(t, "failed setups fall back to UDP");
     // Each side falls back: a joiner and an acceptor whose setup failed each
     // ask for a UDP dial to the same peer in the same CONNECT. With no NAT in
     // the simulation one side's dial would connect the pair alone, so the
@@ -24141,32 +24163,24 @@ fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
     assert!(connected);
 }
 
-/// 10.2 item 2: one node whose native path is broken (every QUIC datagram to
-/// and from it dropped, UDP working) collects a strike on every native setup
-/// UDP then rescues, and demotes its ACCEPTOR role after three with distinct
-/// joiners. The node offers nothing native as joiner
-/// (`with_node_native_joiner_off`), standing in for the node this streak is
-/// for: one that rarely joins (a gateway, a peer at its target). A node that
-/// joins natively demotes its joiner role on its own rescues first, which
-/// would hide the acceptor streak. Every other pair keeps native.
-///
-/// This pins the path from a rescue to the acceptor demotion end to end. That
-/// a demoted acceptor then decides `Udp` is pinned by
-/// `a_demoted_acceptor_decides_udp_through_the_relay_env` (connect driver
-/// tests): in a 10-node run the mesh has settled by the time a rescue-driven
-/// demotion lands (it waits for the UDP fallback), so no request reaches the
-/// node afterwards to decide. Fails closed: the broken node must have decided
-/// native at least 3 times before it demoted, and other pairs must still form
-/// native connections.
+/// One node whose native path is broken (every QUIC datagram to and from it
+/// dropped, UDP working) collects a rescue on every native setup UDP then
+/// rescues, and keeps deciding `Native` for every joiner the slice gives it:
+/// there is no demotion, and each such join costs the joiner one UDP
+/// fallback. The node offers nothing native as joiner
+/// (`with_node_native_joiner_off`), standing in for a node that rarely joins
+/// (a gateway, a peer at its target). Every other pair keeps native. Fails
+/// closed: the broken node must have decided native at least 3 times, and
+/// other pairs must still form native connections.
 #[test_log::test]
-fn test_quic_native_broken_acceptor_demotes_on_rescues() {
+fn test_quic_native_broken_acceptor_keeps_deciding_native() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40A5_00F1;
     const THRESHOLD: usize = 3;
     let name = "native-broken-acceptor";
     // The third node by label (the first regular node after the two
     // gateways): on this seed it is the busiest acceptor of a healthy run,
-    // so with its path broken it meets enough distinct joiners to demote.
+    // so with its path broken it meets several joiners.
     let broken_index = 2;
     let mut broken = None;
     let run = run_native_connect_sim(name, SEED, 200, |sim| {
@@ -24191,40 +24205,29 @@ fn test_quic_native_broken_acceptor_demotes_on_rescues() {
     let broken = broken.expect("premise: the broken node was chosen");
     let t = &run.wire.trace;
     let decisions = t.decisions();
-    let demoted_at = t
-        .acceptor_demotions()
+    // The old rule demoted a node on its third rescue, so the broken node
+    // must have made at least three. Decisions AFTER the third rescue cannot
+    // be required here: in this harness (8 regular nodes; also tried 14 and
+    // 24) the mesh has settled before the rescues land, so no request reaches
+    // the node afterwards. That behaviour is pinned at the state level by
+    // `rescues_in_either_role_never_turn_native_off` (connection lifecycle),
+    // and every in-slice UDP decision must be an admission refusal.
+    let rescues = t.rescues_of(broken);
+    assert!(
+        rescues.len() >= THRESHOLD,
+        "premise: the broken node made at least {THRESHOLD} rescues ({})",
+        rescues.len()
+    );
+    let natives = decisions
         .iter()
-        .filter(|(own, _)| *own == broken)
-        .map(|(_, seq)| *seq)
-        .min();
-    let before = decisions
-        .iter()
-        .filter(|(own, seq, native, _)| {
-            *own == broken && *native && demoted_at.is_none_or(|at| *seq < at)
-        })
+        .filter(|(own, _, native, _)| *own == broken && *native)
         .count();
-    // (order, native, in the slice) for each decision after the demotion.
-    let after: Vec<(u64, bool, bool)> = decisions
-        .iter()
-        .filter(|(own, seq, _, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
-        .map(|(_, seq, native, in_slice)| (*seq, *native, *in_slice))
-        .collect();
-    tracing::info!(%broken, before, ?after, ?demoted_at, "broken acceptor run");
+    tracing::info!(%broken, rescues = rescues.len(), natives, "broken acceptor run");
     assert!(
-        before >= THRESHOLD,
-        "premise: the broken node decided native at least {THRESHOLD} times before demoting ({before})"
+        natives >= THRESHOLD,
+        "premise: the broken node decided native at least {THRESHOLD} times ({natives})"
     );
-    assert!(
-        demoted_at.is_some(),
-        "the broken node demoted its acceptor role"
-    );
-    // Not decisive here (in this run no request reaches the node after its
-    // demotion, so `after` is usually empty); kept as a guard should one do
-    // so. The decisive check is the RelayEnv test named in the doc comment.
-    assert!(
-        after.iter().all(|(_, native, _)| !native),
-        "the broken node decided native after its acceptor role demoted: {after:?}"
-    );
+    assert_in_slice_udp_only_from_refused_setups(t, "broken acceptor");
     assert!(
         t.native_established() > 0,
         "premise: pairs without the broken node still connect natively"
@@ -24362,14 +24365,14 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
 }
 
 /// A joiner that offered QUIC-native but can no longer use a `Native` decision
-/// when the response comes (demoted, or its endpoint went down, in between)
+/// when the response comes (its endpoint went down, in between)
 /// must still meet the acceptor's UDP fallback. The acceptor cannot know: it
 /// waits out its native window and punches UDP. Behind port-restricted NATs a
 /// lone punch never gets through, so before the fix, when the joiner reported
 /// the acceptor failed and did not dial it, every such fallback missed. Every
 /// regular node here offers and then refuses every `Native` decision, which
-/// forces that ordering on every native CONNECT; in the field it needs a
-/// demotion inside a response's travel time (seen once, on nova, as a
+/// forces that ordering on every native CONNECT; in the field it needs the
+/// endpoint to go down inside a response's travel time (seen once, on nova, as a
 /// `missed` fallback in the blocked-pairs test). Fails closed: acceptors must
 /// have started native setups, the NATs must have dropped datagrams, and
 /// fallbacks between peers must have ended.
@@ -24403,38 +24406,6 @@ fn test_quic_native_refused_decision_still_meets_the_acceptors_udp_fallback() {
     assert!(
         t.native_failed() > 0,
         "premise: acceptors started native setups that failed"
-    );
-    // Known residual (connect.rs, `record_native_rescue_strike`): the
-    // acceptor cannot tell a refusal from a broken path, so each refused
-    // decision whose UDP fallback connects strikes the acceptor, and three
-    // distinct joiners demote its acceptor role. Logged and pinned, so a
-    // change in this effect shows up here.
-    let acceptor_demotions = t.acceptor_demotions().len();
-    let acceptor_streak_peak = t
-        .acceptor_streak_peaks()
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(0);
-    tracing::info!(
-        decisions_refused = t.decisions_refused(),
-        acceptor_demotions,
-        acceptor_streak_peak,
-        "refused-decision residual: acceptor strikes"
-    );
-    println!(
-        "refused-decision residual: refused={} acceptor_demotions={acceptor_demotions} acceptor_streak_peak={acceptor_streak_peak}",
-        t.decisions_refused()
-    );
-    // Measured on this seed with every joiner refusing every decision (the
-    // worst case; in the field it needs a demotion inside a response's
-    // flight): 37 refusals, 7 acceptor demotions. Re-measure and update
-    // deliberately if the strike rules change.
-    assert_eq!(
-        acceptor_demotions,
-        7,
-        "acceptor demotions caused by refused decisions changed ({} refusals)",
-        t.decisions_refused()
     );
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
     assert!(
@@ -24810,36 +24781,16 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         }
     });
     log_native_connect(name, &run);
-    // 10.2 item 2: no port-restricted node (nor a gateway) demotes its
-    // acceptor role, though half the regular nodes are symmetric and every
-    // native setup with one fails. UDP fails on those pairs too, so they are
-    // no rescue and no strike. Counting every path failure (the rule before
-    // rescue-only strikes) demoted port-restricted nodes here.
-    let healthy_demoted: Vec<_> = run
-        .wire
-        .trace
-        .acceptor_demotions()
-        .into_iter()
-        .filter(|(own, _)| !symmetric_ips.contains(&own.ip()))
-        .collect();
-    assert_eq!(
-        healthy_demoted,
-        Vec::<(SocketAddr, u64)>::new(),
-        "port-restricted acceptors demoted by joiners whose native setups fail"
-    );
-    // The same for the joiner role: native setups with symmetric peers fail,
-    // and UDP to them fails too, so no joiner takes a strike either.
+    // No port-restricted node (nor a gateway) stops deciding native, though
+    // half the regular nodes are symmetric and every native setup with one
+    // fails: every in-slice UDP decision is an admission refusal.
     assert!(
         run.wire.trace.native_failed() > 0,
         "premise: native setups failed"
     );
-    assert_eq!(
-        run.wire.trace.native_demotions(),
-        0,
-        "joiners demoted by native failures UDP did not rescue"
-    );
+    assert_in_slice_udp_only_from_refused_setups(&run.wire.trace, "symmetric NATs");
     // Premise: some port-restricted node failed native setups with three
-    // distinct symmetric peers, enough to demote it if those counted.
+    // distinct symmetric peers, so the node had many native failures.
     let gateway_ips_early: std::collections::BTreeSet<_> =
         run.gateways.iter().map(|a| a.ip()).collect();
     let mut symmetric_partners: std::collections::BTreeMap<
@@ -24960,7 +24911,6 @@ fn test_quic_native_connect_is_deterministic() {
             (
                 t.native_established(),
                 t.native_failed(),
-                t.native_demotions(),
                 t.responses_native(),
             ),
             shorts,
