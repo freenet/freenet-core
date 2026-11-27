@@ -5466,7 +5466,7 @@ pub(crate) mod tests {
             .expect("the unconnected-dial ConnectPeer");
         assert!(
             code[dispatch..].starts_with(
-                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),transport:crate::operations::connect::native::DialTransport::Udp,}),"
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),transport:dial_transport,}),"
             ),
             "the dial's origin must come from unconnected_dial_origin"
         );

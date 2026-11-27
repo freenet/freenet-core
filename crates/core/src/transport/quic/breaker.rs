@@ -2490,6 +2490,19 @@ mod tests {
 
     const EXPECTED_READERS: &[(&str, &str, usize)] = &[
         ("lib.rs", "constant", 1),
+        // D-8: the connect and dial paths that differ with no UDP to fall back
+        // to: the gateway join plan, the no-transport dial arm, the native
+        // wait beside a pending dial (two sites), the simulation preseed
+        // dial, and the acceptor's refusal at its native-setup cap.
+        ("node/network_bridge/handshake.rs", "accessor", 1),
+        ("node/network_bridge/p2p_protoc.rs", "accessor", 1),
+        (
+            "node/network_bridge/p2p_protoc/connection_lifecycle.rs",
+            "accessor",
+            2,
+        ),
+        ("node/testing_impl/in_memory.rs", "accessor", 1),
+        ("operations/connect.rs", "accessor", 1),
         ("transport/peer_connection.rs", "queue_short caller", 1),
         ("transport/quic/breaker.rs", "bare", 3),
         ("transport/quic/breaker.rs", "constant", 2),
