@@ -1386,9 +1386,8 @@ async fn test_context_oversize_is_dropped_not_crashed() -> Result<(), Box<dyn st
     let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
     let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
-    // Write past MAX_SIZE — `ctx.write` host fn has no size cap of its
-    // own, so the WASM call itself succeeds even though the bytes won't
-    // fit in `DelegateContext`.
+    // Write past MAX_SIZE: `ctx.write` rejects lengths >= MAX_SIZE with
+    // `ERR_CONTEXT_TOO_LARGE` without mutating or persisting the context.
     let oversize = freenet_stdlib::prelude::DelegateContext::MAX_SIZE + 1024;
     let payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(oversize))?;
     let outbound = runtime.inbound_app_message(
@@ -1443,6 +1442,100 @@ async fn test_context_oversize_is_dropped_not_crashed() -> Result<(), Box<dyn st
             );
         }
         other => panic!("Expected ContextData, got {other:?}"),
+    }
+
+    std::mem::drop(temp_dir);
+    Ok(())
+}
+
+/// A delegate that writes an oversize context in message 1 of a multi-message
+/// batch must not panic `DelegateContext::new` when message 2 runs in the same
+/// `inbound_app_message` call.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_context_oversize_in_multi_message_batch_does_not_panic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+    // Boundary check: MAX_SIZE - 1 must persist from message 1 into message 2.
+    let max_valid = freenet_stdlib::prelude::DelegateContext::MAX_SIZE - 1;
+    let write_ok = bincode::serialize(&InboundAppMessage::WriteLargeContext(max_valid))?;
+    let read_ok = bincode::serialize(&InboundAppMessage::ReadContext)?;
+    let outbound = runtime.inbound_app_message(
+        delegate.key(),
+        &vec![].into(),
+        None,
+        None,
+        vec![
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(write_ok)),
+            InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(read_ok)),
+        ],
+    )?;
+    assert_eq!(outbound.len(), 2);
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let response: OutboundAppMessage = match &outbound[1] {
+        OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+        other => panic!("Expected ApplicationMessage, got {other:?}"),
+    };
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match response {
+        OutboundAppMessage::ContextData(data) => {
+            assert_eq!(
+                data.len(),
+                max_valid,
+                "MAX_SIZE - 1 write must persist into message 2"
+            );
+        }
+        other => panic!("Expected ContextData, got {other:?}"),
+    }
+
+    // Clear context before testing oversize rejections.
+    let clear_payload = bincode::serialize(&InboundAppMessage::ClearContext)?;
+    runtime.inbound_app_message(
+        delegate.key(),
+        &vec![].into(),
+        None,
+        None,
+        vec![InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(clear_payload),
+        )],
+    )?;
+
+    for oversize in [
+        freenet_stdlib::prelude::DelegateContext::MAX_SIZE,
+        freenet_stdlib::prelude::DelegateContext::MAX_SIZE + 1,
+        freenet_stdlib::prelude::DelegateContext::MAX_SIZE + 1024,
+    ] {
+        let write_payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(oversize))?;
+        let read_payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(write_payload)),
+                InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(read_payload)),
+            ],
+        )?;
+        assert_eq!(outbound.len(), 2);
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let response: OutboundAppMessage = match &outbound[1] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            other => panic!("Expected ApplicationMessage, got {other:?}"),
+        };
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                assert!(
+                    data.is_empty(),
+                    "oversize write of {oversize} bytes must not persist into message 2; got {} bytes",
+                    data.len()
+                );
+            }
+            other => panic!("Expected ContextData, got {other:?}"),
+        }
     }
 
     std::mem::drop(temp_dir);

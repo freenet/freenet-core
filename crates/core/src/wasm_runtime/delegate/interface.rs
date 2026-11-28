@@ -143,7 +143,17 @@ impl DelegateRuntimeInterface for Runtime {
                         processed,
                         ..
                     }) => {
-                        // clone kept — delegates read message-level context
+                        if context.len() >= DelegateContext::MAX_SIZE {
+                            tracing::warn!(
+                                delegate_key = %delegate_key,
+                                bytes = context.len(),
+                                max = DelegateContext::MAX_SIZE,
+                                "Delegate context met or exceeded DelegateContext::MAX_SIZE \
+                                 between batch messages; clearing context"
+                            );
+                            context.clear();
+                        }
+                        // clone kept: delegates read message-level context
                         let app_msg = InboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(payload)
                                 .processed(processed)
@@ -298,13 +308,10 @@ impl DelegateRuntimeInterface for Runtime {
         // empty to keep the map sparse — `unwrap_or_default()` covers the
         // unset case symmetrically on read.
         //
-        // Drop contexts that exceed `DelegateContext::MAX_SIZE`: the wire
-        // format would assert on the next call when the runtime threads the
-        // bytes back through `DelegateContext::new(...)`. The `ctx.write()`
-        // host function has no size cap of its own, so a delegate with a
-        // bug — or one trying to wedge the runtime — can otherwise stash a
-        // value that would crash on the very next call. Treat oversize as
-        // "delegate misbehavior, forget it" rather than "crash the node."
+        // Defense-in-depth: drop contexts that meet or exceed
+        // `DelegateContext::MAX_SIZE` before persisting. `context_write` and
+        // `process_outbound` enforce this bound earlier, and `DelegateContext::new`
+        // asserts `bytes.len() < MAX_SIZE` on subsequent calls.
         if context.is_empty() {
             self.delegate_contexts.remove(delegate_key, context_user);
         } else if context.len() < freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
@@ -315,7 +322,7 @@ impl DelegateRuntimeInterface for Runtime {
                 delegate_key = %delegate_key,
                 bytes = context.len(),
                 max = freenet_stdlib::prelude::DelegateContext::MAX_SIZE,
-                "Delegate ctx.write() exceeded DelegateContext::MAX_SIZE; \
+                "Delegate context met or exceeded DelegateContext::MAX_SIZE; \
                  dropping the persisted context to avoid a crash on the next call"
             );
             self.delegate_contexts.remove(delegate_key, context_user);
