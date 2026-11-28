@@ -265,8 +265,20 @@ impl DelegateContextStore {
     }
 
     /// Store `bytes` as `user`'s context for `delegate`, then keep the cache
-    /// within its budget.
+    /// within its budget. Entries at or above `DelegateContext::MAX_SIZE` are
+    /// dropped (removing any prior slot) so callers can never read back a
+    /// context that would trip `DelegateContext::new`.
     pub(crate) fn store(&self, delegate: &DelegateKey, user: Option<&UserId>, bytes: Vec<u8>) {
+        if bytes.len() >= freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
+            tracing::warn!(
+                delegate_key = %delegate,
+                bytes = bytes.len(),
+                max = freenet_stdlib::prelude::DelegateContext::MAX_SIZE,
+                "Refusing to cache delegate context at or above DelegateContext::MAX_SIZE"
+            );
+            self.remove(delegate, user);
+            return;
+        }
         // Charged by length, so hold no spare capacity beyond it.
         let mut bytes = bytes;
         bytes.shrink_to_fit();
@@ -2127,7 +2139,7 @@ pub(super) mod time {
 /// - Returns non-negative values on success (usually byte counts)
 /// - Returns `ERR_NOT_IN_PROCESS` (-1) if called outside process()
 /// - Returns `ERR_INVALID_PARAM` (-4) for invalid parameters (negative length)
-/// - Returns `ERR_CONTEXT_TOO_LARGE` (-5) if context exceeds i32::MAX bytes
+/// - Returns `ERR_CONTEXT_TOO_LARGE` (-5) if context meets or exceeds `DelegateContext::MAX_SIZE` (or exceeds `i32::MAX` on read)
 pub(super) mod delegate_context {
     use super::*;
 
@@ -2204,6 +2216,7 @@ pub(super) mod delegate_context {
     /// - `SUCCESS` (0): write succeeded
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
+    /// - `ERR_CONTEXT_TOO_LARGE`: `len` meets or exceeds `DelegateContext::MAX_SIZE`
     pub(crate) fn context_write(ptr: i64, len: i32) -> i32 {
         let id = current_instance_id();
         if id == -1 {
@@ -2213,6 +2226,14 @@ pub(super) mod delegate_context {
         if len < 0 {
             tracing::warn!("delegate context_write called with negative length: {len}");
             return error_codes::ERR_INVALID_PARAM;
+        }
+        if (len as usize) >= freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
+            tracing::warn!(
+                len,
+                max = freenet_stdlib::prelude::DelegateContext::MAX_SIZE,
+                "delegate context_write rejected: length meets or exceeds DelegateContext::MAX_SIZE"
+            );
+            return error_codes::ERR_CONTEXT_TOO_LARGE;
         }
         let Some(info) = MEM_ADDR.get(&id) else {
             tracing::warn!("instance mem space not recorded for {id}");
@@ -4022,5 +4043,64 @@ mod guest_log_tests {
         let out = guest_log_message(&big, 80_000_000);
         assert!(out.len() < 1100);
         assert!(out.ends_with("[truncated, 80000000 bytes total]"));
+    }
+}
+
+#[cfg(test)]
+mod context_write_bound_tests {
+    use super::*;
+    use freenet_stdlib::prelude::DelegateContext;
+
+    #[test]
+    fn context_write_rejects_at_and_above_max_size() {
+        let prev = CURRENT_DELEGATE_INSTANCE.with(|cell| cell.replace(999_001));
+        struct Restore(i64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_DELEGATE_INSTANCE.with(|cell| cell.set(self.0));
+            }
+        }
+        let _restore = Restore(prev);
+
+        assert_eq!(
+            delegate_context::context_write(0, -1),
+            error_codes::ERR_INVALID_PARAM
+        );
+        assert_ne!(
+            delegate_context::context_write(0, (DelegateContext::MAX_SIZE - 1) as i32),
+            error_codes::ERR_CONTEXT_TOO_LARGE,
+            "MAX_SIZE - 1 must pass the size check"
+        );
+        assert_eq!(
+            delegate_context::context_write(0, DelegateContext::MAX_SIZE as i32),
+            error_codes::ERR_CONTEXT_TOO_LARGE
+        );
+        assert_eq!(
+            delegate_context::context_write(0, DelegateContext::MAX_SIZE as i32 + 1),
+            error_codes::ERR_CONTEXT_TOO_LARGE
+        );
+        assert_eq!(
+            delegate_context::context_write(0, i32::MAX),
+            error_codes::ERR_CONTEXT_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn context_store_rejects_at_and_above_max_size() {
+        let store = DelegateContextStore::with_budget(MIN_DELEGATE_CONTEXT_BYTES);
+        let key = DelegateKey::new(
+            [3u8; 32],
+            freenet_stdlib::prelude::CodeHash::from_code(b"ctx-store-test"),
+        );
+        store.store(&key, None, vec![1u8; DelegateContext::MAX_SIZE - 1]);
+        assert_eq!(
+            store.get(&key, None).map(|v| v.len()),
+            Some(DelegateContext::MAX_SIZE - 1)
+        );
+        store.store(&key, None, vec![2u8; DelegateContext::MAX_SIZE]);
+        assert!(
+            store.get(&key, None).is_none(),
+            "storing MAX_SIZE must drop the entry"
+        );
     }
 }

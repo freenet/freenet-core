@@ -149,13 +149,28 @@ pub(crate) fn check_run_budget(
     Ok(())
 }
 
+fn outbound_context_len(msg: &OutboundDelegateMsg) -> usize {
+    match msg {
+        OutboundDelegateMsg::ApplicationMessage(m) => m.context.as_ref().len(),
+        OutboundDelegateMsg::ContextUpdated(ctx) => ctx.as_ref().len(),
+        OutboundDelegateMsg::GetContractRequest(r) => r.context.as_ref().len(),
+        OutboundDelegateMsg::PutContractRequest(r) => r.context.as_ref().len(),
+        OutboundDelegateMsg::UpdateContractRequest(r) => r.context.as_ref().len(),
+        OutboundDelegateMsg::SubscribeContractRequest(r) => r.context.as_ref().len(),
+        OutboundDelegateMsg::UnsubscribeContractRequest(r) => r.context.as_ref().len(),
+        OutboundDelegateMsg::SendDelegateMessage(m) => m.context.as_ref().len(),
+        OutboundDelegateMsg::RequestUserInput(_) => 0,
+    }
+}
+
 /// Decode the serialized `Result<Vec<OutboundDelegateMsg>, DelegateError>` a
 /// delegate returned, refusing it BEFORE allocation if it is too large or
-/// claims too many messages.
+/// claims too many messages, and refusing any outbound context at or above
+/// `DelegateContext::MAX_SIZE`.
 pub(crate) fn decode_delegate_result(
     serialized: &[u8],
 ) -> Result<Vec<OutboundDelegateMsg>, DelegateExecError> {
-    use freenet_stdlib::prelude::DelegateError;
+    use freenet_stdlib::prelude::{DelegateContext, DelegateError};
     let refuse = |msg: String| DelegateExecError::from(DelegateError::Other(msg));
 
     if serialized.len() > MAX_OUTBOUND_BYTES_PER_RUN {
@@ -180,7 +195,17 @@ pub(crate) fn decode_delegate_result(
     }
     let value: Result<Vec<OutboundDelegateMsg>, DelegateError> =
         bincode::deserialize(serialized).map_err(|e| refuse(format!("{e}")))?;
-    value.map_err(DelegateExecError::from)
+    let msgs = value.map_err(DelegateExecError::from)?;
+    for msg in &msgs {
+        let ctx_len = outbound_context_len(msg);
+        if ctx_len >= DelegateContext::MAX_SIZE {
+            return Err(refuse(format!(
+                "delegate outbound context of {ctx_len} bytes meets or exceeds the {} byte limit",
+                DelegateContext::MAX_SIZE
+            )));
+        }
+    }
+    Ok(msgs)
 }
 
 /// Drain every message remaining after a terminal arm of `process_outbound`,
@@ -211,12 +236,15 @@ fn drain_remaining_with_attestation(
 ) {
     for remaining in outbound_msgs.drain(..) {
         match remaining {
+            OutboundDelegateMsg::ApplicationMessage(mut m) => {
+                m.context = freenet_stdlib::prelude::DelegateContext::default();
+                results.push(OutboundDelegateMsg::ApplicationMessage(m));
+            }
             OutboundDelegateMsg::SendDelegateMessage(mut m) if !m.processed => {
                 m.sender = delegate_key.clone();
                 results.push(OutboundDelegateMsg::SendDelegateMessage(m));
             }
-            msg @ (OutboundDelegateMsg::ApplicationMessage(_)
-            | OutboundDelegateMsg::RequestUserInput(_)
+            msg @ (OutboundDelegateMsg::RequestUserInput(_)
             | OutboundDelegateMsg::ContextUpdated(_)
             | OutboundDelegateMsg::GetContractRequest(_)
             | OutboundDelegateMsg::PutContractRequest(_)
@@ -637,9 +665,7 @@ impl Runtime {
                 }
 
                 OutboundDelegateMsg::ContextUpdated(new_context) => {
-                    // avoid alloc churn — buffer reuse instead of to_vec
-                    context.clear();
-                    context.extend_from_slice(new_context.as_ref());
+                    replace_context_bounded(delegate_key, context, new_context.as_ref());
                 }
                 OutboundDelegateMsg::GetContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -655,8 +681,7 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("GetContractRequest processed");
-                    context.clear();
-                    context.extend_from_slice(ctx.as_ref());
+                    replace_context_bounded(delegate_key, context, ctx.as_ref());
                 }
                 OutboundDelegateMsg::PutContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -672,8 +697,7 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("PutContractRequest processed");
-                    context.clear();
-                    context.extend_from_slice(ctx.as_ref());
+                    replace_context_bounded(delegate_key, context, ctx.as_ref());
                 }
                 OutboundDelegateMsg::UpdateContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -689,8 +713,7 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("UpdateContractRequest processed");
-                    context.clear();
-                    context.extend_from_slice(ctx.as_ref());
+                    replace_context_bounded(delegate_key, context, ctx.as_ref());
                 }
                 OutboundDelegateMsg::SubscribeContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -706,8 +729,7 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("SubscribeContractRequest processed");
-                    context.clear();
-                    context.extend_from_slice(ctx.as_ref());
+                    replace_context_bounded(delegate_key, context, ctx.as_ref());
                 }
                 // freenet-stdlib 0.10.0 added this variant (freenet/freenet-stdlib#98);
                 // core has no unsubscribe path behind it yet (tracked in #5600).
@@ -749,12 +771,31 @@ impl Runtime {
                     context: ctx, ..
                 }) => {
                     tracing::debug!("SendDelegateMessage processed");
-                    context.clear();
-                    context.extend_from_slice(ctx.as_ref());
+                    replace_context_bounded(delegate_key, context, ctx.as_ref());
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Replaces `context` with `next` if it strictly fits under
+/// `DelegateContext::MAX_SIZE`; otherwise clears `context` so a subsequent
+/// `DelegateContext::new` call within the same batch or on a later call cannot
+/// panic.
+fn replace_context_bounded(delegate_key: &DelegateKey, context: &mut Vec<u8>, next: &[u8]) {
+    if next.len() < freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
+        // avoid alloc churn: buffer reuse instead of to_vec
+        context.clear();
+        context.extend_from_slice(next);
+    } else {
+        tracing::warn!(
+            delegate_key = %delegate_key,
+            bytes = next.len(),
+            max = freenet_stdlib::prelude::DelegateContext::MAX_SIZE,
+            "Delegate outbound context met or exceeded DelegateContext::MAX_SIZE; dropping context"
+        );
+        context.clear();
     }
 }
 
@@ -820,6 +861,79 @@ mod bound_tests {
             err.to_string().contains("per-request message budget"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn replace_context_bounded_drops_at_and_above_max_size() {
+        let key = DelegateKey::new(
+            [1u8; 32],
+            freenet_stdlib::prelude::CodeHash::from_code(b"test-delegate"),
+        );
+        let mut ctx = b"initial".to_vec();
+
+        let max_valid = vec![0xAB; DelegateContext::MAX_SIZE - 1];
+        replace_context_bounded(&key, &mut ctx, &max_valid);
+        assert_eq!(ctx.len(), DelegateContext::MAX_SIZE - 1);
+
+        let at_limit = vec![0xCD; DelegateContext::MAX_SIZE];
+        replace_context_bounded(&key, &mut ctx, &at_limit);
+        assert!(ctx.is_empty(), "MAX_SIZE must be dropped");
+
+        replace_context_bounded(&key, &mut ctx, b"ok");
+        assert_eq!(ctx, b"ok");
+
+        let over_limit = vec![0xEF; DelegateContext::MAX_SIZE + 1];
+        replace_context_bounded(&key, &mut ctx, &over_limit);
+        assert!(ctx.is_empty(), "MAX_SIZE + 1 must be dropped");
+    }
+
+    #[test]
+    fn decode_delegate_result_rejects_oversize_outbound_context() {
+        // Forge a raw bincode `Ok(vec![OutboundDelegateMsg::ContextUpdated(bytes)])`
+        // bypassing `DelegateContext::new`'s length assertion.
+        // Layout: Result::Ok (u32 = 0), Vec len (u64 = 1),
+        // OutboundDelegateMsg::ContextUpdated tag (u32 = 2), Vec<u8> len (u64), bytes.
+        let encode_context_updated = |len: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(24 + len);
+            out.extend_from_slice(&0u32.to_le_bytes()); // Result::Ok
+            out.extend_from_slice(&1u64.to_le_bytes()); // Vec len = 1
+            out.extend_from_slice(&2u32.to_le_bytes()); // ContextUpdated discriminant
+            out.extend_from_slice(&(len as u64).to_le_bytes());
+            out.resize(out.len() + len, 0x42);
+            out
+        };
+
+        let ok = decode_delegate_result(&encode_context_updated(DelegateContext::MAX_SIZE - 1))
+            .expect("MAX_SIZE - 1 context must decode");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(outbound_context_len(&ok[0]), DelegateContext::MAX_SIZE - 1);
+
+        for bad_len in [DelegateContext::MAX_SIZE, DelegateContext::MAX_SIZE + 1] {
+            let err = decode_delegate_result(&encode_context_updated(bad_len))
+                .expect_err("context >= MAX_SIZE must be rejected");
+            assert!(
+                err.to_string().contains("meets or exceeds"),
+                "unexpected error for {bad_len}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_remaining_strips_application_message_context() {
+        let key = DelegateKey::new(
+            [2u8; 32],
+            freenet_stdlib::prelude::CodeHash::from_code(b"test-delegate"),
+        );
+        let msg = freenet_stdlib::prelude::ApplicationMessage::new(b"hi".to_vec())
+            .with_context(DelegateContext::new(b"secret-ctx".to_vec()));
+        let mut queue = VecDeque::from(vec![OutboundDelegateMsg::ApplicationMessage(msg)]);
+        let mut results = Vec::new();
+        drain_remaining_with_attestation(&key, &mut queue, &mut results);
+        assert_eq!(results.len(), 1);
+        let OutboundDelegateMsg::ApplicationMessage(drained) = &results[0] else {
+            panic!("expected ApplicationMessage, got {:?}", results[0]);
+        };
+        assert!(drained.context.as_ref().is_empty());
     }
 
     #[test]
