@@ -3190,6 +3190,10 @@ mod tests {
                 "per-unpack cap on a streaming decoder, transient and freed when the unpack ends",
             ),
             (
+                "MAX_XZ_DECODER_MEM_BYTES",
+                "per-unpack cap on liblzma decoder memory, transient and freed when the unpack ends",
+            ),
+            (
                 "MAX_REWRITTEN_ASSET_BYTES",
                 "per-request read bound for one .js or HTML file, transient",
             ),

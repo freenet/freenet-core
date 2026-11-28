@@ -139,6 +139,13 @@ const TAR_ENTRY_OVERHEAD_BYTES: u64 = 4096;
 const MAX_DECOMPRESSED_STREAM_BYTES: u64 =
     MAX_UNPACKED_TOTAL_BYTES + MAX_ARCHIVE_ENTRIES as u64 * TAR_ENTRY_OVERHEAD_BYTES;
 
+/// Upper bound on liblzma decoder memory (including the LZMA2 dictionary)
+/// per web archive unpack. Standard `xz` presets 0..=9 use at most a 64 MiB
+/// dictionary (~65 MiB total decoder memory); 96 MiB admits every standard
+/// preset with headroom while rejecting streams that request gigabytes of
+/// dictionary memory from a few dozen bytes of input.
+const MAX_XZ_DECODER_MEM_BYTES: u64 = 96 * 1024 * 1024;
+
 /// A reader that fails (rather than reporting a clean EOF) once more than
 /// `remaining` bytes have been read.
 struct LimitedReader<R> {
@@ -274,7 +281,7 @@ impl WebApp {
 
         let reject = WebContractError::Refused;
 
-        let mut decoded_web = self.decode_web();
+        let mut decoded_web = self.decode_web()?;
         decoded_web.set_overwrite(false);
         decoded_web.set_preserve_mtime(false);
 
@@ -381,7 +388,7 @@ impl WebApp {
     #[instrument(level = "debug", skip(self))]
     pub fn get_file(&mut self, path: &str) -> Result<Vec<u8>, WebContractError> {
         debug!("Retrieving file from web content: {}", path);
-        let mut decoded_web = self.decode_web();
+        let mut decoded_web = self.decode_web()?;
         for e in decoded_web
             .entries()
             .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?
@@ -408,12 +415,14 @@ impl WebApp {
         Err(WebContractError::FileNotFound(path.to_owned()))
     }
 
-    fn decode_web(&self) -> Archive<LimitedReader<XzDecoder<&[u8]>>> {
+    fn decode_web(&self) -> Result<Archive<LimitedReader<XzDecoder<&[u8]>>>, WebContractError> {
         debug!("Decoding compressed web content ({} bytes)", self.web.len());
-        Archive::new(LimitedReader {
-            inner: XzDecoder::new(self.web.as_slice()),
+        let stream = xz2::stream::Stream::new_stream_decoder(MAX_XZ_DECODER_MEM_BYTES, 0)
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
+        Ok(Archive::new(LimitedReader {
+            inner: XzDecoder::new_stream(self.web.as_slice(), stream),
             remaining: MAX_DECOMPRESSED_STREAM_BYTES,
-        })
+        }))
     }
 }
 
@@ -427,6 +436,7 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
         );
         const MAX_METADATA_SIZE: u64 = 1024;
         // Decompose the state and extract the compressed web interface
+        let total_len = state.len() as u64;
         let mut state = Cursor::new(state);
 
         let metadata_size = state
@@ -436,6 +446,12 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
             return Err(WebContractError::UnpackingError(anyhow::anyhow!(
                 "Exceeded metadata size of 1kB: {} bytes",
                 metadata_size
+            )));
+        }
+        let remaining = total_len.saturating_sub(state.position());
+        if metadata_size > remaining {
+            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                "Truncated metadata: header claims {metadata_size} bytes, only {remaining} remain"
             )));
         }
         let mut metadata = vec![0; metadata_size as usize];
@@ -450,6 +466,12 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
             return Err(WebContractError::UnpackingError(anyhow::anyhow!(
                 "Exceeded packed web size of 100MB: {} bytes",
                 web_size
+            )));
+        }
+        let remaining = total_len.saturating_sub(state.position());
+        if web_size > remaining {
+            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                "Truncated web archive: header claims {web_size} bytes, only {remaining} remain"
             )));
         }
         let mut web = vec![0; web_size as usize];
@@ -1122,6 +1144,151 @@ mod tests {
                 "\u{5b57}".repeat(SHOWN_PATH_MAX_CHARS)
             )),
             "{msg}"
+        );
+    }
+
+    fn crc32_ieee(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// Build a minimal valid `.xz` stream decompressing to 0 bytes whose LZMA2
+    /// block header declares the dictionary size encoded by `dict_prop`
+    /// (per XZ spec 5.3.1: even `p` gives `2 << (p / 2 + 11)`, e.g. `0x1C` =
+    /// 64 MiB, `0x20` = 256 MiB, `0x26` = 2 GiB).
+    fn xz_empty_stream_with_dict_prop(dict_prop: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        // Stream Header (12 bytes): magic + flags (CRC32) + CRC32(flags).
+        out.extend_from_slice(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]);
+        let flags = [0x00u8, 0x01];
+        out.extend_from_slice(&flags);
+        out.extend_from_slice(&crc32_ieee(&flags).to_le_bytes());
+
+        // Block Header (12 bytes): encoded_size=2 ((2+1)*4=12), 1 filter,
+        // LZMA2 (0x21), prop_len=1, dict_prop, 3 bytes padding, CRC32.
+        let blk_hdr = [0x02u8, 0x00, 0x21, 0x01, dict_prop, 0x00, 0x00, 0x00];
+        out.extend_from_slice(&blk_hdr);
+        out.extend_from_slice(&crc32_ieee(&blk_hdr).to_le_bytes());
+
+        // Block body: LZMA2 end-of-payload (0x00), 3 bytes padding, CRC32(empty)=0.
+        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        out.extend_from_slice(&0u32.to_le_bytes());
+
+        // Index (8 bytes): indicator=0, records=1, unpadded=17, uncompressed=0, CRC32.
+        let index_body = [0x00u8, 0x01, 17, 0x00];
+        out.extend_from_slice(&index_body);
+        out.extend_from_slice(&crc32_ieee(&index_body).to_le_bytes());
+
+        // Stream Footer (12 bytes): CRC32(backward_size || flags), backward_size=1, flags, "YZ".
+        let mut footer_body = [0u8; 6];
+        footer_body[..4].copy_from_slice(&1u32.to_le_bytes());
+        footer_body[4..6].copy_from_slice(&flags);
+        out.extend_from_slice(&crc32_ieee(&footer_body).to_le_bytes());
+        out.extend_from_slice(&footer_body);
+        out.extend_from_slice(&[0x59, 0x5A]);
+        out
+    }
+
+    #[test]
+    fn xz_decoder_rejects_oversize_dictionary_and_admits_preset_9() {
+        // Preset 9 uses a 64 MiB dictionary (dict_prop = 0x1C), which must unpack cleanly.
+        let ok_xz = xz_empty_stream_with_dict_prop(0x1C);
+        let mut ok_app = WebApp::from_compressed(b"meta".to_vec(), ok_xz).unwrap();
+        let ok_dst = tempfile::tempdir().unwrap();
+        ok_app
+            .unpack(ok_dst.path())
+            .expect("64 MiB dictionary (xz -9) must remain accepted");
+        assert!(
+            matches!(
+                ok_app.get_file("index.html"),
+                Err(WebContractError::FileNotFound(_))
+            ),
+            "get_file must decode a 64 MiB dictionary cleanly before reporting FileNotFound"
+        );
+
+        // Dictionaries exceeding MAX_XZ_DECODER_MEM_BYTES (96 MiB): 96 MiB dict
+        // (0x1D, ~96.07 MiB total decoder mem), 128 MiB (0x1E), 256 MiB (0x20),
+        // and 2 GiB (0x26) must fail specifically with liblzma's memory limit error.
+        for (dict_prop, label) in [
+            (0x1D, "96 MiB"),
+            (0x1E, "128 MiB"),
+            (0x20, "256 MiB"),
+            (0x26, "2 GiB"),
+        ] {
+            let huge_xz = xz_empty_stream_with_dict_prop(dict_prop);
+            let mut huge_app = WebApp::from_compressed(b"meta".to_vec(), huge_xz).unwrap();
+            let huge_dst = tempfile::tempdir().unwrap();
+            let unpack_res = huge_app.unpack(huge_dst.path());
+            let Err(WebContractError::UnpackingError(err)) = unpack_res else {
+                panic!("{label} dictionary expected UnpackingError, got {unpack_res:?}");
+            };
+            assert!(
+                err.to_string().contains("memory limit reached"),
+                "{label} unpack error must come from liblzma memlimit, got: {err}"
+            );
+            let get_res = huge_app.get_file("index.html");
+            let Err(WebContractError::UnpackingError(err)) = get_res else {
+                panic!("{label} get_file expected UnpackingError, got {get_res:?}");
+            };
+            assert!(
+                err.to_string().contains("memory limit reached"),
+                "{label} get_file error must come from liblzma memlimit, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn try_from_rejects_truncated_headers_before_allocating() {
+        // Valid round-trip still works.
+        let packed = WebApp::from_compressed(b"meta".to_vec(), b"body".to_vec())
+            .unwrap()
+            .pack()
+            .unwrap();
+        let unpacked = WebApp::try_from(packed.as_slice()).expect("valid packed state decodes");
+        assert_eq!(unpacked.metadata, b"meta");
+        assert_eq!(unpacked.web, b"body");
+
+        // Off-by-one web truncation after a non-zero metadata prefix.
+        let mut off_by_one = Vec::new();
+        off_by_one.extend_from_slice(&4u64.to_be_bytes());
+        off_by_one.extend_from_slice(b"meta");
+        off_by_one.extend_from_slice(&5u64.to_be_bytes());
+        off_by_one.extend_from_slice(b"body"); // only 4 bytes remain, header claims 5
+        let err = WebApp::try_from(off_by_one.as_slice())
+            .err()
+            .expect("off-by-one truncated web payload must be rejected");
+        assert!(
+            err.to_string().contains("Truncated web archive"),
+            "expected pre-allocation truncation check, got: {err}"
+        );
+
+        // 16-byte state declaring 0-byte metadata and 100 MiB web payload.
+        let mut truncated_web = Vec::new();
+        truncated_web.extend_from_slice(&0u64.to_be_bytes());
+        truncated_web.extend_from_slice(&MAX_WEB_SIZE.to_be_bytes());
+        let err = WebApp::try_from(truncated_web.as_slice())
+            .err()
+            .expect("truncated web payload must be rejected");
+        assert!(
+            err.to_string().contains("Truncated web archive"),
+            "expected pre-allocation truncation check, got: {err}"
+        );
+
+        // 8-byte state declaring 1024-byte metadata with 0 bytes remaining.
+        let truncated_meta = 1024u64.to_be_bytes();
+        let err = WebApp::try_from(truncated_meta.as_slice())
+            .err()
+            .expect("truncated metadata must be rejected");
+        assert!(
+            err.to_string().contains("Truncated metadata"),
+            "expected pre-allocation truncation check, got: {err}"
         );
     }
 }
