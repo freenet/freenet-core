@@ -8,8 +8,16 @@ use crate::config::GlobalRng;
 
 /// An abstract location on the 1D ring, represented by a real number on the interal [0, 1]
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy)]
-#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+#[serde(try_from = "f64")]
 pub struct Location(pub(crate) f64);
+
+#[cfg(test)]
+impl<'a> arbitrary::Arbitrary<'a> for Location {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let raw = u.arbitrary::<u64>()?;
+        Ok(Location(raw as f64 / u64::MAX as f64))
+    }
+}
 
 impl Location {
     pub fn from_address(addr: &std::net::SocketAddr) -> Self {
@@ -160,15 +168,16 @@ impl PartialEq for Location {
     }
 }
 
-/// Since we don't allow NaN values in the construction of Location
-/// we can safely assume that an equivalence relation holds.
+/// Valid locations are finite values in `[0.0, 1.0]`. `Ord` uses `f64::total_cmp`
+/// with `-0.0` canonicalized to `+0.0` so comparisons cannot panic even if a
+/// non-finite value were constructed bypassing `TryFrom`/`Deserialize`.
 impl Eq for Location {}
 
 impl Ord for Location {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .expect("always should return a cmp value")
+        let a = if self.0 == 0.0 { 0.0 } else { self.0 };
+        let b = if other.0 == 0.0 { 0.0 } else { other.0 };
+        a.total_cmp(&b)
     }
 }
 
@@ -180,8 +189,8 @@ impl PartialOrd for Location {
 
 impl std::hash::Hash for Location {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let bits = self.0.to_bits();
-        state.write_u64(bits);
+        let v = if self.0 == 0.0 { 0.0 } else { self.0 };
+        state.write_u64(v.to_bits());
     }
 }
 
@@ -189,10 +198,14 @@ impl TryFrom<f64> for Location {
     type Error = anyhow::Error;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
-        if !(0.0..=1.0).contains(&value) {
-            bail!("expected a value between 0.0 and 1.0, received {}", value)
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            bail!(
+                "expected a finite value between 0.0 and 1.0, received {}",
+                value
+            )
         } else {
-            Ok(Location(value))
+            let canonical = if value == 0.0 { 0.0 } else { value };
+            Ok(Location(canonical))
         }
     }
 }
@@ -248,9 +261,9 @@ impl Eq for Distance {}
 
 impl Ord for Distance {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0
-            .partial_cmp(&other.0)
-            .expect("always should return a cmp value")
+        let a = if self.0 == 0.0 { 0.0 } else { self.0 };
+        let b = if other.0 == 0.0 { 0.0 } else { other.0 };
+        a.total_cmp(&b)
     }
 }
 
@@ -882,5 +895,205 @@ mod test {
             loc("203.0.113.7:5000"),
             "an IPv4-compatible address is not treated as its IPv4 address"
         );
+    }
+
+    #[test]
+    fn location_deserialize_rejects_non_finite_and_out_of_range() {
+        for bad in [
+            f64::NAN,
+            -f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            (-0.0_f64).next_down(),
+            -0.0001,
+            -1.0,
+            1.0_f64.next_up(),
+            1.0001,
+            2.0,
+        ] {
+            assert!(
+                Location::try_from(bad).is_err(),
+                "TryFrom<f64> must reject invalid Location value {bad}"
+            );
+            let encoded = bincode::serialize(&bad).expect("f64 serializes");
+            assert!(
+                bincode::deserialize::<Location>(&encoded).is_err(),
+                "bincode deserialize must reject invalid Location value {bad}"
+            );
+        }
+
+        for bad_json in ["-0.1", "1.5"] {
+            assert!(
+                serde_json::from_str::<Location>(bad_json).is_err(),
+                "json deserialize must reject invalid Location value {bad_json}"
+            );
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TomlLoc {
+            loc: Location,
+        }
+        let valid_toml: TomlLoc = toml::from_str("loc = 0.5").expect("valid toml deserializes");
+        assert_eq!(valid_toml.loc.as_f64(), 0.5);
+        for bad_toml in [
+            "loc = nan",
+            "loc = inf",
+            "loc = -inf",
+            "loc = -0.1",
+            "loc = 1.1",
+        ] {
+            assert!(
+                toml::from_str::<TomlLoc>(bad_toml).is_err(),
+                "toml deserialize must reject `{bad_toml}`"
+            );
+        }
+    }
+
+    #[test]
+    fn location_deserialize_preserves_wire_format_and_canonicalizes_neg_zero() {
+        for valid in [0.0, 0.25, 0.5, 1.0] {
+            let loc = Location::new(valid);
+            let encoded = bincode::serialize(&loc).expect("Location serializes");
+            assert_eq!(
+                encoded,
+                bincode::serialize(&valid).expect("f64 serializes"),
+                "Location wire representation must remain a bare little-endian f64"
+            );
+            let decoded: Location =
+                bincode::deserialize(&encoded).expect("valid Location deserializes");
+            assert_eq!(decoded.as_f64().to_bits(), valid.to_bits());
+        }
+
+        for (json, expected) in [("0.0", 0.0_f64), ("-0.0", 0.0_f64), ("1.0", 1.0_f64)] {
+            let decoded: Location =
+                serde_json::from_str(json).expect("valid json Location deserializes");
+            assert_eq!(decoded.as_f64().to_bits(), expected.to_bits());
+        }
+
+        let neg_zero_try = Location::try_from(-0.0_f64).expect("-0.0 is valid");
+        assert_eq!(neg_zero_try.as_f64().to_bits(), 0.0_f64.to_bits());
+
+        let neg_zero_bytes = bincode::serialize(&(-0.0_f64)).expect("-0.0 serializes");
+        let decoded: Location =
+            bincode::deserialize(&neg_zero_bytes).expect("-0.0 deserializes to +0.0");
+        assert_eq!(decoded.as_f64().to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn connect_msg_wire_rejects_non_finite_and_out_of_range_location() {
+        use crate::message::Transaction;
+        use crate::operations::connect::ConnectMsg;
+
+        let msg = ConnectMsg::Rejected {
+            id: Transaction::new::<ConnectMsg>(),
+            desired_location: Location::new(0.25),
+        };
+        let valid_bytes = bincode::serialize(&msg).expect("ConnectMsg::Rejected serializes");
+        let round_trip: ConnectMsg =
+            bincode::deserialize(&valid_bytes).expect("valid ConnectMsg::Rejected deserializes");
+        let ConnectMsg::Rejected {
+            desired_location, ..
+        } = round_trip
+        else {
+            panic!("unexpected variant: {round_trip:?}");
+        };
+        assert_eq!(desired_location.as_f64(), 0.25);
+
+        let f64_tail = 0.25_f64.to_le_bytes();
+        assert!(
+            valid_bytes.ends_with(&f64_tail),
+            "ConnectMsg::Rejected wire encoding should end with desired_location f64"
+        );
+        let prefix_len = valid_bytes.len() - f64_tail.len();
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut poisoned = valid_bytes[..prefix_len].to_vec();
+            poisoned.extend_from_slice(&bad.to_le_bytes());
+            assert!(
+                bincode::deserialize::<ConnectMsg>(&poisoned).is_err(),
+                "ConnectMsg wire decode must reject invalid desired_location {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn location_hash_and_btreemap_canonicalize_neg_zero_and_handle_non_finite() {
+        use std::collections::{BTreeMap, HashSet, hash_map::DefaultHasher};
+
+        let neg_zero = Location(-0.0);
+        let pos_zero = Location(0.0);
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        neg_zero.hash(&mut h1);
+        pos_zero.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+
+        let mut set = HashSet::new();
+        set.insert(pos_zero);
+        set.insert(neg_zero);
+        assert_eq!(set.len(), 1);
+
+        let mut map = BTreeMap::new();
+        map.insert(pos_zero, 1usize);
+        assert_eq!(map.get(&neg_zero), Some(&1));
+        map.insert(neg_zero, 2usize);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&pos_zero), Some(&2));
+
+        // Non-finite values constructed bypassing Deserialize still obey a total order.
+        map.insert(Location(0.5), 3);
+        map.insert(Location(f64::NAN), 4);
+        map.insert(Location(f64::INFINITY), 5);
+        map.insert(Location(f64::NEG_INFINITY), 6);
+        assert_eq!(map.get(&Location(0.5)), Some(&3));
+        assert_eq!(map.get(&Location(f64::INFINITY)), Some(&5));
+        assert_eq!(map.get(&Location(f64::NEG_INFINITY)), Some(&6));
+    }
+
+    #[test]
+    fn location_and_distance_cmp_are_total_and_never_panic() {
+        use std::cmp::Ordering;
+
+        let locs = [
+            Location(f64::NEG_INFINITY),
+            Location(-0.0),
+            Location(0.0),
+            Location(0.5),
+            Location(1.0),
+            Location(f64::INFINITY),
+            Location(f64::NAN),
+        ];
+        for a in locs {
+            assert_eq!(a.cmp(&a), Ordering::Equal);
+            for b in locs {
+                let ab = a.cmp(&b);
+                let ba = b.cmp(&a);
+                assert_eq!(ab, ba.reverse());
+                assert_eq!(a.partial_cmp(&b), Some(ab));
+            }
+        }
+        assert_eq!(Location(-0.0).cmp(&Location(0.0)), Ordering::Equal);
+        assert!(Location(f64::NEG_INFINITY) < Location(0.0));
+        assert!(Location(1.0) < Location(f64::INFINITY));
+
+        let dists = [
+            Distance(f64::NEG_INFINITY),
+            Distance(-0.0),
+            Distance(0.0),
+            Distance(0.25),
+            Distance(0.5),
+            Distance(f64::INFINITY),
+            Distance(f64::NAN),
+        ];
+        for a in dists {
+            assert_eq!(a.cmp(&a), Ordering::Equal);
+            for b in dists {
+                let ab = a.cmp(&b);
+                let ba = b.cmp(&a);
+                assert_eq!(ab, ba.reverse());
+                assert_eq!(a.partial_cmp(&b), Some(ab));
+            }
+        }
+        assert_eq!(Distance(-0.0).cmp(&Distance(0.0)), Ordering::Equal);
     }
 }
