@@ -277,8 +277,8 @@ enum InstallRecord {
     /// Installed: clear the #4073 install gate, the #5799 cooldown, and the
     /// staged copy.
     Clear,
-    /// A present-but-wrong release (checksum or signature): count it toward
-    /// the #4073 install gate.
+    /// A present-but-wrong release (checksum, signature, or binary version):
+    /// count it toward the #4073 install gate.
     Gate,
     /// Any other failure: cool the release down, recording this error
     /// (#5799). Deliberately includes a missing manifest or asset, which is
@@ -430,7 +430,8 @@ pub fn macos_dmg_asset_name(tag_name: &str) -> String {
 }
 
 /// Deterministic "this release's artifacts do not verify" error: a checksum
-/// MISMATCH or an invalid/wrong-length release signature.
+/// MISMATCH, an invalid/wrong-length release signature, or a binary version or
+/// bundle-layout verification failure.
 ///
 /// Distinct from TRANSIENT failures (GitHub/download outage, a checksum manifest
 /// that is still propagating, extraction/disk errors) so the per-target-version
@@ -450,10 +451,10 @@ impl std::fmt::Display for ReleaseVerificationError {
 impl std::error::Error for ReleaseVerificationError {}
 
 /// Whether `err` is a deterministic release-verification failure (checksum /
-/// signature), i.e. a "bad release" signal that should count toward the
-/// install-failure gate. Checks the top-level error type; the verification call
-/// sites deliberately propagate it without wrapping `.context()` so this
-/// downcast stays reliable.
+/// signature / binary version), i.e. a "bad release" signal that should count
+/// toward the install-failure gate. Checks the top-level error type; the
+/// verification call sites deliberately propagate it without wrapping
+/// `.context()` so this downcast stays reliable.
 fn is_release_verification_failure(err: &anyhow::Error) -> bool {
     err.downcast_ref::<ReleaseVerificationError>().is_some()
 }
@@ -759,6 +760,25 @@ impl UpdateCommand {
         current_version: &str,
         meter: &staged::ByteMeter<'_>,
     ) -> Result<InstallOutcome> {
+        let expected_version = Version::parse(super::auto_update::version_from_tag(
+            &release.tag_name,
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to parse target release tag {} as semver",
+                release.tag_name
+            )
+        })?;
+        let current_ver =
+            Version::parse(current_version).context("Failed to parse current version as semver")?;
+        if !self.force && expected_version <= current_ver {
+            return Err(ReleaseVerificationError(format!(
+                "Refusing non-upgrade install: target version {expected_version} is not newer \
+                 than current version {current_ver}."
+            ))
+            .into());
+        }
+
         // macOS DMG-swap path: when running from inside a .app bundle,
         // in-place binary replacement would invalidate the bundle's code
         // signature and Gatekeeper would refuse to launch the result on
@@ -780,7 +800,10 @@ impl UpdateCommand {
                 .and_then(|exe| super::service::macos_app_bundle_path(&exe))
                 .is_some();
 
-            match self.maybe_perform_bundle_update(release, meter).await {
+            match self
+                .maybe_perform_bundle_update(release, &expected_version, meter)
+                .await
+            {
                 Ok(true) => {
                     tracing::info!("DMG-swap update staged for release {}", release.tag_name);
                     if !self.quiet {
@@ -828,10 +851,11 @@ impl UpdateCommand {
                         );
                     }
                     // No update was installed. Surface as a bundle-skip carrying
-                    // whether the cause was a deterministic DMG checksum/signature
-                    // failure (counts toward the gate, #4073) vs a transient one
-                    // (leaves the gate unchanged), even though we exit 0 to
-                    // protect the signed bundle.
+                    // whether the cause was a deterministic DMG checksum,
+                    // signature, or binary version failure (counts toward the
+                    // gate, #4073) vs a transient one (leaves the gate
+                    // unchanged), even though we exit 0 to protect the signed
+                    // bundle.
                     let verification_failure = is_release_verification_failure(&e);
                     return Ok(InstallOutcome::BundleSkipped {
                         verification_failure,
@@ -950,8 +974,12 @@ impl UpdateCommand {
         // Use a subdirectory per archive to avoid filename collisions
         let freenet_extract_dir = temp_dir.path().join("freenet");
         fs::create_dir_all(&freenet_extract_dir)?;
-        let extracted_freenet =
-            extract_binary(&freenet_archive_path, &freenet_extract_dir, "freenet")?;
+        let extracted_freenet = extract_binary(
+            &freenet_archive_path,
+            &freenet_extract_dir,
+            "freenet",
+            Some(&expected_version),
+        )?;
 
         let current_exe = std::env::current_exe().context("Failed to get current executable")?;
 
@@ -1293,7 +1321,9 @@ impl UpdateCommand {
             return;
         }
 
-        let extracted_fdev = match extract_binary(&archive_path, &extract_dir, "fdev") {
+        // fdev carries its own crate version independent of freenet's release
+        // tag, so skip the release-tag version equality check here.
+        let extracted_fdev = match extract_binary(&archive_path, &extract_dir, "fdev", None) {
             Ok(path) => path,
             Err(e) => {
                 if !self.quiet {
@@ -1349,6 +1379,7 @@ impl UpdateCommand {
     async fn maybe_perform_bundle_update(
         &self,
         release: &Release,
+        expected_version: &Version,
         meter: &staged::ByteMeter<'_>,
     ) -> Result<bool> {
         let current_exe = std::env::current_exe()
@@ -1460,6 +1491,24 @@ impl UpdateCommand {
                 ditto.status,
                 String::from_utf8_lossy(&ditto.stderr).trim()
             );
+        }
+
+        // Verify that the staged app bundle contains a regular, in-bundle
+        // `freenet-bin` reporting the target release version before handing it
+        // off to the detached swap script. Uses `verify_binary_version` so we
+        // do not alter permissions inside the signed bundle.
+        let verify_result =
+            ensure_regular_binary_in_root(&staged_app, &["Contents", "MacOS", "freenet-bin"])
+                .and_then(|staged_bin| verify_binary_version(&staged_bin, Some(expected_version)));
+        if let Err(e) = verify_result {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&staged_app) {
+                tracing::warn!(
+                    error = %cleanup_err,
+                    path = %staged_app.display(),
+                    "Failed to remove rejected staged app bundle"
+                );
+            }
+            return Err(e);
         }
 
         let script_path = write_updater_script()?;
@@ -1687,10 +1736,27 @@ async fn fetch_release_assets(tag: &str, quiet: bool) -> Result<Release> {
         );
     }
 
-    response
+    let release = response
         .json::<Release>()
         .await
-        .context("Failed to parse release info")
+        .context("Failed to parse release info")?;
+    validate_release_tag(&release, tag)?;
+    Ok(release)
+}
+
+/// Verify that a fetched release's `tag_name` matches the exact tag requested.
+///
+/// Prevents a spoofed `/releases/tags/{tag}` response from substituting an
+/// older release's metadata and signed assets.
+fn validate_release_tag(release: &Release, requested_tag: &str) -> Result<()> {
+    if release.tag_name != requested_tag {
+        anyhow::bail!(
+            "Release tag mismatch: requested {requested_tag}, API returned {}. \
+             Refusing to install.",
+            release.tag_name
+        );
+    }
+    Ok(())
 }
 
 /// Download a small release asset fully into memory. Used for the
@@ -2072,7 +2138,12 @@ async fn download_file_counted(
     Ok(())
 }
 
-fn extract_binary(archive_path: &Path, dest_dir: &Path, name: &str) -> Result<PathBuf> {
+fn extract_binary(
+    archive_path: &Path,
+    dest_dir: &Path,
+    name: &str,
+    expected_version: Option<&Version>,
+) -> Result<PathBuf> {
     // Extract with path traversal protection
     let dest_dir_canonical = dest_dir
         .canonicalize()
@@ -2096,15 +2167,92 @@ fn extract_binary(archive_path: &Path, dest_dir: &Path, name: &str) -> Result<Pa
     #[cfg(not(target_os = "windows"))]
     let binary_name = name.to_string();
 
-    let binary_path = dest_dir.join(&binary_name);
-    if !binary_path.exists() {
-        anyhow::bail!("{name} binary not found in archive");
-    }
+    let binary_path = ensure_regular_binary_in_root(dest_dir, &[&binary_name])?;
 
-    // Verify the binary is executable and works
-    verify_binary(&binary_path)?;
+    // Verify the binary is executable, works, and matches the expected release version
+    verify_binary(&binary_path, expected_version)?;
 
     Ok(binary_path)
+}
+
+/// Verify that `root/<relative_components...>` resolves to an existing regular
+/// file strictly inside `root` with no symlinks on the file or any intermediate
+/// directory.
+///
+/// Rejecting symlinks and non-regular files before `chmod` or execution stops a
+/// crafted archive or app bundle from redirecting verification or permission
+/// changes outside its staging directory.
+fn ensure_regular_binary_in_root(root: &Path, relative_components: &[&str]) -> Result<PathBuf> {
+    let root_canonical = root
+        .canonicalize()
+        .context("Failed to canonicalize staging root")?;
+    let mut cur = root.to_path_buf();
+    let Some((file_name, dirs)) = relative_components.split_last() else {
+        return Err(
+            ReleaseVerificationError("Expected binary path cannot be empty".to_string()).into(),
+        );
+    };
+
+    for dir in dirs {
+        cur.push(dir);
+        let meta = match fs::symlink_metadata(&cur) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Err(ReleaseVerificationError(format!(
+                    "Expected directory '{}' missing under {}",
+                    cur.display(),
+                    root.display()
+                ))
+                .into());
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to inspect directory {}", cur.display()));
+            }
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(ReleaseVerificationError(format!(
+                "Security error: expected directory '{}' is a symlink or non-directory",
+                cur.display()
+            ))
+            .into());
+        }
+    }
+
+    cur.push(file_name);
+    let meta = match fs::symlink_metadata(&cur) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(ReleaseVerificationError(format!(
+                "{file_name} binary not found in archive or bundle"
+            ))
+            .into());
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to inspect extracted binary {}", cur.display()));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(ReleaseVerificationError(format!(
+            "Security error: extracted binary '{}' is not a regular file",
+            cur.display()
+        ))
+        .into());
+    }
+
+    let canonical = cur
+        .canonicalize()
+        .context("Failed to canonicalize extracted binary path")?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err(ReleaseVerificationError(format!(
+            "Security error: binary '{}' resolves outside staging directory",
+            cur.display()
+        ))
+        .into());
+    }
+
+    Ok(cur)
 }
 
 fn extract_tar_gz(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Path) -> Result<()> {
@@ -2117,6 +2265,10 @@ fn extract_tar_gz(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Pat
         .context("Failed to read archive entries")?
     {
         let mut entry = entry.context("Failed to read archive entry")?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            anyhow::bail!("Security error: archive contains symlink or hardlink entry");
+        }
         let path = entry.path().context("Failed to get entry path")?;
 
         // Security: Prevent path traversal attacks
@@ -2193,16 +2345,77 @@ fn validate_extract_path(dest_dir: &Path, dest_dir_canonical: &Path, path: &Path
     Ok(())
 }
 
-fn verify_binary(binary_path: &Path) -> Result<()> {
-    // Set executable permissions first
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(binary_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(binary_path, perms)?;
+/// Parse the semver version from `freenet --version` stdout.
+///
+/// Matches the single `Freenet version: <semver> (...)` line emitted by
+/// `freenet --version`, tolerating leading lines, an optional `v` prefix, and
+/// trailing lines such as `Build timestamp: ...`. Rejects ambiguous output
+/// containing multiple `Freenet version:` lines.
+fn parse_reported_freenet_version(stdout: &str) -> Option<Version> {
+    let mut found: Option<Version> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("Freenet version:") {
+            if found.is_some() {
+                return None;
+            }
+            let token = rest.split_whitespace().next()?;
+            let version_str = super::auto_update::version_from_tag(token);
+            found = Some(Version::parse(version_str).ok()?);
+        }
+    }
+    found
+}
+
+/// Compare two semver versions by release identity (`major.minor.patch[-pre]`),
+/// ignoring `+build` metadata per SemVer 2.0.0 precedence and matching
+/// `scripts/gateway-auto-update.sh`.
+fn same_release_version(actual: &Version, expected: &Version) -> bool {
+    actual.major == expected.major
+        && actual.minor == expected.minor
+        && actual.patch == expected.patch
+        && actual.pre == expected.pre
+}
+
+/// Validate `--version` stdout from a downloaded binary.
+///
+/// When `expected_version` is `Some`, the output must include a parseable
+/// `Freenet version: <semver>` line matching `expected_version`. This binds
+/// the binary to the requested release tag so an older archive and manifest
+/// cannot be replayed under a newer tag.
+fn verify_version_output(stdout: &str, expected_version: Option<&Version>) -> Result<()> {
+    if !stdout.contains("Freenet") && !stdout.contains("freenet") {
+        return Err(ReleaseVerificationError(format!(
+            "Downloaded binary doesn't appear to be Freenet. \
+             Got: {}",
+            stdout.trim()
+        ))
+        .into());
     }
 
+    if let Some(expected) = expected_version {
+        let reported = parse_reported_freenet_version(stdout).ok_or_else(|| {
+            ReleaseVerificationError(format!(
+                "Downloaded binary did not report a parseable Freenet version \
+                 (expected {expected}). Got: {}",
+                stdout.trim()
+            ))
+        })?;
+
+        if !same_release_version(&reported, expected) {
+            return Err(ReleaseVerificationError(format!(
+                "Downloaded binary version mismatch: expected {expected}, got {reported}. \
+                 Refusing to install."
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute `<binary> --version` without altering file permissions and validate
+/// its output against `expected_version`.
+fn verify_binary_version(binary_path: &Path, expected_version: Option<&Version>) -> Result<()> {
     // Run --version to verify the binary works
     let output = Command::new(binary_path)
         .arg("--version")
@@ -2216,17 +2429,21 @@ fn verify_binary(binary_path: &Path) -> Result<()> {
         );
     }
 
-    // Verify output contains expected version format
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.contains("Freenet") && !stdout.contains("freenet") {
-        anyhow::bail!(
-            "Downloaded binary doesn't appear to be Freenet. \
-             Got: {}",
-            stdout.trim()
-        );
+    verify_version_output(&stdout, expected_version)
+}
+
+fn verify_binary(binary_path: &Path, expected_version: Option<&Version>) -> Result<()> {
+    // Set executable permissions first
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(binary_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(binary_path, perms)?;
     }
 
-    Ok(())
+    verify_binary_version(binary_path, expected_version)
 }
 
 /// Check if the on-disk systemd unit has drifted from the current
@@ -5581,6 +5798,354 @@ done
             src.contains("releases/tags/"),
             "the remaining REST call must request an exact tag, so the assets we \
              install match the version we decided on"
+        );
+    }
+
+    #[test]
+    fn verify_version_output_binds_release_version() {
+        let v_target = Version::parse("0.2.167").expect("valid target semver");
+        let v_pre = Version::parse("0.2.167-rc.1").expect("valid prerelease semver");
+        let v_build_a = Version::parse("0.2.167+build.a").expect("valid build semver");
+
+        // Matching freenet --version shapes (including CRLF, commit suffix,
+        // leading whitespace, leading log lines, prerelease, and +build metadata).
+        for ok_out in [
+            "Freenet version: 0.2.167 (abc1234)\nBuild timestamp: 2026-11-28T00:00:00Z\n",
+            "Freenet version: 0.2.167 (abc1234-dirty)\r\nBuild timestamp: 2026-11-28T00:00:00Z\r\n",
+            "Freenet version: 0.2.167\n",
+            "Freenet version: v0.2.167 (abc1234)\n",
+            "  Freenet version: 0.2.167 (abc1234)\n",
+            "warning: banner\nFreenet version: 0.2.167 (abc1234)\n",
+            "Freenet version: 0.2.167+ci.99 (abc1234)\n",
+        ] {
+            verify_version_output(ok_out, Some(&v_target))
+                .unwrap_or_else(|e| panic!("expected match for {ok_out:?}, got {e}"));
+        }
+        verify_version_output(
+            "Freenet version: 0.2.167+build.b (abc1234)\n",
+            Some(&v_build_a),
+        )
+        .expect("+build metadata must be ignored when comparing release versions");
+        verify_version_output("Freenet version: 0.2.167-rc.1 (abc1234)\n", Some(&v_pre))
+            .expect("matching prerelease must be accepted");
+
+        // Mismatched versions (patch/minor/major/prerelease drift in both
+        // directions) must fail closed as deterministic ReleaseVerificationError.
+        for bad_out in [
+            "Freenet version: 0.2.100 (oldhash)\nBuild timestamp: 2026-01-01T00:00:00Z\n",
+            "Freenet version: 0.2.168 (newhash)\n",
+            "Freenet version: 0.3.167 (minor)\n",
+            "Freenet version: 1.2.167 (major)\n",
+            "Freenet version: 0.2.167-rc.1 (prehash)\n",
+        ] {
+            let err = verify_version_output(bad_out, Some(&v_target))
+                .expect_err("version mismatch must be rejected");
+            assert!(
+                err.to_string().contains("version mismatch"),
+                "expected version mismatch error for {bad_out:?}, got: {err}"
+            );
+            assert!(
+                is_release_verification_failure(&err),
+                "version mismatch must classify as ReleaseVerificationError"
+            );
+        }
+        for bad_pre_out in [
+            "Freenet version: 0.2.167 (stable)\n",
+            "Freenet version: 0.2.167-rc.2 (other-pre)\n",
+        ] {
+            let err = verify_version_output(bad_pre_out, Some(&v_pre))
+                .expect_err("prerelease mismatch must be rejected");
+            assert!(is_release_verification_failure(&err));
+        }
+
+        // Unparseable, missing, double-v, or ambiguous Freenet version lines
+        // when expected_version is Some.
+        for unparseable in [
+            "Freenet Development Tool 0.3.329\n",
+            "Freenet version: not-a-semver\n",
+            "Freenet version: vv0.2.167 (double-v)\n",
+            "Freenet version:\n",
+            "Freenet version: 0.2.167 (a)\nFreenet version: 0.2.100 (b)\n",
+            "freenet\n",
+        ] {
+            let err = verify_version_output(unparseable, Some(&v_target))
+                .expect_err("unparseable version must be rejected when expected_version is Some");
+            assert!(
+                is_release_verification_failure(&err),
+                "unparseable version must classify as ReleaseVerificationError for {unparseable:?}"
+            );
+        }
+
+        // Empty or non-Freenet output is always rejected as a verification failure.
+        for non_freenet in ["", "other-tool 0.2.167\n"] {
+            let err = verify_version_output(non_freenet, Some(&v_target))
+                .expect_err("empty or non-Freenet output must be rejected");
+            assert!(is_release_verification_failure(&err));
+        }
+
+        // expected_version == None (used for fdev, which has its own crate version)
+        // accepts Freenet Development Tool output and still rejects non-Freenet output.
+        verify_version_output("Freenet Development Tool 0.3.329\n", None)
+            .expect("fdev version output must pass when expected_version is None");
+        let non_freenet_none = verify_version_output("unrelated 1.0.0\n", None)
+            .expect_err("non-Freenet output must be rejected even when expected_version is None");
+        assert!(is_release_verification_failure(&non_freenet_none));
+    }
+
+    #[test]
+    fn validate_release_tag_enforces_exact_tag_match() {
+        let release = Release {
+            tag_name: "v0.2.167".to_string(),
+            assets: Vec::new(),
+        };
+        validate_release_tag(&release, "v0.2.167").expect("matching release tag must pass");
+
+        let mismatched = Release {
+            tag_name: "v0.2.100".to_string(),
+            assets: Vec::new(),
+        };
+        let err = validate_release_tag(&mismatched, "v0.2.167")
+            .expect_err("mismatched API release tag must be refused");
+        assert!(
+            err.to_string().contains("Release tag mismatch"),
+            "expected Release tag mismatch error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn retry_on_etxtbsy<T>(mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        // Under parallel `cargo test` on Linux, another test thread can fork
+        // while a freshly written test script's write fd is still open, causing
+        // `execve` to fail transiently with ETXTBSY (rust-lang/rust#114554).
+        let mut tries = 0;
+        loop {
+            match op() {
+                Err(e)
+                    if tries < 50
+                        && e.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<io::Error>()
+                                .and_then(|io_err| io_err.raw_os_error())
+                                == Some(libc::ETXTBSY)
+                        }) =>
+                {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_binary_rejects_mismatched_version() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = Version::parse("0.2.167").expect("valid target semver");
+        let old = Version::parse("0.2.100").expect("valid old semver");
+
+        // Pack a real .tar.gz containing a stub `freenet` reporting 0.2.100.
+        let archive_path = dir.path().join("freenet-replayed.tar.gz");
+        {
+            let file = File::create(&archive_path).expect("create archive");
+            let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let script = b"#!/bin/sh\necho 'Freenet version: 0.2.100 (oldhash)'\necho 'Build timestamp: 2026-01-01T00:00:00Z'\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(script.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            tar.append_data(&mut header, "freenet", &script[..])
+                .expect("append stub to tar");
+            tar.into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("finish gzip");
+        }
+
+        // Targeting 0.2.167 must reject the 0.2.100 binary as a deterministic
+        // verification failure before installation.
+        let dest_mismatch = dir.path().join("extract-mismatch");
+        fs::create_dir_all(&dest_mismatch).expect("mkdir");
+        let err = retry_on_etxtbsy(|| {
+            extract_binary(&archive_path, &dest_mismatch, "freenet", Some(&expected))
+        })
+        .expect_err("replayed older binary (0.2.100) must be rejected when targeting 0.2.167");
+        assert!(
+            is_release_verification_failure(&err),
+            "version mismatch must classify as ReleaseVerificationError, got: {err}"
+        );
+
+        // Targeting 0.2.100 accepts the matching archive.
+        let dest_match = dir.path().join("extract-match");
+        fs::create_dir_all(&dest_match).expect("mkdir");
+        let extracted =
+            retry_on_etxtbsy(|| extract_binary(&archive_path, &dest_match, "freenet", Some(&old)))
+                .expect("matching version must succeed");
+        assert!(extracted.exists());
+
+        // An archive containing a symlink entry must be rejected before extraction.
+        let symlink_archive = dir.path().join("freenet-symlink.tar.gz");
+        {
+            let file = File::create(&symlink_archive).expect("create symlink archive");
+            let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            tar.append_link(&mut header, "freenet", "/bin/true")
+                .expect("append symlink");
+            tar.into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("finish gzip");
+        }
+        let dest_sym = dir.path().join("extract-sym");
+        fs::create_dir_all(&dest_sym).expect("mkdir");
+        let sym_err = extract_binary(&symlink_archive, &dest_sym, "freenet", Some(&expected))
+            .expect_err("symlink entry in release archive must be rejected");
+        assert!(
+            sym_err.to_string().contains("symlink"),
+            "expected symlink rejection, got: {sym_err}"
+        );
+
+        // Non-zero exit from --version is rejected, but stays a transient error
+        // (not ReleaseVerificationError) so a transient failure does not gate.
+        let failing_stub = dir.path().join("freenet-fail");
+        fs::write(&failing_stub, "#!/bin/sh\nexit 1\n").expect("write failing stub");
+        let fail_err = retry_on_etxtbsy(|| verify_binary(&failing_stub, Some(&expected)))
+            .expect_err("non-zero --version exit must be rejected");
+        assert!(
+            fail_err.to_string().contains("--version check failed"),
+            "expected --version failure error, got: {fail_err}"
+        );
+        assert!(
+            !is_release_verification_failure(&fail_err),
+            "non-zero --version exit must not permanently gate"
+        );
+
+        // fdev path passes expected_version = None and accepts fdev's independent version.
+        let fdev_stub = dir.path().join("fdev");
+        fs::write(
+            &fdev_stub,
+            "#!/bin/sh\necho 'Freenet Development Tool 0.3.329'\n",
+        )
+        .expect("write fdev stub");
+        retry_on_etxtbsy(|| verify_binary(&fdev_stub, None))
+            .expect("fdev stub must pass with expected_version = None");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_regular_binary_in_root_rejects_symlinks_and_missing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-bin");
+        fs::write(&outside, "#!/bin/sh\nexit 0\n").expect("write outside");
+
+        // Regular bundle layout passes.
+        let ok_bundle = dir.path().join("ok.app");
+        let ok_macos = ok_bundle.join("Contents/MacOS");
+        fs::create_dir_all(&ok_macos).expect("mkdir ok bundle");
+        fs::write(ok_macos.join("freenet-bin"), b"binary").expect("write bin");
+        let resolved =
+            ensure_regular_binary_in_root(&ok_bundle, &["Contents", "MacOS", "freenet-bin"])
+                .expect("regular in-bundle binary must pass");
+        assert_eq!(resolved, ok_macos.join("freenet-bin"));
+
+        // Missing binary fails as ReleaseVerificationError.
+        let missing_bundle = dir.path().join("missing.app");
+        fs::create_dir_all(missing_bundle.join("Contents/MacOS")).expect("mkdir");
+        let missing_err =
+            ensure_regular_binary_in_root(&missing_bundle, &["Contents", "MacOS", "freenet-bin"])
+                .expect_err("missing bundle binary must fail");
+        assert!(is_release_verification_failure(&missing_err));
+
+        // Symlinked final binary fails as ReleaseVerificationError.
+        let sym_bin_bundle = dir.path().join("sym-bin.app");
+        fs::create_dir_all(sym_bin_bundle.join("Contents/MacOS")).expect("mkdir");
+        symlink(&outside, sym_bin_bundle.join("Contents/MacOS/freenet-bin")).expect("symlink bin");
+        let sym_bin_err =
+            ensure_regular_binary_in_root(&sym_bin_bundle, &["Contents", "MacOS", "freenet-bin"])
+                .expect_err("symlinked bundle binary must fail");
+        assert!(is_release_verification_failure(&sym_bin_err));
+
+        // Symlinked intermediate directory fails as ReleaseVerificationError.
+        let sym_dir_bundle = dir.path().join("sym-dir.app");
+        fs::create_dir_all(sym_dir_bundle.join("Contents")).expect("mkdir");
+        let external_dir = dir.path().join("external-macos");
+        fs::create_dir_all(&external_dir).expect("mkdir external");
+        fs::write(external_dir.join("freenet-bin"), b"binary").expect("write external bin");
+        symlink(&external_dir, sym_dir_bundle.join("Contents/MacOS")).expect("symlink dir");
+        let sym_dir_err =
+            ensure_regular_binary_in_root(&sym_dir_bundle, &["Contents", "MacOS", "freenet-bin"])
+                .expect_err("symlinked intermediate directory must fail");
+        assert!(is_release_verification_failure(&sym_dir_err));
+    }
+
+    #[test]
+    fn version_verification_binds_freenet_and_bundle_installs() {
+        // Method-bounded structural pins covering the release-tag check, the
+        // Linux/Windows binary install path, and the cfg(target_os = "macos")
+        // bundle-swap path (not compiled on Linux CI).
+        let src = strip_line_comments_for_pin(include_str!("update.rs"));
+        let production = src
+            .split_once(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("test module")
+            .0;
+        let region = |signature: &str, end: &str| -> String {
+            let at = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("missing `{signature}`"));
+            let body = &production[at..];
+            body[..body
+                .find(end)
+                .unwrap_or_else(|| panic!("missing end of `{signature}`"))]
+                .split_whitespace()
+                .collect::<String>()
+                .replace(",)", ")")
+        };
+
+        let fetch_assets = region("\nasync fn fetch_release_assets(", "\n}\n");
+        assert!(
+            fetch_assets.contains("validate_release_tag(&release,tag)?;"),
+            "fetch_release_assets must verify release.tag_name against the requested tag"
+        );
+
+        let download_install = region("\n    async fn download_and_install(", "\n    }\n");
+        assert!(
+            download_install.contains(
+                "extract_binary(&freenet_archive_path,&freenet_extract_dir,\"freenet\",Some(&expected_version))"
+            ),
+            "download_and_install must pass Some(&expected_version) to extract_binary for freenet"
+        );
+        assert!(
+            download_install.contains("if!self.force&&expected_version<=current_ver{"),
+            "download_and_install must refuse non-upgrade installs unless --force is set"
+        );
+
+        let try_fdev = region("\n    async fn try_update_fdev(", "\n    }\n");
+        assert!(
+            try_fdev.contains("extract_binary(&archive_path,&extract_dir,\"fdev\",None)"),
+            "try_update_fdev must pass None for fdev's independent crate version"
+        );
+
+        let bundle_body = region("\n    async fn maybe_perform_bundle_update(", "\n    }\n");
+        let regular_pos = bundle_body
+            .find("ensure_regular_binary_in_root(&staged_app,&[\"Contents\",\"MacOS\",\"freenet-bin\"])")
+            .expect("maybe_perform_bundle_update must validate staged bundle binary path");
+        let verify_pos = bundle_body
+            .find("verify_binary_version(&staged_bin,Some(expected_version))")
+            .expect("maybe_perform_bundle_update must verify staged bundle binary version");
+        let spawn_pos = bundle_body
+            .find("spawn_detached_updater(")
+            .expect("spawn_detached_updater not found in maybe_perform_bundle_update");
+        assert!(
+            regular_pos < verify_pos && verify_pos < spawn_pos,
+            "macOS bundle binary path + version verification must run before spawning the detached updater"
         );
     }
 }
