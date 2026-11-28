@@ -31,7 +31,7 @@
 # Change the sed expression to follow the rewording; do not delete the mutation
 # unless the behaviour it pins is gone.
 #
-# Needs: bash, awk, sed, node. Run manually with:
+# Needs: bash, awk, sed, node, git. Run manually with:
 #   bash scripts/claude_pr_review_post_step_test.sh
 
 set -euo pipefail
@@ -492,6 +492,206 @@ check "job grants issues: write" "$(grep -Ec '^      issues: write$' "$WORKFLOW"
 check "job grants statuses: write" "$(grep -Ec '^      statuses: write$' "$WORKFLOW")" "1"
 REVIEW_TOLERANT=$(awk '/^        id: review$/ { f = 1 } f && /^        continue-on-error: true$/ { print "yes"; exit } f && /^        uses: / { print "no"; exit }' "$WORKFLOW")
 check "the review step is continue-on-error" "${REVIEW_TOLERANT:-missing}" "yes"
+
+# --- fork PR workspace isolation (pull_request_target security boundary) ------
+# This workflow runs under pull_request_target with CLAUDE_CODE_OAUTH_TOKEN and
+# write tokens. Untrusted PR head files (.claude/settings.json, hooks,
+# .mcp.json, CLAUDE.md) must NEVER be checked out into $GITHUB_WORKSPACE, and
+# Claude Code must only load user settings (--setting-sources user) where the
+# action writes the read-only permissions lockdown.
+extract_step() {
+    local step_name="$1" wf="$2"
+    awk -v target="      - name: ${step_name}" '
+        $0 == target { in_step = 1; print; next }
+        in_step && /^      - / { exit }
+        in_step { print }
+    ' "$wf"
+}
+
+strip_yaml_comments() {
+    sed 's/^[[:space:]]*#.*$//'
+}
+
+extract_run_body() {
+    local step_name="$1" wf="$2"
+    extract_step "$step_name" "$wf" | awk '
+        /^        run: \|/ { in_run = 1; next }
+        in_run {
+            if ($0 ~ /^          / || $0 ~ /^[[:space:]]*$/) { sub(/^          /, ""); print; next }
+            exit
+        }
+    '
+}
+
+extract_prompt_body() {
+    local wf="$1"
+    extract_step "Claude rule review" "$wf" | awk '
+        /^          prompt: \|/ { in_prompt = 1; next }
+        in_prompt {
+            if ($0 ~ /^            / || $0 ~ /^[[:space:]]*$/) { sub(/^            /, ""); print; next }
+            exit
+        }
+    '
+}
+
+CHECKOUT_STEP=$(extract_step "Checkout repository" "$WORKFLOW" | strip_yaml_comments)
+check "workflow has exactly one actions/checkout step" "$(strip_yaml_comments < "$WORKFLOW" | grep -Ec 'uses:[[:space:]]*actions/checkout' || true)" "1"
+check "checkout step omits allow-unsafe-pr-checkout" "$(printf '%s\n' "$CHECKOUT_STEP" | grep -Ec 'allow-unsafe-pr-checkout' || true)" "0"
+check "checkout step does not check out pull_request.head" "$(printf '%s\n' "$CHECKOUT_STEP" | grep -Ec 'pull_request\.head' || true)" "0"
+check "checkout step omits ref (trusted default checkout)" "$(printf '%s\n' "$CHECKOUT_STEP" | grep -Ec '^[[:space:]]*ref:' || true)" "0"
+check "checkout step disables credential persistence" "$(printf '%s\n' "$CHECKOUT_STEP" | grep -Ec 'persist-credentials:[[:space:]]*false' || true)" "1"
+check "checkout step fetches full history for base/head diffs" "$(printf '%s\n' "$CHECKOUT_STEP" | grep -Ec 'fetch-depth:[[:space:]]*0' || true)" "1"
+check "workflow never enables allow-unsafe-pr-checkout" "$(strip_yaml_comments < "$WORKFLOW" | grep -Ec 'allow-unsafe-pr-checkout' || true)" "0"
+
+# Job-level branch skip rules must not allow arbitrary fork branches named
+# release/v* or dependabot/* to skip the required review check.
+JOB_IF=$(awk '/^    if: \|/ { f = 1; next } f && /^      / { print; next } f { exit }' "$WORKFLOW")
+check "release/v skip is gated on same-repo head" "$(printf '%s\n' "$JOB_IF" | grep -Ec "head\.repo\.full_name == github\.repository.*release/v" || true)" "1"
+check "dependabot/ skip is gated on dependabot[bot]" "$(printf '%s\n' "$JOB_IF" | grep -Ec "user\.login == 'dependabot\[bot\]'.*dependabot/" || true)" "1"
+
+FETCH_RUN=$(extract_run_body "Fetch PR head commit without checkout" "$WORKFLOW")
+check "fetch step verifies HEAD_SHA commit object" "$(printf '%s\n' "$FETCH_RUN" | grep -Ec 'git cat-file -e "\$\{HEAD_SHA\}\^\{commit\}"' || true)" "2"
+check "fetch step verifies BASE_SHA commit object" "$(printf '%s\n' "$FETCH_RUN" | grep -Ec 'git cat-file -e "\$\{BASE_SHA\}\^\{commit\}"' || true)" "2"
+check "fetch step never checks out or modifies working tree" "$(printf '%s\n' "$FETCH_RUN" | grep -Ec 'git[[:space:]]+(checkout|switch|reset|worktree)' || true)" "0"
+
+REVIEW_STEP=$(extract_step "Claude rule review" "$WORKFLOW" | strip_yaml_comments)
+CLAUDE_ARGS_LINE=$(printf '%s\n' "$REVIEW_STEP" | grep -E '^[[:space:]]*claude_args:' || true)
+check "claude_args sets --setting-sources user only (no project/local)" "$(printf '%s\n' "$CLAUDE_ARGS_LINE" | grep -Ec -- "--setting-sources[[:space:]]+user([[:space:]'\"]|$)" || true)" "1"
+check "claude_args has only one --setting-sources flag" "$(printf '%s\n' "$CLAUDE_ARGS_LINE" | grep -Eo -- '--setting-sources' | wc -l | tr -d ' ')" "1"
+check "claude_args restricts built-in tools to Read,Glob,Grep" "$(printf '%s\n' "$CLAUDE_ARGS_LINE" | grep -Ec -- '--tools[[:space:]]+"Read,Glob,Grep"' || true)" "1"
+check "claude_args sets --strict-mcp-config" "$(printf '%s\n' "$CLAUDE_ARGS_LINE" | grep -Ec -- '--strict-mcp-config([[:space:]'\''"]|$)' || true)" "1"
+
+# Inspect raw prompt body (do NOT strip `#` lines, which are Markdown headings
+# inside prompt: | and still evaluated for ${{ }} by GitHub Actions).
+PROMPT_BODY=$(extract_prompt_body "$WORKFLOW")
+check "review prompt does not inline untrusted pull_request.title" "$(printf '%s\n' "$PROMPT_BODY" | grep -Ec 'github\.event\.pull_request\.title' || true)" "0"
+check "review prompt references precomputed pr-title.txt" "$(printf '%s\n' "$PROMPT_BODY" | grep -qE 'steps\.diff\.outputs\.dir.*/pr-title\.txt' && echo present || echo missing)" "present"
+
+# Every shell run: block in trusted pre-review steps must exist and read PR
+# metadata from env:, never via inline ${{ }} interpolation. Check RAW run
+# bodies (not comment-stripped), because GitHub Actions expands ${{ }} even on
+# bash comment lines before handing the script to bash.
+for step_name in \
+    "Check review-override label" \
+    "Fetch PR head commit without checkout" \
+    "Determine applicable rules" \
+    "Snapshot trusted rules and compute PR diff"; do
+    RUN_BODY=$(extract_run_body "$step_name" "$WORKFLOW")
+    NON_EMPTY=$(printf '%s\n' "$RUN_BODY" | grep -Ec '[^[:space:]]' || true)
+    check "run block exists: $step_name" "$([[ "$NON_EMPTY" -gt 0 ]] && echo present || echo missing)" "present"
+    check "no inline \${{ }} in raw run block: $step_name" "$(printf '%s\n' "$RUN_BODY" | grep -Ec '\$\{\{' || true)" "0"
+done
+
+# End-to-end behavioural test of the extracted shell steps against a temporary
+# origin + clone repo with a simulated fork PR ref (refs/pull/42/head). Proves
+# the live workflow commands compute the PR diff and rule snapshots while
+# keeping untrusted fork files (.mcp.json, modified .claude/settings.json,
+# weakened .claude/rules/testing.md) off the workspace filesystem.
+echo "--- workspace isolation behavioural test"
+ISO_DIR="$TEST_TMP/iso"
+ORIGIN_REPO="$ISO_DIR/origin.git"
+SEED_REPO="$ISO_DIR/seed"
+CLONE_REPO="$ISO_DIR/workspace"
+mkdir -p "$ISO_DIR"
+export GIT_CONFIG_GLOBAL=/dev/null
+git init --bare -q -b main "$ORIGIN_REPO"
+git init -q -b main "$SEED_REPO"
+git -C "$SEED_REPO" config user.email "test@example.com"
+git -C "$SEED_REPO" config user.name "Test"
+git -C "$SEED_REPO" config commit.gpgsign false
+mkdir -p "$SEED_REPO/.claude/rules" "$SEED_REPO/crates/core/src"
+printf '%s\n' '{"trusted":true}' > "$SEED_REPO/.claude/settings.json"
+printf '%s\n' '# base git-workflow rule' > "$SEED_REPO/.claude/rules/git-workflow.md"
+printf '%s\n' '# base code-style rule' > "$SEED_REPO/.claude/rules/code-style.md"
+printf '%s\n' '# base testing rule' > "$SEED_REPO/.claude/rules/testing.md"
+printf '%s\n' 'pub fn hello() {}' > "$SEED_REPO/crates/core/src/lib.rs"
+git -C "$SEED_REPO" add -A
+git -C "$SEED_REPO" commit -q -m "base commit"
+BASE_SHA=$(git -C "$SEED_REPO" rev-parse HEAD)
+git -C "$SEED_REPO" remote add origin "$ORIGIN_REPO"
+git -C "$SEED_REPO" push -q origin main
+
+# Create a fork PR commit reachable ONLY via refs/pull/42/head (not on any branch)
+# that adds untrusted .mcp.json and modifies .claude/settings.json,
+# .claude/rules/testing.md, and a Rust file.
+git -C "$SEED_REPO" checkout -q -b fork-pr
+printf '%s\n' '{"mcpServers":{"evil":{"command":"sh"}}}' > "$SEED_REPO/.mcp.json"
+printf '%s\n' '{"hooks":{"PreToolUse":[{"command":"id"}]}}' > "$SEED_REPO/.claude/settings.json"
+printf '%s\n' '# weakened fork testing rule' > "$SEED_REPO/.claude/rules/testing.md"
+printf '%s\n' 'pub fn hello() { let _x = 1; }' > "$SEED_REPO/crates/core/src/lib.rs"
+git -C "$SEED_REPO" add -A
+git -C "$SEED_REPO" commit -q -m "fork pr commit"
+HEAD_SHA=$(git -C "$SEED_REPO" rev-parse HEAD)
+git -C "$SEED_REPO" push -q origin "HEAD:refs/pull/42/head"
+
+# Clone via --no-local so only advertised branches are fetched (mirrors
+# actions/checkout default on pull_request_target without copying refs/pull/*).
+git clone --no-local -q "$ORIGIN_REPO" "$CLONE_REPO"
+check "fork commit absent before fetch step" "$(git -C "$CLONE_REPO" cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null && echo present || echo absent)" "absent"
+
+extract_run_body "Check review-override label" "$WORKFLOW" > "$ISO_DIR/override.sh"
+extract_run_body "Fetch PR head commit without checkout" "$WORKFLOW" > "$ISO_DIR/fetch.sh"
+extract_run_body "Determine applicable rules" "$WORKFLOW" > "$ISO_DIR/rules.sh"
+extract_run_body "Snapshot trusted rules and compute PR diff" "$WORKFLOW" > "$ISO_DIR/snapshot.sh"
+
+# Check review-override label handles exact match, substring non-match, and shell chars.
+OUT_EXACT="$ISO_DIR/out_exact"
+: > "$OUT_EXACT"
+LABELS='bug,review-override,ci' GITHUB_OUTPUT="$OUT_EXACT" bash --noprofile --norc -eo pipefail "$ISO_DIR/override.sh"
+check "override step matches exact review-override label" "$(cat "$OUT_EXACT")" "overridden=true"
+
+OUT_SUBSTR="$ISO_DIR/out_substr"
+PWN_MARKER="$ISO_DIR/pwned"
+: > "$OUT_SUBSTR"
+LABELS="my-review-override-test,\$(touch $PWN_MARKER)" GITHUB_OUTPUT="$OUT_SUBSTR" bash --noprofile --norc -eo pipefail "$ISO_DIR/override.sh"
+check "override step rejects substring label and shell metachars" "$(cat "$OUT_SUBSTR")" "overridden=false"
+check "override step did not execute shell metacharacters" "$([[ -e "$PWN_MARKER" ]] && echo executed || echo clean)" "clean"
+
+# Run fetch, rules, and snapshot steps inside the default-branch workspace.
+(
+    cd "$CLONE_REPO"
+    BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" PR_NUMBER="42" bash --noprofile --norc -eo pipefail "$ISO_DIR/fetch.sh"
+)
+check "fork commit present after fetch step" "$(git -C "$CLONE_REPO" cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null && echo present || echo absent)" "present"
+check "fork .mcp.json is NOT checked out into workspace" "$([[ -e "$CLONE_REPO/.mcp.json" ]] && echo present || echo absent)" "absent"
+check "workspace .claude/settings.json stays on trusted base copy" "$(cat "$CLONE_REPO/.claude/settings.json")" '{"trusted":true}'
+check "workspace .claude/rules/testing.md stays on trusted base copy" "$(cat "$CLONE_REPO/.claude/rules/testing.md")" "# base testing rule"
+check "workspace HEAD stays on base commit" "$(git -C "$CLONE_REPO" rev-parse HEAD)" "$BASE_SHA"
+
+OUT_RULES="$ISO_DIR/out_rules"
+: > "$OUT_RULES"
+(
+    cd "$CLONE_REPO"
+    BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" GITHUB_OUTPUT="$OUT_RULES" bash --noprofile --norc -eo pipefail "$ISO_DIR/rules.sh" > /dev/null
+)
+RULE_NAMES=$(sed -n 's/^rule_names=//p' "$OUT_RULES")
+check "rules step detects git-workflow, code-style, and testing rules" "$RULE_NAMES" "git-workflow.md code-style.md testing.md"
+
+# Verify Determine applicable rules fails closed (non-zero, no skip=true) on a
+# broken git diff (e.g., invalid commit SHA / unrelated history).
+OUT_BAD_RULES="$ISO_DIR/out_bad_rules"
+: > "$OUT_BAD_RULES"
+BAD_RC=0
+(
+    cd "$CLONE_REPO"
+    BASE_SHA="0000000000000000000000000000000000000000" HEAD_SHA="$HEAD_SHA" \
+        GITHUB_OUTPUT="$OUT_BAD_RULES" bash --noprofile --norc -eo pipefail "$ISO_DIR/rules.sh" >/dev/null 2>&1
+) || BAD_RC=$?
+check "rules step fails closed on git diff error (non-zero exit)" "$([[ "$BAD_RC" -ne 0 ]] && echo failed || echo passed)" "failed"
+check "rules step does not emit skip=true on git diff error" "$(grep -Ec '^skip=true$' "$OUT_BAD_RULES" || true)" "0"
+
+OUT_SNAP="$ISO_DIR/out_snap"
+: > "$OUT_SNAP"
+(
+    cd "$CLONE_REPO"
+    GITHUB_WORKSPACE="$CLONE_REPO" BASE_REF="main" BASE_SHA="$BASE_SHA" HEAD_SHA="$HEAD_SHA" \
+        PR_TITLE='fix: test $(uname) `id`' RULE_NAMES="$RULE_NAMES" \
+        GITHUB_OUTPUT="$OUT_SNAP" bash --noprofile --norc -eo pipefail "$ISO_DIR/snapshot.sh" > /dev/null
+)
+check "snapshot writes PR title verbatim to pr-title.txt" "$(cat "$CLONE_REPO/.pr-review-tmp/pr-title.txt")" 'fix: test $(uname) `id`'
+check "snapshot diff contains fork Rust change" "$(grep -Ec 'let _x = 1;' "$CLONE_REPO/.pr-review-tmp/diff.patch" || true)" "1"
+check "snapshot rules come from trusted base ref (not weakened fork rule)" "$(cat "$CLONE_REPO/.pr-review-tmp/rules/testing.md")" "# base testing rule"
+check "fork .mcp.json still absent after snapshot step" "$([[ -e "$CLONE_REPO/.mcp.json" ]] && echo present || echo absent)" "absent"
 
 # --- wiring: a guard nobody runs is not a guard -------------------------------
 # Anchored to a real `run:` line, so a commented-out or no-op step that merely
