@@ -2189,7 +2189,7 @@ dependencies = [
  "turmoil",
  "ulid",
  "url",
- "wasmparser 0.254.2",
+ "wasmparser 0.260.0",
  "wasmtime",
  "wat",
  "which",
@@ -8125,8 +8125,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c94519d78304dc4a4bb5925eda6ff153bf06167467cff9233dc9593bae28fdd"
 dependencies = [
  "bitflags 2.11.1",
+ "hashbrown 0.17.1",
  "indexmap 2.14.0",
  "semver",
+ "serde",
 ]
 
 [[package]]
